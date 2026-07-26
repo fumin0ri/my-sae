@@ -29,6 +29,18 @@ bash scripts/research_quickstart.sh
 runs/research/report/index.html
 ```
 
+SSH先で実行した場合は、SSH先でreport serverを起動します。
+
+```bash
+python -m http.server 8000 --directory runs/research/report
+```
+
+手元のPCからport forwardして `http://localhost:8000` を開きます。
+
+```bash
+ssh -L 8000:localhost:8000 <user>@<ssh-host>
+```
+
 同じ数値からPNGとPDFも生成されます。
 
 ```text
