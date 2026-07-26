@@ -216,6 +216,11 @@ def main() -> None:
                     "_commit_hash",
                     None,
                 ),
+                "resolved_tokenizer_revision": getattr(
+                    tokenizer,
+                    "init_kwargs",
+                    {},
+                ).get("_commit_hash"),
                 "multi_layer_extraction": True,
             },
         }

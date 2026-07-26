@@ -126,6 +126,11 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
                 "_commit_hash",
                 None,
             ),
+            "resolved_tokenizer_revision": getattr(
+                tokenizer,
+                "init_kwargs",
+                {},
+            ).get("_commit_hash"),
         },
     }
 
