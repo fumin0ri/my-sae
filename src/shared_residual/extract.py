@@ -8,7 +8,13 @@ import torch
 from tqdm import tqdm
 
 from .io import read_jsonl
-from .modeling import capture_residual, get_layer, input_device, load_hf_model
+from .modeling import (
+    capture_residual,
+    forward_backbone,
+    get_layer,
+    input_device,
+    load_hf_model,
+)
 
 
 def window_starts(length: int, width: int, mode: str, stride: int) -> list[int]:
@@ -70,7 +76,7 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
         with torch.inference_mode(), capture_residual(
             layer_module, args.hook_point
         ) as captured:
-            model(**encoded, use_cache=False)
+            forward_backbone(model, encoded)
         hidden = captured["activation"]
 
         for local_i, row in enumerate(batch_rows):

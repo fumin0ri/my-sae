@@ -4,29 +4,45 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# One-command, leakage-aware confirmatory experiment. Every value can be
-# overridden from the environment without editing this file.
-MODEL="${MODEL:-EleutherAI/pythia-70m-deduped}"
-LAYER="${LAYER:-3}"
-WINDOW_SIZE="${WINDOW_SIZE:-48}"
-CONTEXT_WIDTH="${CONTEXT_WIDTH:-24}"
-TARGET_SIZES="${TARGET_SIZES:-2,4,8}"
+# One-command RTX 4090 (24GB) profile. Pythia-6.9B is the largest suite member
+# that leaves enough VRAM for the 8x predictive SAE during causal intervention.
+MODEL="${MODEL:-EleutherAI/pythia-6.9b-deduped}"
+LAYER="${LAYER:-16}"
+WINDOW_SIZE="${WINDOW_SIZE:-64}"
+CONTEXT_WIDTH="${CONTEXT_WIDTH:-32}"
+TARGET_SIZES="${TARGET_SIZES:-2,4,8,16}"
 GAPS="${GAPS:-2,4,8}"
-D_SAE="${D_SAE:-2048}"
-K="${K:-32}"
-STEPS="${STEPS:-3000}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+D_SAE="${D_SAE:-32768}"
+K="${K:-64}"
+PREDICTOR_WIDTH="${PREDICTOR_WIDTH:-256}"
+PREDICTOR_HEADS="${PREDICTOR_HEADS:-8}"
+PREDICTOR_LAYERS="${PREDICTOR_LAYERS:-3}"
+STEPS="${STEPS:-12000}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
+EXTRACT_BATCH_SIZE="${EXTRACT_BATCH_SIZE:-8}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+PROBLEMS="${PROBLEMS:-256}"
+PAIRS="${PAIRS:-64}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/predictive-research}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB")'
+mkdir -p "$RUN_DIR"
+git rev-parse HEAD > "$RUN_DIR/code-commit.txt"
+python -m pip freeze > "$RUN_DIR/python-environment.txt"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
+  > "$RUN_DIR/gpu-environment.csv"
 
 echo "[1/8] Generate paraphrase-grouped state-tracking data and independent causal pairs"
 python scripts/make_research_data.py \
   --prompts-output data/research/prompts.jsonl \
   --pairs-output data/research/pairs.jsonl \
-  --problems 128 \
+  --problems "$PROBLEMS" \
   --paraphrases 4 \
-  --pairs 32 \
+  --pairs "$PAIRS" \
   --seed 0
 
 echo "[2/8] Extract frozen residual windows at the prespecified layer"
@@ -37,9 +53,10 @@ sr-extract-grid \
   --layers "$LAYER" \
   --hook-point post \
   --window-size "$WINDOW_SIZE" \
-  --batch-size 16 \
-  --max-length 256 \
-  --dtype float32
+  --batch-size "$EXTRACT_BATCH_SIZE" \
+  --max-length 384 \
+  --dtype bfloat16 \
+  --storage-dtype bfloat16
 
 ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
 
@@ -50,12 +67,21 @@ sr-train-predictive-sae \
   --objective joint \
   --d-sae "$D_SAE" \
   --k "$K" \
+  --d-model "$PREDICTOR_WIDTH" \
+  --n-heads "$PREDICTOR_HEADS" \
+  --n-layers "$PREDICTOR_LAYERS" \
   --context-width "$CONTEXT_WIDTH" \
   --target-sizes "$TARGET_SIZES" \
   --gaps "$GAPS" \
   --context-mode causal \
   --steps "$STEPS" \
   --batch-size "$BATCH_SIZE" \
+  --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
+  --amp-dtype bfloat16 \
+  --lr 0.0002 \
+  --warmup-steps 500 \
+  --num-workers 2 \
+  --log-every 500 \
   --device "$TRAIN_DEVICE" \
   --seed 0
 
@@ -66,12 +92,21 @@ sr-train-predictive-sae \
   --objective posthoc \
   --d-sae "$D_SAE" \
   --k "$K" \
+  --d-model "$PREDICTOR_WIDTH" \
+  --n-heads "$PREDICTOR_HEADS" \
+  --n-layers "$PREDICTOR_LAYERS" \
   --context-width "$CONTEXT_WIDTH" \
   --target-sizes "$TARGET_SIZES" \
   --gaps "$GAPS" \
   --context-mode causal \
   --steps "$STEPS" \
   --batch-size "$BATCH_SIZE" \
+  --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
+  --amp-dtype bfloat16 \
+  --lr 0.0002 \
+  --warmup-steps 500 \
+  --num-workers 2 \
+  --log-every 500 \
   --device "$TRAIN_DEVICE" \
   --seed 0
 
@@ -83,7 +118,7 @@ sr-evaluate-predictive-sae \
   --output-dir "$RUN_DIR/analysis" \
   --label-key state \
   --group-key group_id \
-  --batch-size 64 \
+  --batch-size "$EVAL_BATCH_SIZE" \
   --device "$TRAIN_DEVICE" \
   --seed 0
 

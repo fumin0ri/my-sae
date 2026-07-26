@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,6 +23,58 @@ def parse_int_tuple(value: str) -> tuple[int, ...]:
     if not values or any(item < 1 for item in values):
         raise argparse.ArgumentTypeError("expected positive comma-separated integers")
     return values
+
+
+def configure_accelerator(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+
+def autocast_context(device: torch.device, amp_dtype: str):
+    if device.type != "cuda" or amp_dtype == "none":
+        return nullcontext()
+    dtype = {
+        "bfloat16": torch.bfloat16,
+    }[amp_dtype]
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def cosine_learning_rate(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_steps: int,
+    minimum_ratio: float,
+) -> float:
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_lr * step / warmup_steps
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    multiplier = minimum_ratio + (1.0 - minimum_ratio) * 0.5 * (
+        1.0 + math.cos(math.pi * progress)
+    )
+    return base_lr * multiplier
+
+
+def build_adamw(
+    parameters: Iterable[torch.nn.Parameter],
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+) -> tuple[torch.optim.AdamW, bool]:
+    fused = device.type == "cuda"
+    optimizer = torch.optim.AdamW(
+        list(parameters),
+        lr=lr,
+        weight_decay=weight_decay,
+        fused=fused,
+    )
+    return optimizer, fused
 
 
 @dataclass(frozen=True)
@@ -295,6 +348,7 @@ def predictive_loss(
     span: SpanSpec,
     prediction_weight: float,
     residual_prediction_weight: float,
+    collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     outputs = model(x, span)
     scale = x.var(dim=(0, 1), unbiased=False).mean().clamp_min(1e-8)
@@ -312,26 +366,36 @@ def predictive_loss(
     loss = reconstruction + prediction_weight * (
         code_prediction + residual_prediction_weight * residual_prediction
     )
-    metrics = {
-        "loss": float(loss.detach().item()),
-        "reconstruction_fvu": float(reconstruction.detach().item()),
-        "code_prediction_loss": float(code_prediction.detach().item()),
-        "code_cosine": float(cosine.detach().item()),
-        "code_nrmse": float(code_nrmse.detach().item()),
-        "residual_prediction_fvu": float(residual_prediction.detach().item()),
-        "l0": float((outputs["codes"] > 0).float().sum(dim=-1).mean().item()),
-        "predictable_energy_fraction": float(
-            (
-                outputs["predictable"] - model.pre_bias
-            ).square().sum(dim=-1).mean().div(
-                (outputs["target"] - model.pre_bias)
-                .square()
+    metrics: dict[str, float] = {}
+    if collect_metrics:
+        metrics = {
+            "loss": float(loss.detach().item()),
+            "reconstruction_fvu": float(reconstruction.detach().item()),
+            "code_prediction_loss": float(code_prediction.detach().item()),
+            "code_cosine": float(cosine.detach().item()),
+            "code_nrmse": float(code_nrmse.detach().item()),
+            "residual_prediction_fvu": float(
+                residual_prediction.detach().item()
+            ),
+            "l0": float(
+                (outputs["codes"] > 0)
+                .float()
                 .sum(dim=-1)
                 .mean()
-                .clamp_min(1e-8)
-            ).detach().item()
-        ),
-    }
+                .item()
+            ),
+            "predictable_energy_fraction": float(
+                (
+                    outputs["predictable"] - model.pre_bias
+                ).square().sum(dim=-1).mean().div(
+                    (outputs["target"] - model.pre_bias)
+                    .square()
+                    .sum(dim=-1)
+                    .mean()
+                    .clamp_min(1e-8)
+                ).detach().item()
+            ),
+        }
     return loss, metrics
 
 
@@ -444,20 +508,22 @@ def evaluate_losses(
     device: torch.device,
     prediction_weight: float,
     residual_prediction_weight: float,
+    amp_dtype: str = "none",
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
     count = 0
     for (x,) in loader:
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         for span in spans:
-            _, metrics = predictive_loss(
-                model,
-                x,
-                span,
-                prediction_weight,
-                residual_prediction_weight,
-            )
+            with autocast_context(device, amp_dtype):
+                _, metrics = predictive_loss(
+                    model,
+                    x,
+                    span,
+                    prediction_weight,
+                    residual_prediction_weight,
+                )
             batch_count = len(x)
             count += batch_count
             for key, value in metrics.items():
@@ -498,12 +564,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--posthoc-fraction",
         type=float,
         default=0.35,
-        help="fraction of posthoc steps reserved for its frozen-SAE predictor",
+        help=(
+            "additional frozen-predictor steps as a fraction of standard-SAE "
+            "steps; the SAE itself always receives the full --steps budget"
+        ),
     )
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
+    parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["none", "bfloat16"],
+        default="bfloat16",
+        help="bfloat16 is recommended for Ampere/Ada GPUs such as RTX 4090",
+    )
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--group-key", default="group_id")
@@ -529,12 +613,19 @@ def main() -> None:
         raise ValueError("--posthoc-fraction must be between 0 and 1")
     if args.steps < 2:
         raise ValueError("--steps must be at least 2")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise ValueError("--min-lr-ratio must be in [0, 1]")
     torch.manual_seed(args.seed)
     device = torch.device(
         args.device
         if not args.device.startswith("cuda") or torch.cuda.is_available()
         else "cpu"
     )
+    configure_accelerator(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     bundle = torch_load(args.activations)
     x = bundle["activations"].float()
     metadata = bundle["metadata"]
@@ -563,11 +654,17 @@ def main() -> None:
         shuffle=True,
         drop_last=False,
         generator=torch.Generator().manual_seed(args.seed),
+        pin_memory=device.type == "cuda",
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
     validation_loader = DataLoader(
         TensorDataset(x[validation_indices]),
         batch_size=args.batch_size,
         shuffle=False,
+        pin_memory=device.type == "cuda",
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
     cfg = PredictiveSAEConfig(
         d_in=x.shape[-1],
@@ -585,10 +682,15 @@ def main() -> None:
     )
     model = PredictiveSparseAutoencoder(cfg).to(device)
     model.initialize_from_data(x[train_indices])
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+    optimizer, fused_optimizer = build_adamw(
+        (
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
+        args.lr,
+        args.weight_decay,
+        device,
     )
     mask_generator = torch.Generator().manual_seed(args.seed + 919)
     target_sizes = tuple(args.target_sizes)
@@ -600,15 +702,26 @@ def main() -> None:
         gaps,
         args.context_mode,
     )
-    posthoc_start = (
-        round(args.steps * (1.0 - args.posthoc_fraction))
+    posthoc_predictor_steps = (
+        max(1, round(args.steps * args.posthoc_fraction))
         if args.objective == "posthoc"
-        else args.steps + 1
+        else 0
     )
+    total_optimizer_steps = args.steps + posthoc_predictor_steps
+    posthoc_start = args.steps + 1
     history: list[dict[str, Any]] = []
     iterator = iter(train_loader)
     phase = "joint" if args.objective == "joint" else "sae"
-    for step in trange(1, args.steps + 1, desc=f"predictive SAE ({args.objective})"):
+    for step in trange(
+        1,
+        total_optimizer_steps + 1,
+        desc=f"predictive SAE ({args.objective})",
+    ):
+        should_log = (
+            step == 1
+            or step % args.log_every == 0
+            or step in {args.steps, total_optimizer_steps}
+        )
         if args.objective == "posthoc" and step == posthoc_start:
             phase = "posthoc_predictor"
             for parameter in (
@@ -617,49 +730,109 @@ def main() -> None:
             ):
                 parameter.requires_grad_(False)
             model.target_encoder.load_state_dict(model.encoder.state_dict())
-            optimizer = torch.optim.AdamW(
-                [
+            optimizer, _ = build_adamw(
+                (
                     parameter
                     for parameter in model.parameters()
                     if parameter.requires_grad
-                ],
-                lr=args.lr,
-                weight_decay=args.weight_decay,
+                ),
+                args.lr,
+                args.weight_decay,
+                device,
             )
-        try:
-            (batch,) = next(iterator)
-        except StopIteration:
-            iterator = iter(train_loader)
-            (batch,) = next(iterator)
-        target_size = target_sizes[
-            int(torch.randint(len(target_sizes), (1,), generator=mask_generator).item())
-        ]
-        gap = gaps[int(torch.randint(len(gaps), (1,), generator=mask_generator).item())]
-        span = make_span_spec(
-            window_size,
-            args.context_width,
-            target_size,
-            gap,
-            args.context_mode,
-            generator=mask_generator,
+        phase_step = (
+            step - args.steps
+            if phase == "posthoc_predictor"
+            else step
         )
+        phase_total_steps = (
+            posthoc_predictor_steps
+            if phase == "posthoc_predictor"
+            else args.steps
+        )
+        phase_warmup = min(args.warmup_steps, max(1, phase_total_steps // 10))
+        learning_rate = cosine_learning_rate(
+            phase_step,
+            phase_total_steps,
+            args.lr,
+            phase_warmup,
+            args.min_lr_ratio,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
         active_prediction_weight = (
             0.0 if args.objective == "posthoc" and phase == "sae" else args.prediction_weight
         )
         optimizer.zero_grad(set_to_none=True)
-        loss, metrics = predictive_loss(
-            model,
-            batch.to(device),
-            span,
-            active_prediction_weight,
-            args.residual_prediction_weight,
-        )
-        loss.backward()
+        metric_sums: dict[str, float] = {}
+        for _micro_step in range(args.gradient_accumulation_steps):
+            try:
+                (batch,) = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                (batch,) = next(iterator)
+            target_size = target_sizes[
+                int(
+                    torch.randint(
+                        len(target_sizes),
+                        (1,),
+                        generator=mask_generator,
+                    ).item()
+                )
+            ]
+            gap = gaps[
+                int(
+                    torch.randint(
+                        len(gaps),
+                        (1,),
+                        generator=mask_generator,
+                    ).item()
+                )
+            ]
+            span = make_span_spec(
+                window_size,
+                args.context_width,
+                target_size,
+                gap,
+                args.context_mode,
+                generator=mask_generator,
+            )
+            batch = batch.to(device, non_blocking=True)
+            with autocast_context(device, args.amp_dtype):
+                loss, micro_metrics = predictive_loss(
+                    model,
+                    batch,
+                    span,
+                    active_prediction_weight,
+                    args.residual_prediction_weight,
+                    collect_metrics=should_log,
+                )
+                scaled_loss = loss / args.gradient_accumulation_steps
+            scaled_loss.backward()
+            for key, value in micro_metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
+        metrics = {
+            key: value / args.gradient_accumulation_steps
+            for key, value in metric_sums.items()
+        }
+        if should_log:
+            metrics["learning_rate"] = learning_rate
+        if args.gradient_clip > 0:
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                (
+                    parameter
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ),
+                args.gradient_clip,
+            )
+            if should_log:
+                metrics["gradient_norm"] = float(gradient_norm.item())
         optimizer.step()
         model.normalize_decoder()
         if phase == "joint":
             model.update_target_encoder()
-        if step == 1 or step % args.log_every == 0 or step == args.steps:
+        if should_log:
             validation = evaluate_losses(
                 model,
                 validation_loader,
@@ -667,6 +840,7 @@ def main() -> None:
                 device,
                 args.prediction_weight,
                 args.residual_prediction_weight,
+                args.amp_dtype,
             )
             history.append(
                 {
@@ -713,10 +887,52 @@ def main() -> None:
             "n_train_windows": len(train_indices),
             "n_validation_windows": len(validation_indices),
             "n_locked_test_windows": len(test_indices),
+            "optimizer_budget": {
+                "sae_steps": args.steps,
+                "posthoc_predictor_steps": posthoc_predictor_steps,
+                "total_optimizer_steps": total_optimizer_steps,
+            },
             "mask_grid": {
                 "context_width": args.context_width,
                 "target_sizes": list(target_sizes),
                 "gaps": list(gaps),
+            },
+            "accelerator": {
+                "device": str(device),
+                "device_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else "CPU"
+                ),
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "compute_capability": (
+                    list(torch.cuda.get_device_capability(device))
+                    if device.type == "cuda"
+                    else None
+                ),
+                "amp_dtype": (
+                    args.amp_dtype if device.type == "cuda" else "none"
+                ),
+                "tf32_enabled": device.type == "cuda",
+                "fused_adamw": fused_optimizer,
+                "micro_batch_size": args.batch_size,
+                "gradient_accumulation_steps": (
+                    args.gradient_accumulation_steps
+                ),
+                "effective_batch_size": (
+                    args.batch_size * args.gradient_accumulation_steps
+                ),
+                "peak_allocated_gib": (
+                    torch.cuda.max_memory_allocated(device) / 2**30
+                    if device.type == "cuda"
+                    else None
+                ),
+                "peak_reserved_gib": (
+                    torch.cuda.max_memory_reserved(device) / 2**30
+                    if device.type == "cuda"
+                    else None
+                ),
             },
             "history": history,
             "final_validation": history[-1]["validation"],

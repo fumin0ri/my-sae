@@ -10,6 +10,7 @@ from tqdm import tqdm
 from .extract import _record_range, window_starts
 from .io import read_jsonl
 from .modeling import (
+    forward_backbone,
     get_layer,
     input_device,
     load_hf_model,
@@ -78,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["float32", "float16", "bfloat16"],
         default="bfloat16",
     )
+    parser.add_argument(
+        "--storage-dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="bfloat16",
+        help="bfloat16 halves activation disk/RAM use without narrowing range",
+    )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--revision")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -100,6 +107,15 @@ def main() -> None:
         args.trust_remote_code,
         args.revision,
     )
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    storage_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[args.storage_dtype]
     paths, captured, handles = register_multi_hooks(
         model,
         args.layers,
@@ -123,6 +139,7 @@ def main() -> None:
                 padding=True,
                 truncation=True,
                 max_length=args.max_length,
+                pad_to_multiple_of=8,
                 return_tensors="pt",
             )
             encoded = {
@@ -131,7 +148,7 @@ def main() -> None:
             }
             captured.clear()
             with torch.inference_mode():
-                model(**encoded, use_cache=False)
+                forward_backbone(model, encoded)
             missing_layers = set(args.layers) - set(captured)
             if missing_layers:
                 raise RuntimeError(f"hooks did not capture layers {missing_layers}")
@@ -159,7 +176,7 @@ def main() -> None:
                         activations[layer].append(
                             captured[layer][local_index, start:end]
                             .detach()
-                            .to(torch.float32)
+                            .to(storage_dtype)
                             .cpu()
                         )
                     token_ids_out.append(ids)
@@ -210,6 +227,19 @@ def main() -> None:
                 "window_mode": args.window_mode,
                 "stride": args.stride,
                 "dtype": args.dtype,
+                "storage_dtype": args.storage_dtype,
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "gpu_name": (
+                    torch.cuda.get_device_name()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "attention_implementation": getattr(
+                    model.config,
+                    "_attn_implementation",
+                    None,
+                ),
                 "requested_revision": args.revision,
                 "resolved_model_revision": getattr(
                     model.config,

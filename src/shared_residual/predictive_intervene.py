@@ -9,7 +9,13 @@ from tqdm import tqdm
 
 from .intervene import answer_logprob, capture, tokenize_text
 from .io import read_jsonl, torch_load, write_jsonl
-from .modeling import edit_residual, get_layer, input_device, load_hf_model
+from .modeling import (
+    edit_residual,
+    get_layer,
+    input_device,
+    load_hf_model,
+    parse_dtype,
+)
 from .predictive_sae import (
     PredictiveSAEConfig,
     PredictiveSparseAutoencoder,
@@ -74,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["float32", "float16", "bfloat16"],
         default="bfloat16",
     )
+    parser.add_argument(
+        "--sae-dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="bfloat16",
+        help="Use BF16 to keep a large SAE resident beside the LLM on a 24GB GPU",
+    )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--revision")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -131,6 +143,7 @@ def main() -> None:
             f"checkpoint layer path {fitted_layer_path!r} != loaded {layer_path!r}"
         )
     token_device = input_device(llm)
+    sae_dtype = parse_dtype(args.sae_dtype)
     results: list[dict[str, Any]] = []
     for row_index, row in enumerate(tqdm(rows, desc=f"predictive {args.mode}")):
         source_ids = tokenize_text(
@@ -166,13 +179,15 @@ def main() -> None:
             source_ids,
         )
         hidden_device = target_hidden.device
-        psae.to(hidden_device)
+        psae.to(device=hidden_device, dtype=sae_dtype)
         target_window_start = len(target_prefix_ids) - width
         target_window = target_hidden[
             0,
             target_window_start : len(target_prefix_ids),
-        ].float()[None, :, :]
-        source_window = source_hidden[0, -width:].float()[None, :, :]
+        ].to(dtype=sae_dtype)[None, :, :]
+        source_window = source_hidden[0, -width:].to(
+            dtype=sae_dtype
+        )[None, :, :]
         with torch.inference_mode():
             source_codes, _ = psae.predict_codes(source_window, span)
             target_codes, _ = psae.predict_codes(target_window, span)

@@ -1,12 +1,30 @@
+import math
+
 import torch
 
 from shared_residual.predictive_sae import (
     PredictiveSAEConfig,
     PredictiveSparseAutoencoder,
+    cosine_learning_rate,
     grouped_three_way_split,
     make_span_spec,
     predictive_loss,
 )
+
+
+def test_cosine_schedule_warms_up_and_decays() -> None:
+    assert math.isclose(
+        cosine_learning_rate(1, 100, 1e-3, 10, 0.1),
+        1e-4,
+    )
+    assert math.isclose(
+        cosine_learning_rate(10, 100, 1e-3, 10, 0.1),
+        1e-3,
+    )
+    assert math.isclose(
+        cosine_learning_rate(100, 100, 1e-3, 10, 0.1),
+        1e-4,
+    )
 
 
 def test_causal_span_never_uses_right_context() -> None:

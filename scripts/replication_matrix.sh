@@ -5,21 +5,35 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 # Format: model|comma-separated-layers;model|comma-separated-layers
-MODEL_SPECS="${MODEL_SPECS:-EleutherAI/pythia-70m-deduped|1,3,5;EleutherAI/pythia-160m-deduped|3,7,11;EleutherAI/pythia-410m-deduped|5,11,17}"
+MODEL_SPECS="${MODEL_SPECS:-EleutherAI/pythia-1.4b-deduped|5,11,17;EleutherAI/pythia-2.8b-deduped|7,15,23;EleutherAI/pythia-6.9b-deduped|7,15,23}"
 TASK_FAMILIES="${TASK_FAMILIES:-fsm,arithmetic,logic}"
 SEEDS="${SEEDS:-0,1,2}"
-STEPS="${STEPS:-10000}"
+STEPS="${STEPS:-12000}"
 PROBLEMS="${PROBLEMS:-300}"
 WINDOW_SIZE="${WINDOW_SIZE:-64}"
 CONTEXT_WIDTH="${CONTEXT_WIDTH:-32}"
-TARGET_SIZES="${TARGET_SIZES:-2,4,8}"
+TARGET_SIZES="${TARGET_SIZES:-2,4,8,16}"
 GAPS="${GAPS:-2,4,8}"
 EXPANSION="${EXPANSION:-8}"
 K="${K:-64}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
+PREDICTOR_WIDTH="${PREDICTOR_WIDTH:-256}"
+PREDICTOR_HEADS="${PREDICTOR_HEADS:-8}"
+PREDICTOR_LAYERS="${PREDICTOR_LAYERS:-3}"
+EXTRACT_BATCH_SIZE="${EXTRACT_BATCH_SIZE:-8}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-0}"
 STUDY_ROOT="${STUDY_ROOT:-runs/predictive-replication}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB")'
+mkdir -p "$STUDY_ROOT"
+git rev-parse HEAD > "$STUDY_ROOT/code-commit.txt"
+python -m pip freeze > "$STUDY_ROOT/python-environment.txt"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
+  > "$STUDY_ROOT/gpu-environment.csv"
 
 IFS=';' read -r -a specifications <<< "$MODEL_SPECS"
 IFS=',' read -r -a feature_seeds <<< "$SEEDS"
@@ -50,9 +64,10 @@ for task_family in "${task_families[@]}"; do
       --layers "$layers" \
       --hook-point post \
       --window-size "$WINDOW_SIZE" \
-      --batch-size 8 \
+      --batch-size "$EXTRACT_BATCH_SIZE" \
       --max-length 384 \
-      --dtype float32
+      --dtype bfloat16 \
+      --storage-dtype bfloat16
 
     IFS=',' read -r -a layer_indices <<< "$layers"
     for layer in "${layer_indices[@]}"; do
@@ -67,12 +82,21 @@ for task_family in "${task_families[@]}"; do
           --activations "$activations"
           --d-sae "$d_sae"
           --k "$K"
+          --d-model "$PREDICTOR_WIDTH"
+          --n-heads "$PREDICTOR_HEADS"
+          --n-layers "$PREDICTOR_LAYERS"
           --context-width "$CONTEXT_WIDTH"
           --target-sizes "$TARGET_SIZES"
           --gaps "$GAPS"
           --context-mode causal
           --steps "$STEPS"
           --batch-size "$BATCH_SIZE"
+          --gradient-accumulation-steps "$GRADIENT_ACCUMULATION"
+          --amp-dtype bfloat16
+          --lr 0.0002
+          --warmup-steps 500
+          --num-workers 2
+          --log-every 500
           --device "$TRAIN_DEVICE"
           --seed "$seed"
           --split-seed 0
@@ -90,6 +114,7 @@ for task_family in "${task_families[@]}"; do
           --joint-checkpoint "$run_dir/joint/predictive_sae.pt" \
           --baseline-checkpoint "$run_dir/posthoc/predictive_sae.pt" \
           --output-dir "$run_dir/analysis" \
+          --batch-size "$EVAL_BATCH_SIZE" \
           --device "$TRAIN_DEVICE" \
           --seed "$seed"
 

@@ -20,10 +20,27 @@ pip install -e .
 bash scripts/research_quickstart.sh
 ```
 
-デフォルトではPythia-70Mのlayer 3を使い、次を一括実行します。
+デフォルトは**単一RTX 4090（24GB）向けprofile**です。
+
+| 項目 | 設定 |
+|---|---:|
+| frozen LLM | `EleutherAI/pythia-6.9b-deduped` |
+| residual layer | 16 / 32 |
+| residual width | 4,096 |
+| SAE dictionary | 32,768 features（8× expansion） |
+| sparsity | Top-K 64 |
+| JEPA predictor | width 256、8 heads、3 layers |
+| mask | context 32、gap 2/4/8、target 2/4/8/16 |
+| training | BF16 autocast + TF32 + fused AdamW |
+| batch | micro 16 × accumulation 2 = effective 32 |
+| optimizer steps | 12,000 |
+
+Pythia-12BはBF16重みだけで24GB級となり、因果介入時にSAEを同じGPUへ置けません。6.9Bは32層・hidden 4,096で、8× SAEと同居できる最大寄りの構成です。
+
+次を一括実行します。
 
 1. paraphraseをproblem groupとして管理したcontrolled benchmarkを生成
-2. frozen LLMから48-token residual windowを抽出
+2. frozen LLMから64-token residual windowをBF16で抽出
 3. JEPA-regularized SAEを学習
 4. standard SAE + frozen post-hoc predictorを同じsplitで学習
 5. 未使用のlocked testを一度だけ評価
@@ -36,6 +53,8 @@ bash scripts/research_quickstart.sh
 ```text
 runs/predictive-research/report/index.html
 ```
+
+同じrun directoryにcode commit、`pip freeze`、GPU名・VRAM・driverも保存されます。
 
 SSH先でレポートを見る場合:
 
@@ -54,20 +73,29 @@ ssh -L 8000:localhost:8000 <user>@<ssh-host>
 最初に軽く動作確認する場合:
 
 ```bash
-STEPS=300 D_SAE=512 RUN_CAUSAL=0 bash scripts/research_quickstart.sh
-```
-
-GPUメモリに合わせて変更する場合:
-
-```bash
-MODEL=EleutherAI/pythia-410m-deduped \
-LAYER=12 \
-D_SAE=8192 \
-K=64 \
-BATCH_SIZE=16 \
-STEPS=10000 \
+MODEL=EleutherAI/pythia-70m-deduped \
+LAYER=3 \
+D_SAE=2048 \
+PREDICTOR_WIDTH=128 \
+PREDICTOR_HEADS=4 \
+PREDICTOR_LAYERS=2 \
+STEPS=300 \
+PROBLEMS=40 \
+EXTRACT_BATCH_SIZE=32 \
+RUN_CAUSAL=0 \
 bash scripts/research_quickstart.sh
 ```
+
+OOMになった場合は、まずmicro batchだけを下げてeffective batchを維持します。
+
+```bash
+BATCH_SIZE=8 \
+GRADIENT_ACCUMULATION=4 \
+EXTRACT_BATCH_SIZE=4 \
+bash scripts/research_quickstart.sh
+```
+
+それでも不足する場合のみ `D_SAE=16384` に下げてください。学習レポートにはGPU名、AMP/TF32/fused optimizerの状態、effective batch、peak allocated/reserved VRAMが保存されます。
 
 ## モデル
 
@@ -158,7 +186,7 @@ locked testで自動生成する主な結果:
 
 詳しいconfirmatory hypothesis、falsification条件、replication matrixは [docs/RESEARCH_PROTOCOL.md](docs/RESEARCH_PROTOCOL.md) に固定しています。
 
-3 model size × 3 layer × 3 seedのprespecified replicationを回す場合:
+Pythia 1.4B / 2.8B / 6.9B × 3 layer × 3 task family × 3 feature seedのprespecified replicationを回す場合:
 
 ```bash
 bash scripts/replication_matrix.sh
@@ -175,6 +203,7 @@ runs/predictive-replication/summary/replication_summary.csv
 
 ```bash
 MODEL_SPECS='EleutherAI/pythia-70m-deduped|1,3,5' \
+TASK_FAMILIES=fsm \
 SEEDS=0 \
 STEPS=300 \
 PROBLEMS=40 \
@@ -187,37 +216,49 @@ bash scripts/replication_matrix.sh
 
 ```bash
 sr-train-predictive-sae \
-  --activations runs/layer-003.pt \
+  --activations runs/layer-016.pt \
   --output-dir runs/joint \
   --objective joint \
-  --d-sae 8192 \
+  --d-sae 32768 \
   --k 64 \
+  --d-model 256 \
+  --n-heads 8 \
+  --n-layers 3 \
   --context-width 32 \
-  --target-sizes 2,4,8 \
+  --target-sizes 2,4,8,16 \
   --gaps 2,4,8 \
-  --steps 20000
+  --steps 12000 \
+  --batch-size 16 \
+  --gradient-accumulation-steps 2 \
+  --amp-dtype bfloat16
 ```
 
 通常SAE control:
 
 ```bash
 sr-train-predictive-sae \
-  --activations runs/layer-003.pt \
+  --activations runs/layer-016.pt \
   --output-dir runs/posthoc \
   --objective posthoc \
-  --d-sae 8192 \
+  --d-sae 32768 \
   --k 64 \
+  --d-model 256 \
+  --n-heads 8 \
+  --n-layers 3 \
   --context-width 32 \
-  --target-sizes 2,4,8 \
+  --target-sizes 2,4,8,16 \
   --gaps 2,4,8 \
-  --steps 20000
+  --steps 12000 \
+  --batch-size 16 \
+  --gradient-accumulation-steps 2 \
+  --amp-dtype bfloat16
 ```
 
 locked evaluation:
 
 ```bash
 sr-evaluate-predictive-sae \
-  --activations runs/layer-003.pt \
+  --activations runs/layer-016.pt \
   --joint-checkpoint runs/joint/predictive_sae.pt \
   --baseline-checkpoint runs/posthoc/predictive_sae.pt \
   --output-dir runs/analysis
@@ -227,11 +268,11 @@ featureを限定した因果介入:
 
 ```bash
 sr-intervene-predictive-sae \
-  --model EleutherAI/pythia-70m-deduped \
+  --model EleutherAI/pythia-6.9b-deduped \
   --pairs data/research/pairs.jsonl \
   --checkpoint runs/joint/predictive_sae.pt \
   --output runs/analysis/feature-ablation.jsonl \
-  --layer 3 \
+  --layer 16 \
   --mode ablate \
   --feature-ids 17,92,301 \
   --target-size 4 \
@@ -256,6 +297,7 @@ sr-visualize-predictive-sae --run-dir runs/predictive-research
 
 ## 関連する一次資料
 
+- [Pythia: Interpreting Transformers Across Time and Scale](https://github.com/EleutherAI/pythia)
 - [I-JEPA: Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture](https://arxiv.org/abs/2301.08243)
 - [Joint Embedding Predictive Architectures Focus on Slow Features](https://arxiv.org/abs/2211.10831)
 - [LLM-JEPA: Large Language Models Meet Joint-Embedding Predictive Architectures](https://arxiv.org/abs/2509.14252)

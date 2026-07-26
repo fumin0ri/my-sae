@@ -251,7 +251,7 @@ The computational-state interpretation is not supported when any of these hold:
 
 Minimum serious study:
 
-- 3 sizes from one model family;
+- Pythia 1.4B, 2.8B, and 6.9B on a single RTX 4090;
 - 1 independently trained second model family;
 - residual-pre and residual-post;
 - prespecified early, middle, and late layers;
@@ -261,6 +261,13 @@ Minimum serious study:
 - dictionary expansion factors 4×, 8×, and 16× residual width;
 - Top-K values selected to match reconstruction quality;
 - causal dose response at alpha 0.25, 0.5, 1.0, and 2.0.
+
+The prespecified RTX 4090 primary run uses Pythia-6.9B layer 16, an 8x
+dictionary (32,768 features), Top-K 64, a three-layer width-256 predictor,
+BF16 autocast, TF32, fused AdamW, and an effective batch of 32. Pythia-12B is
+excluded from the single-GPU confirmatory matrix because its BF16 LLM weights
+alone consume approximately the full 24GB budget and cannot coexist with the
+SAE during causal intervention.
 
 Model × task × seed is the replication unit. Compute intervals by resampling
 independent problem groups or causal pairs, never individual overlapping token

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.2.0"
+version = "0.2.1"
 description = "Learn and causally test predictive sparse states in LLM residual streams"
 requires-python = ">=3.10"
 dependencies = [

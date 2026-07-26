@@ -18,6 +18,8 @@ from .io import torch_load, write_json
 from .predictive_sae import (
     PredictiveSAEConfig,
     PredictiveSparseAutoencoder,
+    autocast_context,
+    configure_accelerator,
     fixed_spans,
     predictive_loss,
 )
@@ -45,6 +47,7 @@ def collect_representations(
     spans: list[Any],
     batch_size: int,
     device: torch.device,
+    amp_dtype: str = "none",
 ) -> dict[str, torch.Tensor]:
     collected: dict[str, list[torch.Tensor]] = {
         "target_code": [],
@@ -60,7 +63,8 @@ def collect_representations(
             key: [] for key in collected
         }
         for span in spans:
-            outputs = model(batch, span)
+            with autocast_context(device, amp_dtype):
+                outputs = model(batch, span)
             per_span["target_code"].append(outputs["target_codes"].mean(dim=1))
             per_span["predicted_code"].append(
                 outputs["predicted_codes"].mean(dim=1)
@@ -251,6 +255,7 @@ def gap_curve(
     spans: list[Any],
     batch_size: int,
     device: torch.device,
+    amp_dtype: str = "none",
 ) -> list[dict[str, float | int]]:
     loader = DataLoader(
         TensorDataset(x[indices]),
@@ -262,13 +267,14 @@ def gap_curve(
         sums: dict[str, float] = {}
         count = 0
         for (batch,) in loader:
-            _, metrics = predictive_loss(
-                model,
-                batch.to(device),
-                span,
-                prediction_weight=1.0,
-                residual_prediction_weight=0.1,
-            )
+            with autocast_context(device, amp_dtype):
+                _, metrics = predictive_loss(
+                    model,
+                    batch.to(device, non_blocking=True),
+                    span,
+                    prediction_weight=1.0,
+                    residual_prediction_weight=0.1,
+                )
             count += len(batch)
             for key, value in metrics.items():
                 sums[key] = sums.get(key, 0.0) + len(batch) * value
@@ -292,6 +298,7 @@ def shuffled_context_curve(
     spans: list[Any],
     batch_size: int,
     device: torch.device,
+    amp_dtype: str = "none",
 ) -> list[dict[str, float | int]]:
     loader = DataLoader(
         TensorDataset(x[indices]),
@@ -318,10 +325,14 @@ def shuffled_context_curve(
                 shifts=max(1, len(batch) // 2),
                 dims=0,
             )
-            predicted_codes, _ = model.predict_codes(shuffled_context, span)
-            target = batch.index_select(1, target_indices)
-            target_codes = model.encode_target(target)
-            predictable = model.decode(predicted_codes)
+            with autocast_context(device, amp_dtype):
+                predicted_codes, _ = model.predict_codes(
+                    shuffled_context,
+                    span,
+                )
+                target = batch.index_select(1, target_indices)
+                target_codes = model.encode_target(target)
+                predictable = model.decode(predicted_codes)
             cosine_sum += float(
                 F.cosine_similarity(
                     predicted_codes,
@@ -411,6 +422,7 @@ def main() -> None:
         if not args.device.startswith("cuda") or torch.cuda.is_available()
         else "cpu"
     )
+    configure_accelerator(device)
     bundle = torch_load(args.activations)
     x = bundle["activations"].float()
     metadata = bundle["metadata"]
@@ -422,6 +434,11 @@ def main() -> None:
     train_indices = list(split["train_indices"]) + list(split["validation_indices"])
     test_indices = list(split["test_indices"])
     train_args = joint.checkpoint["train_args"]
+    amp_dtype = (
+        str(train_args.get("amp_dtype", "bfloat16"))
+        if device.type == "cuda"
+        else "none"
+    )
     spans = fixed_spans(
         x.shape[1],
         joint.model.cfg.context_width,
@@ -435,6 +452,7 @@ def main() -> None:
         spans,
         args.batch_size,
         device,
+        amp_dtype,
     )
     baseline_representations = collect_representations(
         baseline.model,
@@ -442,6 +460,7 @@ def main() -> None:
         spans,
         args.batch_size,
         device,
+        amp_dtype,
     )
     representations = {
         "joint_predictable_code": joint_representations["predicted_code"],
@@ -589,6 +608,7 @@ def main() -> None:
                 spans,
                 args.batch_size,
                 device,
+                amp_dtype,
             ),
             "posthoc": gap_curve(
                 baseline.model,
@@ -597,6 +617,7 @@ def main() -> None:
                 spans,
                 args.batch_size,
                 device,
+                amp_dtype,
             ),
         },
         "shuffled_context_null": {
@@ -607,6 +628,7 @@ def main() -> None:
                 spans,
                 args.batch_size,
                 device,
+                amp_dtype,
             ),
             "posthoc": shuffled_context_curve(
                 baseline.model,
@@ -615,6 +637,7 @@ def main() -> None:
                 spans,
                 args.batch_size,
                 device,
+                amp_dtype,
             ),
         },
         "top_predictable_features": top_features(

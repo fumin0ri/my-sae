@@ -32,6 +32,7 @@ def load_hf_model(
     device_map: str = "auto",
     trust_remote_code: bool = False,
     revision: str | None = None,
+    attn_implementation: str = "sdpa",
 ) -> tuple[Any, Any]:
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -47,6 +48,7 @@ def load_hf_model(
         device_map=device_map,
         trust_remote_code=trust_remote_code,
         revision=revision,
+        attn_implementation=attn_implementation,
     )
     model.eval()
     return model, tokenizer
@@ -54,6 +56,11 @@ def load_hf_model(
 
 def input_device(model: Any) -> torch.device:
     return model.get_input_embeddings().weight.device
+
+
+def forward_backbone(model: Any, encoded: dict[str, torch.Tensor]) -> Any:
+    """Run transformer blocks without the expensive vocabulary projection."""
+    return model.base_model(**encoded, use_cache=False, return_dict=True)
 
 
 def find_layer_stack(model: Any) -> tuple[str, Any]:
