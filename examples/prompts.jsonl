@@ -1,0 +1,4 @@
+{"id":"capital-france","label":"geography","text":"Question: What is the capital of France?\nReason briefly, then answer. France is a country in Western Europe. Its capital city is"}
+{"id":"capital-japan","label":"geography","text":"Question: What is the capital of Japan?\nReason briefly, then answer. Japan is an island country in East Asia. Its capital city is"}
+{"id":"arithmetic-1","label":"arithmetic","text":"Question: Compute 17 + 25.\nReason briefly, then answer. Adding the tens and units gives"}
+{"id":"arithmetic-2","label":"arithmetic","text":"Question: Compute 34 + 19.\nReason briefly, then answer. Adding the tens and units gives"}

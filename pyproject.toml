@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shared-residual"
+version = "0.1.0"
+description = "Extract and causally test token-shared residual-stream representations"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.30",
+  "numpy>=1.26",
+  "scikit-learn>=1.4",
+  "torch>=2.2",
+  "tqdm>=4.66",
+  "transformers>=4.44",
+]
+
+[project.optional-dependencies]
+sae = ["sae-lens>=6.0", "transformer-lens>=2.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+sr-extract = "shared_residual.extract:main"
+sr-fit = "shared_residual.subspace:main"
+sr-sae = "shared_residual.sae_analysis:main"
+sr-intervene = "shared_residual.intervene:main"
+sr-train-group-sae = "shared_residual.group_sae:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
