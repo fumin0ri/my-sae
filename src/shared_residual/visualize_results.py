@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .io import read_jsonl, write_json
+from .io import read_jsonl, torch_load, write_json
 
 
 SERIES = {
@@ -294,6 +294,39 @@ def plot_spectrum(locked: dict[str, Any], figures_dir: Path) -> None:
     save_figure(fig, figures_dir, "shared-spectrum")
 
 
+def plot_code_embedding(research_dir: Path, figures_dir: Path) -> None:
+    bundle = torch_load(research_dir / "final_codes.pt")
+    codes = bundle["codes"].float().numpy()
+    metadata = bundle["metadata"]
+    centered = codes - codes.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    width = min(2, vh.shape[0])
+    embedded = centered @ vh[:width].T
+    if width == 1:
+        embedded = np.column_stack([embedded[:, 0], np.zeros(len(embedded))])
+    label_key = str(bundle.get("label_key", "state"))
+    labels = [str(row.get(label_key, "unknown")) for row in metadata]
+    unique = sorted(set(labels))
+    fig, ax = plt.subplots(figsize=(7.2, 5.5))
+    colors = plt.get_cmap("tab10")
+    for index, label in enumerate(unique):
+        mask = np.asarray([value == label for value in labels])
+        ax.scatter(
+            embedded[mask, 0],
+            embedded[mask, 1],
+            s=20,
+            alpha=0.6,
+            label=label,
+            color=colors(index % 10),
+        )
+    ax.set_xlabel("Shared-code PC 1")
+    ax.set_ylabel("Shared-code PC 2")
+    ax.set_title("Window states in the selected shared subspace")
+    ax.legend(frameon=False, title=label_key)
+    ax.grid(alpha=0.15)
+    save_figure(fig, figures_dir, "shared-code-embedding")
+
+
 def plot_interventions(
     research_dir: Path,
     figures_dir: Path,
@@ -448,6 +481,7 @@ def build_html(
         ("Depth profile and baselines", "figures/depth-profile.png"),
         ("Locked test", "figures/locked-test.png"),
         ("Shared spectrum", "figures/shared-spectrum.png"),
+        ("Shared-code embedding", "figures/shared-code-embedding.png"),
     ]
     if intervention is not None:
         figures.append(
@@ -575,6 +609,7 @@ def main() -> None:
     plot_selected_slice(summary, selection["selected"], figures_dir)
     plot_locked_test(locked, figures_dir)
     plot_spectrum(locked, figures_dir)
+    plot_code_embedding(research_dir, figures_dir)
     intervention = plot_interventions(research_dir, figures_dir)
     build_html(output_dir, selection, locked, best_rows, intervention)
     write_json(

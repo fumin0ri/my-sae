@@ -606,6 +606,7 @@ def main() -> None:
             "codes": common_codes(y_all, final_basis.cpu()),
             "metadata": metadata,
             "selected": selected,
+            "label_key": args.label_key,
         },
         output_dir / "final_codes.pt",
     )

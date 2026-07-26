@@ -36,6 +36,7 @@ runs/research/report/figures/layer-window-icc.{png,pdf}
 runs/research/report/figures/depth-profile.{png,pdf}
 runs/research/report/figures/locked-test.{png,pdf}
 runs/research/report/figures/shared-spectrum.{png,pdf}
+runs/research/report/figures/shared-code-embedding.{png,pdf}
 runs/research/report/figures/causal-interventions.{png,pdf}
 runs/research/report/figures/patch-directionality.{png,pdf}
 ```
