@@ -7,6 +7,43 @@ SAE で記述し、因果介入で検証するための実験コードです。
 「同じ窓の位置間では再現し、別の窓では変化する低ランク部分空間」です。
 平均はその状態の window ごとの座標として使います。
 
+## クイックスタート
+
+以下をそのまま実行すると、公開されている小型モデル
+`EleutherAI/pythia-70m-deduped` を使って、データ生成から residual 抽出、
+共有部分空間の推定、保持データ評価、permutation control まで実行します。
+
+```bash
+git clone https://github.com/fumin0ri/my-sae.git
+cd my-sae
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e .
+bash scripts/quickstart.sh
+```
+
+GPUがない場合も `sr-fit` は自動的にCPUへfallbackします。明示する場合:
+
+```bash
+FIT_DEVICE=cpu bash scripts/quickstart.sh
+```
+
+生成物は次に保存されます。
+
+```text
+data/quickstart.jsonl
+runs/quickstart/activations.pt
+runs/quickstart/shared/subspace.pt
+runs/quickstart/shared/codes.pt
+runs/quickstart/shared/report.json
+```
+
+このquickstartは実行経路と統計量を確認する smoke test です。デモデータでは
+4種類の working-memory state が文章中に明示されています。したがって、ここで
+共有部分空間やprobe精度が得られても「LLMの思考の本質」の証拠にはなりません。
+本実験では後述する minimal pair、paraphrase分離、因果patchを使ってください。
+
 ## 仮説と推定量
 
 layer `l`、window `w`、相対 token 位置 `t` の residual を
@@ -43,6 +80,8 @@ control、split-half の部分空間角を計測します。
 5. token 順序を window 間で崩した permutation control では信号が消える。
 
 ## インストール
+
+上のquickstartを実行済みなら、この節は不要です。
 
 ```bash
 git clone <this-directory-or-copy-it>
