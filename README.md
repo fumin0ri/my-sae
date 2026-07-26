@@ -1,17 +1,14 @@
-# Token-shared residual stream
+# Predictive sparse residual streams
 
-連続する複数トークン位置の residual stream に共通する内部状態を、統計的に抽出し、
-SAE で記述し、因果介入で検証するための実験コードです。
+LLMの「近接tokenに共通する内部状態」を、単なる平均や低ランク相関ではなく、**離れた文脈から予測可能な疎なresidual-space feature**として同定する研究コードです。
 
-結論を先に言うと、最初に試すべき対象は単純な10ベクトルの平均ではなく、
-「同じ窓の位置間では再現し、別の窓では変化する低ランク部分空間」です。
-平均はその状態の window ごとの座標として使います。
+中心仮説は次です。
 
-## 研究用クイックスタート（推奨）
+> ある中間表現がLLM内で維持される計算状態なら、target token自体を見なくても、手前のcontext residualからgapを越えてその表現を予測できる。その予測可能部分を除いた残差は、新規入力・局所token・surpriseを表すinnovationになる。
 
-次を実行すると、controlled benchmark生成から、複数layerの同時抽出、nested
-group splitによるmodel selection、完全に未使用なouter test、因果介入、
-publication figure、HTML reportまで一括実行します。
+## 一発で動かす
+
+LinuxのGPUマシン（SSH接続先を想定）で以下を実行します。
 
 ```bash
 git clone https://github.com/fumin0ri/my-sae.git
@@ -23,361 +20,246 @@ pip install -e .
 bash scripts/research_quickstart.sh
 ```
 
-完了後、次をブラウザで開いてください。
+デフォルトではPythia-70Mのlayer 3を使い、次を一括実行します。
+
+1. paraphraseをproblem groupとして管理したcontrolled benchmarkを生成
+2. frozen LLMから48-token residual windowを抽出
+3. JEPA-regularized SAEを学習
+4. standard SAE + frozen post-hoc predictorを同じsplitで学習
+5. 未使用のlocked testを一度だけ評価
+6. 従来のlow-rank random-effects法をbaselineとしてfit
+7. predictable featureのpatch、ablation、norm-matched random ablation
+8. HTML、PNG、PDFの研究レポートを生成
+
+結果はここに出ます。
 
 ```text
-runs/research/report/index.html
+runs/predictive-research/report/index.html
 ```
 
-SSH先で実行した場合は、SSH先でreport serverを起動します。
+SSH先でレポートを見る場合:
 
 ```bash
-python -m http.server 8000 --directory runs/research/report
+python -m http.server 8000 --directory runs/predictive-research/report
 ```
 
-手元のPCからport forwardして `http://localhost:8000` を開きます。
+手元PCから:
 
 ```bash
 ssh -L 8000:localhost:8000 <user>@<ssh-host>
 ```
 
-同じ数値からPNGとPDFも生成されます。
+その後 `http://localhost:8000` を開きます。
 
-```text
-runs/research/report/figures/layer-window-icc.{png,pdf}
-runs/research/report/figures/depth-profile.{png,pdf}
-runs/research/report/figures/locked-test.{png,pdf}
-runs/research/report/figures/shared-spectrum.{png,pdf}
-runs/research/report/figures/shared-code-embedding.{png,pdf}
-runs/research/report/figures/causal-interventions.{png,pdf}
-runs/research/report/figures/patch-directionality.{png,pdf}
-```
-
-GPUがない場合:
+最初に軽く動作確認する場合:
 
 ```bash
-FIT_DEVICE=cpu bash scripts/research_quickstart.sh
+STEPS=300 D_SAE=512 RUN_CAUSAL=0 bash scripts/research_quickstart.sh
 ```
 
-modelや調べるlayerは環境変数で変更できます。
+GPUメモリに合わせて変更する場合:
 
 ```bash
 MODEL=EleutherAI/pythia-410m-deduped \
-LAYERS=0,3,6,9,12,15,18,21,23 \
+LAYER=12 \
+D_SAE=8192 \
+K=64 \
+BATCH_SIZE=16 \
+STEPS=10000 \
 bash scripts/research_quickstart.sh
 ```
 
-この研究用pipelineは以下を分離しています。
+## モデル
 
-1. **Inner grouped validation:** layer、window幅、rank、ridgeの選択専用。
-2. **Locked outer test:** 選択中には一度も参照しない最終評価。
-3. **Group bootstrap:** paraphraseを独立標本と誤認せず、問題単位で95% CIを計算。
-4. **Position-shuffled null:** 同じwindowに属する関係を壊した帰無分布。
-5. **Rank-matched baselines:** window mean PCAとlast-token PCAを同じrankで比較。
-6. **Split-half stability:** 独立した問題集合で同じsubspaceが再現するか評価。
-7. **Causal tests:** contradictory patch、learned ablation、norm-matched random
-   ablationを独立した問題pairで比較。
-8. **Paired inference:** learned-vs-random介入差についてbootstrap CI、
-   sign-flip test、Cohen's dzを報告。
-
-benchmarkは4-state machineを用い、同じ潜在問題を4通りにparaphraseします。
-同一問題のparaphraseは必ず同じsplitに入り、表層文のtrain/test leakageを防ぎます。
-因果介入pairはsubspace推定用promptとは別に生成されます。
-仮説、主要評価項目、反証条件、replication matrixは
-[`docs/RESEARCH_PROTOCOL.md`](docs/RESEARCH_PROTOCOL.md) に固定しています。
-
-## 最小スモークテスト
-
-以下をそのまま実行すると、公開されている小型モデル
-`EleutherAI/pythia-70m-deduped` を使って、データ生成から residual 抽出、
-共有部分空間の推定、保持データ評価、permutation control まで実行します。
-
-```bash
-git clone https://github.com/fumin0ri/my-sae.git
-cd my-sae
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
-bash scripts/quickstart.sh
-```
-
-GPUがない場合も `sr-fit` は自動的にCPUへfallbackします。明示する場合:
-
-```bash
-FIT_DEVICE=cpu bash scripts/quickstart.sh
-```
-
-生成物は次に保存されます。
+frozen LLMのlayer `l` におけるresidualを `h_t` とします。target span `B` の手前からgapを空けてcontext `C` を作ります。
 
 ```text
-data/quickstart.jsonl
-runs/quickstart/activations.pt
-runs/quickstart/shared/subspace.pt
-runs/quickstart/shared/codes.pt
-runs/quickstart/shared/report.json
+h_C ── online sparse encoder ── context transformer ── predictor ── ẑ_B
+                                                                         │
+h_B ── EMA target sparse encoder ──────────────────────────────── z_B     │
+                                                                         ▼
+original residual space ◀──────────────────────────────────────── decoder D
 ```
 
-このquickstartは実行経路と統計量を確認する smoke test です。デモデータでは
-4種類の working-memory state が文章中に明示されています。したがって、ここで
-共有部分空間やprobe精度が得られても「LLMの思考の本質」の証拠にはなりません。
-本実験では後述する minimal pair、paraphrase分離、因果patchを使ってください。
-
-## 仮説と推定量
-
-layer `l`、window `w`、相対 token 位置 `t` の residual を
+学習する主な量は次です。
 
 ```text
-x[w,t] = global_mean + relative_position[t] + z[w] + eps[w,t]
+z_t       = TopK(ReLU(E_online(h_t - b)))
+ĥ_t       = b + D z_t
+z_target  = stopgrad(TopK(ReLU(E_EMA(h_B - b))))
+z_predict = TopK(ReLU(P(E_online(h_C), position(B))))
+
+L = L_reconstruct(h, ĥ)
+  + α L_predict(z_predict, z_target)
+  + β L_residual-predict(b + D z_predict, h_B)
 ```
 
-と分けます。`z[w]` が10位置に共有された候補状態、`eps[w,t]` が
-token 固有成分です。学習データ上で
+decoderの各行は元のLLM residual spaceに存在します。したがってfeatureを解釈するだけでなく、元LLMへそのままpatchまたはablateできます。
+
+分解は次です。
 
 ```text
-Sigma_eps = pooled covariance of x[w,t] - mean_t(x[w,t])
-Sigma_z   = covariance(mean_t(x[w,t])) - Sigma_eps / T
+predictable_B = b + D z_predict
+innovation_B  = h_B - predictable_B
 ```
 
-を推定し、次を最大化する一般化固有ベクトルを取ります。
+`predictable` は「contextから予測できる持続状態」の候補、`innovation` は予測できなかった局所更新の候補です。これは解釈であり、評価と因果介入を通らない段階では結論ではありません。
+
+## decoder-only LLMでのmask
+
+主実験は必ず次のcausal maskを使います。
 
 ```text
-v' Sigma_z v / v' (Sigma_eps + ridge I) v
+[ context C ][ unused gap ][ target B ]
 ```
 
-これは「window 間では変わるが、同じ window の10位置には共通する」方向を優先します。
-保持データで intraclass correlation (ICC)、位置ごとに別 window へ崩す permutation
-control、split-half の部分空間角を計測します。
+decoder-only LLMではtargetより右のresidualは既にtarget tokenへattentionしています。左右のcontextからtargetを予測すると情報漏洩になるため、`--context-mode retrospective` は明示的なnegative-control / upper-bound ablationとしてのみ実装しています。主結果には使わないでください。
 
-ただし、この条件だけでは topic、話者、書式、頻出 token の影響も `z[w]` になり得ます。
-「LLM が考えていることの本質」と呼ぶには、最低でも次を順に通してください。
-
-1. 異なる prompt・言い換え・window offset でも保持データ上で再現する。
-2. label probe が raw mean や last token より汎化する。
-3. task state だけを変えた minimal pair 間で subspace patching すると回答確率が動く。
-4. 同 rank の random-subspace intervention では同じ効果が出ない。
-5. token 順序を window 間で崩した permutation control では信号が消える。
-
-## インストール
-
-上のいずれかのquickstartを実行済みなら、この節は不要です。
+target spanとgapは学習時に複数のスケールからsampleします。
 
 ```bash
-git clone <this-directory-or-copy-it>
-cd shared-residual
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+--target-sizes 2,4,8 --gaps 2,4,8
 ```
 
-SAE Lens と TransformerLens も使う場合:
+これにより、単なる隣接token copyingと、phrase程度の時間幅を持つ状態を分離します。
 
-```bash
-pip install -e '.[sae]'
-```
+## 比較条件
 
-テスト:
+同じarchitecture、dictionary size、Top-K、データsplitで次を比較します。
 
-```bash
-pip install -e '.[dev]'
-pytest -q
-```
+- `joint`: 提案法。SAE reconstructionとmasked predictionを共同学習
+- `posthoc`: 通常SAEを先に学習して固定し、predictorだけを後付け学習
+- `low-rank-baseline`: 従来のwindow random-effects generalized eigenspace
+- raw target residual
+- innovation residual
 
-## 1. データ
+`posthoc`との比較で「通常SAEに既に予測可能featureが存在するだけか」と「予測目的が辞書自体を改善したか」を分けます。従来のlow-rank法、shared/private group SAE、SAE Lens解析のCLIも削除せずbaselineとして残しています。
 
-一行一 prompt の JSONL を用意します。
+## locked-test評価
 
-```json
-{"id":"ex-0001","label":"arithmetic","text":"Question: ... reasoning prefix ..."}
-```
-
-`label` は任意です。特定 token span のみを対象にしたい場合は、model tokenizer
-で数えた半開区間 `start_token`, `end_token` を追加できます。既定では各 prompt
-末尾の10 tokenを1 windowにします。
-
-同じ長文から sliding window を大量に取ると train/test leakage が起きます。
-本実装の split は window 単位なので、sliding を使う場合は入力をあらかじめ
-文書単位で train/test に分け、別々に実行してください。主要実験は一 prompt
-一 window、最低数百、望ましくは数千 window を推奨します。
-
-## 2. Residual stream の抽出
-
-Hugging Face backend:
-
-```bash
-sr-extract \
-  --model meta-llama/Llama-3.2-3B \
-  --data data/prompts.jsonl \
-  --output runs/layer12.pt \
-  --layer 12 \
-  --hook-point post \
-  --window-size 10 \
-  --batch-size 8
-```
-
-`pre` は block 入力、`post` は block 出力です。層を比較するときは同じ hook point
-を使います。まず全層の 25%, 50%, 75% 付近を調べ、信号が強い帯を細かく走査するのが
-効率的です。
-
-既存 SAE と厳密に合わせる場合は、その SAE を学習した model、hook、dtype、
-TransformerLens の設定をそろえてください。
-
-```bash
-sr-extract \
-  --backend transformer_lens \
-  --model gpt2-small \
-  --hook-name blocks.6.hook_resid_post \
-  --data data/prompts.jsonl \
-  --output runs/gpt2-l6.pt \
-  --window-size 10
-```
-
-## 3. 共通部分空間
-
-```bash
-sr-fit \
-  --activations runs/layer12.pt \
-  --output-dir runs/layer12-shared \
-  --rank 32 \
-  --ridge 1e-3 \
-  --permutations 200 \
-  --label-key label
-```
-
-出力:
-
-- `subspace.pt`: 直交基底、global mean、相対位置効果。
-- `codes.pt`: 各 window の共有座標、raw mean、last-token baseline。
-- `report.json`: train/test ICC、permutation p 値、split-half 安定性、probe。
-
-rank は 8, 16, 32, 64 程度を保持データで比較してください。rank を test set に
-合わせて選ばず、validation set で選んだ後に未使用 test set を一度だけ評価します。
-`--keep-relative-position` は位置効果を残す ablation であり、主解析には勧めません。
-
-## 4. SAE による解釈
-
-### 既存 SAE: token-first を主解析にする
-
-```bash
-sr-sae \
-  --activations runs/gpt2-l6.pt \
-  --subspace runs/gpt2-l6-shared/subspace.pt \
-  --release <SAE-Lens release> \
-  --sae-id <matching SAE id> \
-  --output-dir runs/gpt2-l6-sae \
-  --min-active-fraction 0.7 \
-  --quantile 0.25
-```
-
-二つの順序を同時に保存します。
-
-- **token-first**: 10本を個別に SAE encode し、7割以上の位置で active な feature
-  の25 percentile activationを共有 codeとする。
-- **mean-first**: 10本を平均してから SAE encode する。
-
-主解析は token-first です。標準 SAE は token residual の分布で学習されるため、
-平均 residual は off-manifold になり得ます。`sae_report.json` の token と mean の
-reconstruction FVU を必ず比較します。`--subspace` を渡すと、
-「反復 activation × SAE decoder direction の共有部分空間への overlap」で
-featureを順位付けします。
-
-### 専用の shared/private SAE
-
-```bash
-sr-train-group-sae \
-  --activations runs/layer12.pt \
-  --output-dir runs/layer12-group-sae \
-  --d-shared 8192 \
-  --d-private 8192 \
-  --k-shared 32 \
-  --k-private 32 \
-  --steps 20000 \
-  --batch-size 32
-```
-
-これは直接
+splitはtoken window単位ではなく `group_id` 単位です。同じ問題のparaphraseは必ず同じsplitに入ります。
 
 ```text
-x[w,t] ≈ bias + D_shared z_shared[w] + D_private z_private[w,t]
+60% train / 20% validation / 20% locked test
 ```
 
-を学習します。`z_shared` は10位置に一つだけです。private decoder の window 平均に
-penalty をかけ、共通情報を private feature が10回重複して持つ解を抑えます。
-これは探索的モデルなので、標準 SAE より強い同定仮定を置きます。結果は必ず
-通常 SAE と線形 random-effects subspace の双方に照合してください。
+locked testで自動生成する主な結果:
 
-## 5. 因果介入
+- target sparse codeのgap越し予測cosine / NRMSE
+- residual prediction FVU
+- joint vs post-hocのtask-state probeとgroup bootstrap 95% CI
+- same-problem paraphrase / same-state別問題 / different-stateのcosine
+- predictable codeとinnovation residualの情報分離
+- effective rank、dead feature率、L0によるcollapse診断
+- gap × target-span heatmap
+- top predictable featureと上位activation例
+- original residualでのpatch / ablation / norm-matched random control
+- paired bootstrap、sign-flip test、Cohen's `d_z`
 
-pair JSONL:
+詳しいconfirmatory hypothesis、falsification条件、replication matrixは [docs/RESEARCH_PROTOCOL.md](docs/RESEARCH_PROTOCOL.md) に固定しています。
 
-```json
-{
-  "id": "pair-1",
-  "source_text": "state A を表す完全な prefix",
-  "target_text": "state B を表す完全な prefix",
-  "answer": " target B に対する正解"
-}
-```
-
-source と target の末尾10 tokenから共有座標差を計算し、target の同じ10位置へ
-同じ residual shift を加えます。
+3 model size × 3 layer × 3 seedのprespecified replicationを回す場合:
 
 ```bash
-sr-intervene \
-  --model meta-llama/Llama-3.2-3B \
-  --pairs data/pairs.jsonl \
-  --subspace runs/layer12-shared/subspace.pt \
-  --output runs/patch.jsonl \
-  --layer 12 \
-  --hook-point post \
-  --mode patch
+bash scripts/replication_matrix.sh
 ```
 
-Ablation と rank・介入 norm を揃えた random control:
+各runのHTMLに加え、forest plot、CSV、JSONを次に集約します。
+
+```text
+runs/predictive-replication/summary/index.html
+runs/predictive-replication/summary/replication_summary.csv
+```
+
+計算量が大きいため、最初はmatrixを縮めて確認できます。
 
 ```bash
-sr-intervene ... --mode ablate --output runs/ablate.jsonl
-sr-intervene ... --mode random_ablate --output runs/random-ablate.jsonl
+MODEL_SPECS='EleutherAI/pythia-70m-deduped|1,3,5' \
+SEEDS=0 \
+STEPS=300 \
+PROBLEMS=40 \
+bash scripts/replication_matrix.sh
 ```
 
-`delta_answer_logprob` が主要指標です。patch 実験では、source state と整合する回答と
-target state と整合する回答を別々の pair 群で測ります。効果量は intervention の
-L2 norm と rank を random control に一致させて比較してください。
+## 個別コマンド
 
-## 推奨する最小実験
+学習:
 
-最初は自然文の自由な chain-of-thought ではなく、内部状態が明確な課題を使います。
+```bash
+sr-train-predictive-sae \
+  --activations runs/layer-003.pt \
+  --output-dir runs/joint \
+  --objective joint \
+  --d-sae 8192 \
+  --k 64 \
+  --context-width 32 \
+  --target-sizes 2,4,8 \
+  --gaps 2,4,8 \
+  --steps 20000
+```
 
-- 同じ surface form で変数値だけが違う modular arithmetic。
-- factual question の entity/country だけを置換した minimal pair。
-- true/false の仮定を途中で反転する短い deduction。
-- 同一問題の paraphrase を train/test で完全分離。
+通常SAE control:
 
-各 prompt は「答えを出す直前」の10 tokenを対象にし、`label` を latent state
-（例: modulo class、entity、truth value）にします。そこで再現・probe・patch が
-成立してから、自然な reasoning traceへ広げるのが安全です。
+```bash
+sr-train-predictive-sae \
+  --activations runs/layer-003.pt \
+  --output-dir runs/posthoc \
+  --objective posthoc \
+  --d-sae 8192 \
+  --k 64 \
+  --context-width 32 \
+  --target-sizes 2,4,8 \
+  --gaps 2,4,8 \
+  --steps 20000
+```
 
-## 既知の限界
+locked evaluation:
 
-- 共通**方向**が同じでも位置ごとに係数が違う表現は、完全な additive `z[w]`
-  では過小評価します。次段階は `x[w,t] = A[t] z[w] + eps` という multi-view CCA
-  または shared response model です。
-- attention sink、改行、引用符、system prompt は強い共有信号になります。
-  token/format をそろえた minimal pair と shuffle control が必要です。
-- 線形 subspace が無いことは、共有状態が無いことを意味しません。非線形符号化や
-  position-dependent rotation の可能性があります。
-- probe の成功だけでは因果性を示しません。最終判断は patch/ablation です。
+```bash
+sr-evaluate-predictive-sae \
+  --activations runs/layer-003.pt \
+  --joint-checkpoint runs/joint/predictive_sae.pt \
+  --baseline-checkpoint runs/posthoc/predictive_sae.pt \
+  --output-dir runs/analysis
+```
 
-## 関連する発想
+featureを限定した因果介入:
 
-- Sparse crosscoders は、複数 layer/model にまたがる共有 feature を共同で読む発想を
-  提供します: <https://transformer-circuits.pub/2024/crosscoders/index.html>
-- Multi-layer SAE は residual stream の layer 間共有性を直接調べています:
-  <https://arxiv.org/abs/2409.04185>
-- residual の position/context mean-effect 分解は、この実装の nuisance 除去に近い
-  出発点です: <https://openreview.net/forum?id=1M0qIxVKf6>
-- 低ランク communication channel の実証:
-  <https://openreview.net/forum?id=LUsx0chTsL>
-- SAE Lens の現行 API:
-  <https://decoderesearch.github.io/SAELens/>
+```bash
+sr-intervene-predictive-sae \
+  --model EleutherAI/pythia-70m-deduped \
+  --pairs data/research/pairs.jsonl \
+  --checkpoint runs/joint/predictive_sae.pt \
+  --output runs/analysis/feature-ablation.jsonl \
+  --layer 3 \
+  --mode ablate \
+  --feature-ids 17,92,301 \
+  --target-size 4 \
+  --gap 4
+```
+
+可視化:
+
+```bash
+sr-visualize-predictive-sae --run-dir runs/predictive-research
+```
+
+## 研究としての注意
+
+- 高いprediction scoreだけでは、token identity、template、absolute positionを予測している可能性があります。
+- 高いprobe精度だけでは因果性を示しません。
+- SAE featureは一意とは限りません。seed、dictionary size、Top-Kを変えた再現性が必要です。
+- EMAだけをcollapse対策とみなさず、reconstruction、effective rank、feature variance、dead-feature率を必ず監視します。
+- model/layer/hook/revisionがcheckpointと異なる因果介入はデフォルトで拒否します。
+- layerやhyperparameterをlocked testで選ばないでください。
+- 本研究の主張単位は単一promptではなく、model × task family × seedです。
+
+## 関連する一次資料
+
+- [I-JEPA: Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture](https://arxiv.org/abs/2301.08243)
+- [Joint Embedding Predictive Architectures Focus on Slow Features](https://arxiv.org/abs/2211.10831)
+- [LLM-JEPA: Large Language Models Meet Joint-Embedding Predictive Architectures](https://arxiv.org/abs/2509.14252)
+- [SparseJEPA](https://arxiv.org/abs/2504.16140)
+- [C-JEPA: Contrastive-JEPA for Avoiding Representation Collapse](https://arxiv.org/abs/2410.19560)
+
+このrepositoryの目的はJEPAをLLMの新しいtraining objectiveとして使うことではなく、**frozen LLMのresidual dynamicsから予測可能な計算状態を同定し、疎なresidual-space directionとして因果検証すること**です。

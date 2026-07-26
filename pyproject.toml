@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.1.0"
-description = "Extract and causally test token-shared residual-stream representations"
+version = "0.2.0"
+description = "Learn and causally test predictive sparse states in LLM residual streams"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",
@@ -30,6 +30,11 @@ sr-sae = "shared_residual.sae_analysis:main"
 sr-intervene = "shared_residual.intervene:main"
 sr-train-group-sae = "shared_residual.group_sae:main"
 sr-visualize = "shared_residual.visualize_results:main"
+sr-train-predictive-sae = "shared_residual.predictive_sae:main"
+sr-evaluate-predictive-sae = "shared_residual.predictive_eval:main"
+sr-intervene-predictive-sae = "shared_residual.predictive_intervene:main"
+sr-visualize-predictive-sae = "shared_residual.predictive_visualize:main"
+sr-aggregate-predictive-study = "shared_residual.predictive_aggregate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

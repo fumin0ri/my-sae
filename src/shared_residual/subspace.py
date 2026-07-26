@@ -246,6 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--permutations", type=int, default=100)
     p.add_argument("--label-key")
+    p.add_argument(
+        "--group-key",
+        help="Keep all windows/paraphrases from one problem in the same split",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--keep-relative-position", action="store_true")
     return p
@@ -259,9 +263,45 @@ def main() -> None:
     if n < 10:
         raise SystemExit("Use at least 10 windows; hundreds or thousands are recommended.")
     generator = torch.Generator().manual_seed(args.seed)
-    order = torch.randperm(n, generator=generator)
-    n_train = max(3, min(n - 3, round(n * args.train_fraction)))
-    train_idx, test_idx = order[:n_train], order[n_train:]
+    if args.group_key:
+        groups: dict[str, list[int]] = {}
+        for index, row in enumerate(bundle["metadata"]):
+            if args.group_key not in row:
+                raise KeyError(
+                    f"metadata row {index} has no group key {args.group_key!r}"
+                )
+            groups.setdefault(str(row[args.group_key]), []).append(index)
+        if len(groups) < 6:
+            raise ValueError("grouped split needs at least six independent groups")
+        names = sorted(groups)
+        order = torch.randperm(len(names), generator=generator).tolist()
+        n_train_groups = max(
+            3,
+            min(len(names) - 3, round(len(names) * args.train_fraction)),
+        )
+        train_groups = {names[index] for index in order[:n_train_groups]}
+        train_idx = torch.as_tensor(
+            [
+                index
+                for group, indices in groups.items()
+                if group in train_groups
+                for index in indices
+            ],
+            dtype=torch.long,
+        )
+        test_idx = torch.as_tensor(
+            [
+                index
+                for group, indices in groups.items()
+                if group not in train_groups
+                for index in indices
+            ],
+            dtype=torch.long,
+        )
+    else:
+        order = torch.randperm(n, generator=generator)
+        n_train = max(3, min(n - 3, round(n * args.train_fraction)))
+        train_idx, test_idx = order[:n_train], order[n_train:]
     centering = fit_centering(
         x[train_idx], remove_relative_position=not args.keep_relative_position
     )

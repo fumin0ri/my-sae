@@ -1,177 +1,291 @@
-# Research protocol: token-shared residual representations
+# Confirmatory protocol: predictive sparse states in LLM residual streams
 
-## Research question
+## 1. Research question
 
-Does a decoder-only language model maintain a low-dimensional latent state that
-is simultaneously readable at several nearby token positions, varies across
-reasoning instances, predicts the relevant task state, and causally affects the
-model's answer?
+Does a frozen decoder-only language model maintain a sparse internal state that:
 
-The claim is deliberately stronger than "nearby residual vectors are similar."
-Token identity, position, formatting, topic, and prompt template can all produce
-similarity without constituting a computational state.
+1. can be predicted from earlier residual-stream positions across a nonzero gap;
+2. is stable under paraphrase but changes when task state changes;
+3. is represented by decoder directions in the original residual space; and
+4. causally affects the model's continuation?
 
-## Confirmatory hypotheses
+This claim is stronger than adjacent residual vectors being similar. Position,
+token identity, prompt template, attention sinks, and slowly changing style can
+all be predictable without being a computational state.
 
-- **H1 — cross-position reliability:** a learned shared subspace has positive
-  held-out ICC and exceeds the position-shuffled null on a locked outer test.
-- **H2 — representational specificity:** a rank-matched probe on shared
-  coordinates predicts the latent task state at least as well as window-mean PCA
-  and last-token PCA.
-- **H3 — reproducibility:** independently fitted halves recover overlapping
-  subspaces, measured by mean squared canonical correlation.
-- **H4 — causality:** ablating the learned subspace changes correct-answer log
-  probability more than a norm- and rank-matched random subspace. Patching a
-  contradictory source state into a target decreases the target-consistent
-  answer probability.
+## 2. Prespecified hypotheses
 
-H1 and H4 are the primary hypotheses. H2 and H3 characterize a positive result
-but cannot establish causality alone.
+- **H1 — masked predictability (primary):** On an untouched group-held-out test,
+  the joint predictive SAE predicts target sparse codes better than a standard
+  SAE whose predictor is trained only after the SAE is frozen.
+- **H2 — semantic persistence:** Joint predictable codes have higher similarity
+  between paraphrases of the same problem than between different problems with
+  the same answer state, while retaining a positive same-state versus
+  different-state margin.
+- **H3 — predictable / innovation separation:** Predictable codes decode the
+  persistent task state; innovation residuals preferentially encode local
+  update, boundary, negation, or surprise variables in task families where
+  these are annotated.
+- **H4 — causal relevance (primary):** Ablating predictable decoder writes
+  changes answer log probability more than a norm-matched random residual edit.
+  Patching a contradictory source's predictable code moves probability toward
+  the source-consistent answer.
+- **H5 — reproducibility:** Results replicate across feature-learning seeds,
+  model sizes, and task families; matched features or decoder subspaces are
+  stable enough to support the same semantic and causal conclusion.
 
-## Controlled benchmark
+H1 and H4 are primary. Probe accuracy alone is not confirmatory evidence.
 
-`scripts/make_research_data.py` generates four-state cyclic programs.
+## 3. Estimand and model
 
-- The answer state is balanced across problems.
-- Each latent program receives multiple independently worded paraphrases.
-- All paraphrases of a program share `group_id`.
-- Splitting is performed by `group_id`, never by prompt row.
-- Causal source/target pairs are generated from new programs that do not occur
-  in the representation-learning dataset.
-
-For a paper-level experiment, add at least two further task families, such as
-modular arithmetic and symbolic entailment, without changing the analysis code.
-Do not choose tasks after inspecting the locked test.
-
-## Estimand
-
-For window `w`, relative position `t`, and residual width `d`:
+For frozen residual `h_t`:
 
 ```text
-x[w,t] = μ + position[t] + z[w] + ε[w,t]
+z_t = TopK(ReLU(E_online(h_t - b)))
+h_reconstructed_t = b + D z_t
 ```
 
-The estimator removes `μ` and the relative-position mean effect using training
-data only. It estimates:
+For a context `C`, an excluded gap `G`, and a future target span `B`:
 
 ```text
-Σ_ε = pooled within-window covariance
-Σ_z = Cov(mean_t x[w,t]) - Σ_ε / T
+z_target_B = stopgrad(E_EMA(h_B - b))
+z_pred_B   = TopK(ReLU(P(E_online(h_C - b), relative_position(B))))
 ```
 
-Directions maximize:
+The objective is:
 
 ```text
-vᵀ Σ_z v / vᵀ(Σ_ε + ridge I)v
+L = normalized_MSE(h, b + D z)
+  + alpha * [1 - cosine(z_pred_B, z_target_B)
+             + 0.25 * normalized_MSE(z_pred_B, z_target_B)]
+  + alpha * beta * normalized_MSE(b + D z_pred_B, h_B)
 ```
 
-The window state coordinate is the projection of the centered window mean onto
-the learned basis. The mean is therefore a per-window coordinate estimator, not
-the definition of the shared subspace.
+The proposed decomposition is:
 
-For wide models, the implementation optionally performs a training-only PCA
-preprojection before the generalized eigendecomposition (`--pre-rank`, default
-512). The retained variance is recorded. Confirm important results at multiple
-pre-ranks, including a no-preprojection run when computationally feasible.
+```text
+predictable_B = b + D z_pred_B
+innovation_B  = h_B - predictable_B
+```
 
-## Selection and locked evaluation
+This is not assumed to be an orthogonal decomposition. Report all three
+energies and prediction FVU; do not present their energies as percentages that
+must sum to one.
 
-1. Hold out 20% of independent problem groups as the outer test.
-2. On the remaining development groups, repeat stratified group train/validation
-   splits over prespecified seeds.
-3. Sweep layer, window width, rank, and ridge.
-4. Select by mean validation `(ICC - shuffled-null ICC)`.
-5. Fit the selected configuration once on all development groups.
-6. Evaluate once on the untouched outer groups.
-7. After recording the locked result, fit an all-data basis for downstream
-   causal intervention. Do not report its in-sample metrics as test evidence.
+## 4. Leakage-aware masking
 
-The pipeline writes every candidate result, so selection can be audited.
+The confirmatory mask for a decoder-only LLM is:
 
-## Prespecified metrics
+```text
+past context C | unused gap G | future target B
+```
 
-Primary representation metric:
+No residual position after `B` may enter `C`: a later decoder residual has
+already attended to target tokens and would reveal them. The implementation's
+`causal` mode enforces this invariant and its unit test checks it.
 
-- mean held-out ICC across retained shared components;
-- position-shuffled permutation p-value;
-- problem-group bootstrap 95% confidence interval.
+`retrospective` mode deliberately uses left and right context. It is an
+information-leaking upper-bound ablation and must be labelled as such in every
+table and figure.
 
-Secondary metrics:
+Prespecified multi-scale grid:
 
-- state-probe accuracy;
-- rank-matched window-mean PCA accuracy;
-- rank-matched last-token PCA accuracy;
-- split-half mean squared canonical correlation;
-- generalized eigenvalue spectrum.
+- context width: 16, 24, or 32 depending on model context and memory;
+- target span: 2, 4, 8 tokens;
+- gap: 2, 4, 8 tokens.
 
-Primary causal metric:
+The primary run uses all nine target/gap combinations during training. Report
+each combination separately on test. A result limited to gap 2 is consistent
+with local continuation prediction and does not establish a persistent state.
 
-- paired difference in answer-log-probability change between learned and random
-  ablation;
-- contradictory-patch directionality, defined as the source-consistent answer
-  change minus the target-consistent answer change;
-- problem-pair bootstrap 95% confidence interval;
-- paired sign-flip p-value;
+## 5. Conditions
+
+All learned conditions use the same activation data, group split, dictionary
+width, Top-K, optimizer budget, and random seed where applicable.
+
+1. **Joint predictive SAE (proposed):** reconstruction and prediction train the
+   sparse dictionary jointly; target encoder is an EMA copy.
+2. **Standard SAE + post-hoc predictor:** train only reconstruction, freeze SAE
+   and decoder, then train the same predictor.
+3. **Raw residual:** pooled target residual.
+4. **Innovation residual:** target residual minus predictable decoder write.
+5. **Low-rank random-effects baseline:** previous cross-position generalized
+   eigenspace method.
+6. **Retrospective JEPA:** optional leakage-positive control.
+7. **Shuffled context-target pairing:** required negative control in paper-level
+   runs.
+
+Two-stage JEPA followed by an SAE in JEPA latent space may be reported as an
+additional representation-learning baseline, but it does not by itself produce
+directions in the original LLM residual space and is therefore not a substitute
+for the causal condition.
+
+## 6. Data and split
+
+The included controlled benchmark is a four-state cyclic program:
+
+- answer states are balanced;
+- every latent program has multiple independently worded paraphrases;
+- all paraphrases share `group_id`;
+- causal source/target pairs are generated from independent programs;
+- the prompt ends before the answer token.
+
+The fixed split is made before optimization:
+
+```text
+60% independent groups: training
+20% independent groups: validation
+20% independent groups: locked test
+```
+
+Never split overlapping windows or paraphrases independently. Validation may be
+used for early stopping and prespecified hyperparameter selection. Locked test
+must not be inspected until the model and analysis choices are frozen.
+
+For a paper-level study, add at least:
+
+- modular arithmetic state tracking;
+- symbolic entailment with explicit negation;
+- a boundary/update benchmark with annotated stable, update, boundary, and
+  surprise positions;
+- a representation-negative task that requires no persistent state.
+
+Keep surface form and answer-token distribution matched across state labels.
+
+## 7. Metrics
+
+### H1: prediction
+
+- target-code cosine;
+- target-code NRMSE;
+- decoded residual prediction FVU;
+- performance by gap and target span;
+- joint-minus-post-hoc paired difference;
+- group-bootstrap 95% confidence interval.
+
+### H2/H3: content
+
+- held-out linear probe on predictable code;
+- the same probe on standard SAE code, raw target residual, and innovation;
+- same-problem paraphrase cosine;
+- different-problem/same-state cosine;
+- different-state cosine;
+- semantic and paraphrase margins;
+- template, task-family, token-identity, position, and length nuisance probes.
+
+Probe regularization must be fixed or selected only on development data.
+
+### Collapse and dictionary health
+
+- reconstruction FVU;
+- average L0;
+- active and dead feature fractions;
+- mean per-feature standard deviation;
+- effective rank of centered predictable codes;
+- activation frequency distribution;
+- top examples for each reported feature.
+
+Reconstruction anchors the dictionary to the original residual stream, but does
+not remove the obligation to report collapse diagnostics. EMA is not treated as
+a sufficient collapse guarantee.
+
+### H4: causality
+
+- change in target-consistent answer log probability;
+- change in source-consistent contrast answer log probability;
+- source-minus-target directional patch effect;
+- first-token KL;
+- intervention L2 norm;
+- learned-minus-random paired effect;
+- pair-bootstrap 95% CI;
+- sign-flip p-value;
 - Cohen's `d_z`.
 
-## Falsification and controls
+Random residual edits are matched per example and target position to the learned
+edit's L2 norm. Report alpha dose-response, not only alpha 1.
 
-A result does not support the shared-computational-state interpretation when any
-of the following holds:
+## 8. Feature interpretation
 
-- observed ICC is indistinguishable from position-shuffled ICC;
-- the effect disappears under paraphrase-group splitting;
-- only the raw mean or last token decodes the state;
-- split-half subspaces are unstable;
-- learned ablation is not stronger than norm-matched random ablation;
-- patch direction fails to move answer probability toward the source state;
-- the signal is confined to punctuation, padding, BOS/EOS, or a single template.
+For each candidate predictable feature:
 
-Recommended additional controls:
+1. rank held-out examples by activation;
+2. inspect false positives and zero-activation counterexamples;
+3. quantify label, template, token, and position selectivity;
+4. check stability across paraphrase;
+5. locate decoder direction in the original residual space;
+6. ablate the feature alone and in matched feature sets;
+7. repeat in an independently trained seed.
 
-- randomize token order inside windows while preserving token marginals;
-- match prompt length and final-token strings across labels;
-- regress template, absolute position, and sequence length;
-- repeat with an unrelated label;
-- compare residual-pre and residual-post;
-- repeat with non-overlapping windows;
-- test a representation-negative task where no persistent state is needed.
+Feature labels are hypotheses. A natural-language label without quantitative
+counterexamples and causal testing is not a result.
 
-## Replication matrix
+## 9. Selection and multiplicity
 
-The minimal research quickstart validates the pipeline on Pythia-70M. A serious
-study should prespecify:
+Prespecify model, layer, hook, target/gap grid, dictionary widths, `k`, loss
+weights, seeds, and primary metrics. If layer is selected:
 
-- at least three model sizes from one family;
-- at least one independently trained model family;
-- early, middle, and late layers, preferably all layers when feasible;
-- window widths such as 4, 8, 10, 16, and 32;
-- ranks such as 2, 4, 8, 16, and 32;
-- at least three inner split seeds;
-- at least three task families;
-- a minimum of several hundred independent problem groups per task.
+1. select using development groups only;
+2. freeze the layer and all settings;
+3. evaluate the locked test once.
 
-Treat model × task as the replication unit. Correct confirmatory p-values across
-that prespecified family, and show individual effects rather than only a pooled
-average.
+When testing several model × task × layer families, control the confirmatory
+false discovery rate or family-wise error rate. Show each replication unit;
+do not report only a pooled number.
 
-## Artifact checklist
+## 10. Falsification criteria
 
-The analysis is complete only when the run contains:
+The computational-state interpretation is not supported when any of these hold:
+
+- joint training does not improve over the post-hoc SAE control;
+- prediction disappears at nontrivial gaps;
+- shuffled context-target pairs perform similarly;
+- similarity is explained by template, token identity, or absolute position;
+- predictable code fails to distinguish same-state from different-state items;
+- innovation carries all task-state information;
+- dictionary effective rank collapses or most features are dead;
+- a norm-matched random intervention has the same effect;
+- contradictory patches fail to move the source-versus-target answer contrast;
+- results do not replicate across seeds or task families.
+
+## 11. Replication matrix
+
+Minimum serious study:
+
+- 3 sizes from one model family;
+- 1 independently trained second model family;
+- residual-pre and residual-post;
+- prespecified early, middle, and late layers;
+- 3 feature-learning seeds;
+- 3 task families plus 1 negative-control family;
+- at least 300 independent problem groups per task;
+- dictionary expansion factors 4×, 8×, and 16× residual width;
+- Top-K values selected to match reconstruction quality;
+- causal dose response at alpha 0.25, 0.5, 1.0, and 2.0.
+
+Model × task × seed is the replication unit. Compute intervals by resampling
+independent problem groups or causal pairs, never individual overlapping token
+windows.
+
+## 12. Required artifacts
 
 ```text
 activations/layer-*.pt
-analysis/candidates.jsonl
-analysis/selection.json
-analysis/locked_test.json
-analysis/final_subspace.pt
-analysis/final_codes.pt
-analysis/intervention-*.jsonl
+joint/predictive_sae.pt
+joint/training_report.json
+posthoc/predictive_sae.pt
+posthoc/training_report.json
+low-rank-baseline/subspace.pt
+analysis/predictive_codes.pt
+analysis/predictive_report.json
+analysis/intervention-patch.jsonl
+analysis/intervention-ablate.jsonl
+analysis/intervention-random.jsonl
 report/index.html
 report/figures/*.png
 report/figures/*.pdf
 report/visualization_summary.json
 ```
 
-Archive the exact code commit, model revision, tokenizer revision, dataset seed,
-GPU/software environment, and command line with the result.
+Archive the code commit, exact model/tokenizer revision, dataset seed, split,
+command line, package lock, CUDA/PyTorch versions, GPU type, wall time, and peak
+memory with every reported run.
