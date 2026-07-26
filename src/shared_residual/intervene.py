@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     p.add_argument("--device-map", default="auto")
     p.add_argument("--revision")
+    p.add_argument("--use-safetensors", action="store_true")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -93,6 +94,7 @@ def main() -> None:
         args.device_map,
         args.trust_remote_code,
         args.revision,
+        use_safetensors=True if args.use_safetensors else None,
     )
     fitted_revision = source_cfg.get("resolved_model_revision")
     loaded_revision = getattr(model.config, "_commit_hash", None)

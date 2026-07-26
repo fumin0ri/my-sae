@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Format: model|comma-separated-layers;model|comma-separated-layers
-MODEL_SPECS="${MODEL_SPECS:-EleutherAI/pythia-1.4b-deduped|5,11,17;EleutherAI/pythia-2.8b-deduped|7,15,23;EleutherAI/pythia-6.9b-deduped|7,15,23}"
+# Format: model@safetensors-revision|comma-separated-layers;...
+MODEL_SPECS="${MODEL_SPECS:-EleutherAI/pythia-1.4b-deduped@dd0ec760c55304118fd0d0c98b3c6e3a4fa286af|5,11,17;EleutherAI/pythia-2.8b-deduped@04c6993bdebe728d5ad1dae3a916eaa766166783|7,15,23;EleutherAI/pythia-6.9b-deduped@d7e0e8080e3935fff58cb35d13fdaab0b2da9f30|7,15,23}"
 TASK_FAMILIES="${TASK_FAMILIES:-fsm,arithmetic,logic}"
 SEEDS="${SEEDS:-0,1,2}"
 STEPS="${STEPS:-12000}"
@@ -28,7 +28,7 @@ RUN_CAUSAL="${RUN_CAUSAL:-0}"
 STUDY_ROOT="${STUDY_ROOT:-runs/predictive-replication}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB")'
+python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
 mkdir -p "$STUDY_ROOT"
 git rev-parse HEAD > "$STUDY_ROOT/code-commit.txt"
 python -m pip freeze > "$STUDY_ROOT/python-environment.txt"
@@ -51,14 +51,18 @@ for task_family in "${task_families[@]}"; do
     --seed 0
 
   for specification in "${specifications[@]}"; do
-    model="${specification%%|*}"
+    model_revision="${specification%%|*}"
     layers="${specification#*|}"
+    model="${model_revision%@*}"
+    revision="${model_revision##*@}"
     model_key="$(printf '%s' "$model" | tr '/:' '__')"
     activation_dir="$STUDY_ROOT/activations/$task_family/$model_key"
 
     echo "Extracting task=$task_family model=$model layers=$layers"
     sr-extract-grid \
       --model "$model" \
+      --revision "$revision" \
+      --use-safetensors \
       --data "$task_data_dir/prompts.jsonl" \
       --output-dir "$activation_dir" \
       --layers "$layers" \
@@ -138,6 +142,8 @@ for task_family in "${task_families[@]}"; do
             fi
             sr-intervene-predictive-sae \
               --model "$model" \
+              --revision "$revision" \
+              --use-safetensors \
               --pairs "$task_data_dir/pairs.jsonl" \
               --checkpoint "$run_dir/joint/predictive_sae.pt" \
               --output "$run_dir/analysis/intervention-$output_mode.jsonl" \

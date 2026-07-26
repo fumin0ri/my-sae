@@ -7,6 +7,24 @@ cd "$ROOT_DIR"
 # One-command RTX 4090 (24GB) profile. Pythia-6.9B is the largest suite member
 # that leaves enough VRAM for the 8x predictive SAE during causal intervention.
 MODEL="${MODEL:-EleutherAI/pythia-6.9b-deduped}"
+default_safetensors_revision() {
+  case "$1" in
+    EleutherAI/pythia-70m-deduped)
+      printf '%s' "c92722694b14c67e3f8ed3bf164bb2456449e720"
+      ;;
+    EleutherAI/pythia-1.4b-deduped)
+      printf '%s' "dd0ec760c55304118fd0d0c98b3c6e3a4fa286af"
+      ;;
+    EleutherAI/pythia-2.8b-deduped)
+      printf '%s' "04c6993bdebe728d5ad1dae3a916eaa766166783"
+      ;;
+    EleutherAI/pythia-6.9b-deduped)
+      printf '%s' "d7e0e8080e3935fff58cb35d13fdaab0b2da9f30"
+      ;;
+  esac
+}
+REVISION="${REVISION:-$(default_safetensors_revision "$MODEL")}"
+USE_SAFETENSORS="${USE_SAFETENSORS:-1}"
 LAYER="${LAYER:-16}"
 WINDOW_SIZE="${WINDOW_SIZE:-64}"
 CONTEXT_WIDTH="${CONTEXT_WIDTH:-32}"
@@ -28,8 +46,16 @@ TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/predictive-research}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export USE_SAFETENSORS
 
-python -c 'import torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}")'
+python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
+MODEL_LOAD_ARGS=(--model "$MODEL")
+if [[ -n "$REVISION" ]]; then
+  MODEL_LOAD_ARGS+=(--revision "$REVISION")
+fi
+if [[ "$USE_SAFETENSORS" == "1" ]]; then
+  MODEL_LOAD_ARGS+=(--use-safetensors)
+fi
 mkdir -p "$RUN_DIR"
 git rev-parse HEAD > "$RUN_DIR/code-commit.txt"
 python -m pip freeze > "$RUN_DIR/python-environment.txt"
@@ -47,7 +73,7 @@ python scripts/make_research_data.py \
 
 echo "[2/8] Extract frozen residual windows at the prespecified layer"
 sr-extract-grid \
-  --model "$MODEL" \
+  "${MODEL_LOAD_ARGS[@]}" \
   --data data/research/prompts.jsonl \
   --output-dir "$RUN_DIR/activations" \
   --layers "$LAYER" \
@@ -136,7 +162,7 @@ sr-fit \
 if [[ "$RUN_CAUSAL" == "1" ]]; then
   echo "[7/8] Patch, ablate, and norm-match random directions in the original LLM"
   sr-intervene-predictive-sae \
-    --model "$MODEL" \
+    "${MODEL_LOAD_ARGS[@]}" \
     --pairs data/research/pairs.jsonl \
     --checkpoint "$RUN_DIR/joint/predictive_sae.pt" \
     --output "$RUN_DIR/analysis/intervention-patch.jsonl" \
@@ -146,7 +172,7 @@ if [[ "$RUN_CAUSAL" == "1" ]]; then
     --target-size 4 \
     --gap 4
   sr-intervene-predictive-sae \
-    --model "$MODEL" \
+    "${MODEL_LOAD_ARGS[@]}" \
     --pairs data/research/pairs.jsonl \
     --checkpoint "$RUN_DIR/joint/predictive_sae.pt" \
     --output "$RUN_DIR/analysis/intervention-ablate.jsonl" \
@@ -156,7 +182,7 @@ if [[ "$RUN_CAUSAL" == "1" ]]; then
     --target-size 4 \
     --gap 4
   sr-intervene-predictive-sae \
-    --model "$MODEL" \
+    "${MODEL_LOAD_ARGS[@]}" \
     --pairs data/research/pairs.jsonl \
     --checkpoint "$RUN_DIR/joint/predictive_sae.pt" \
     --output "$RUN_DIR/analysis/intervention-random.jsonl" \

@@ -56,6 +56,7 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
         args.device_map,
         args.trust_remote_code,
         args.revision,
+        use_safetensors=True if args.use_safetensors else None,
     )
     layer_path, layer_module = get_layer(model, args.layer)
     activations: list[torch.Tensor] = []
@@ -127,6 +128,7 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
             "stride": args.stride,
             "dtype": args.dtype,
             "requested_revision": args.revision,
+            "use_safetensors": args.use_safetensors,
             "resolved_model_revision": getattr(
                 model.config,
                 "_commit_hash",
@@ -247,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     p.add_argument("--device-map", default="auto")
     p.add_argument("--revision")
+    p.add_argument("--use-safetensors", action="store_true")
     p.add_argument("--tl-device", default="cuda")
     p.add_argument("--trust-remote-code", action="store_true")
     return p

@@ -87,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--revision")
+    parser.add_argument("--use-safetensors", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser
 
@@ -106,6 +107,7 @@ def main() -> None:
         args.device_map,
         args.trust_remote_code,
         args.revision,
+        use_safetensors=True if args.use_safetensors else None,
     )
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -241,6 +243,7 @@ def main() -> None:
                     None,
                 ),
                 "requested_revision": args.revision,
+                "use_safetensors": args.use_safetensors,
                 "resolved_model_revision": getattr(
                     model.config,
                     "_commit_hash",

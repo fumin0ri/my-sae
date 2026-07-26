@@ -88,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--revision")
+    parser.add_argument("--use-safetensors", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allow-mismatch", action="store_true")
@@ -135,7 +136,22 @@ def main() -> None:
         args.device_map,
         args.trust_remote_code,
         args.revision,
+        use_safetensors=True if args.use_safetensors else None,
     )
+    fitted_revision = source_cfg.get("resolved_model_revision")
+    loaded_revision = getattr(llm.config, "_commit_hash", None)
+    if (
+        fitted_revision is not None
+        and loaded_revision is not None
+        and fitted_revision != loaded_revision
+        and not args.allow_mismatch
+    ):
+        raise ValueError(
+            "Checkpoint/intervention model revision mismatch: "
+            f"fitted={fitted_revision!r}, loaded={loaded_revision!r}. "
+            "Use the same pinned revision, or pass --allow-mismatch only for "
+            "a deliberate cross-revision experiment."
+        )
     layer_path, layer = get_layer(llm, args.layer)
     fitted_layer_path = source_cfg.get("layer_path")
     if fitted_layer_path is not None and fitted_layer_path != layer_path:
