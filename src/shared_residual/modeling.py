@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import re
 from typing import Any, Callable, Iterator
 
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -13,6 +15,25 @@ LAYER_PATHS = (
     "gpt_neox.layers",       # Pythia
     "model.decoder.layers",  # OPT
 )
+
+
+def major_minor(version: str) -> tuple[int, int]:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        raise ValueError(f"cannot parse package version {version!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def require_safe_torch_load(version: str | None = None) -> None:
+    """Reject torch versions affected by unsafe torch.load checkpoint loading."""
+    detected = torch.__version__ if version is None else version
+    if major_minor(detected) < (2, 6):
+        raise RuntimeError(
+            "PyTorch >= 2.6 is required to load legacy Hugging Face .bin "
+            f"checkpoints safely (found torch {detected}). "
+            "Upgrade this environment with: "
+            "python -m pip install --upgrade 'torch>=2.6,<3'"
+        )
 
 
 def parse_dtype(name: str) -> torch.dtype:
@@ -34,6 +55,10 @@ def load_hf_model(
     revision: str | None = None,
     attn_implementation: str = "sdpa",
 ) -> tuple[Any, Any]:
+    # Official Pythia checkpoints are legacy torch .bin files rather than
+    # safetensors. Transformers deliberately blocks them on torch < 2.6 due
+    # to CVE-2025-32434; fail before downloading the tokenizer or weight shards.
+    require_safe_torch_load()
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=trust_remote_code,
@@ -42,13 +67,17 @@ def load_hf_model(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    dtype_keyword = (
+        "dtype" if major_minor(transformers.__version__) >= (4, 56)
+        else "torch_dtype"
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=parse_dtype(dtype),
         device_map=device_map,
         trust_remote_code=trust_remote_code,
         revision=revision,
         attn_implementation=attn_implementation,
+        **{dtype_keyword: parse_dtype(dtype)},
     )
     model.eval()
     return model, tokenizer

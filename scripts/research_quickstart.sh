@@ -29,7 +29,7 @@ RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/predictive-research}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-python -c 'import torch; assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB")'
+python -c 'import torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}")'
 mkdir -p "$RUN_DIR"
 git rev-parse HEAD > "$RUN_DIR/code-commit.txt"
 python -m pip freeze > "$RUN_DIR/python-environment.txt"

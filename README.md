@@ -16,9 +16,28 @@ cd my-sae
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install -e .
+python -m pip install --upgrade -e .
 bash scripts/research_quickstart.sh
 ```
+
+### PyTorch 2.6以上が必要
+
+公式PythiaチェックポイントはSafeTensorsではなくPyTorch `.bin` 形式です。
+CVE-2025-32434への対策として、TransformersはTorch 2.6未満でこの形式の
+読み込みを拒否します。`HF_HUB_DISABLE_TORCH_SECURITY_CHECK` では安全に回避
+できないため、次のコマンドで現在の環境を更新してください。
+
+```bash
+# RTX 4090 / CUDA 12.4向けの再現性を重視した推奨構成
+python -m pip install --upgrade \
+  torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install --upgrade -e .
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+bash scripts/research_quickstart.sh
+```
+
+クイックスタートは13.9GBのモデルをダウンロードする前にTorchのバージョンを
+検査し、不足している場合はアップグレードコマンドを表示して停止します。
 
 デフォルトは**単一RTX 4090（24GB）向けprofile**です。
 

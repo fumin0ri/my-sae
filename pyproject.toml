@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.2.1"
+version = "0.2.2"
 description = "Learn and causally test predictive sparse states in LLM residual streams"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
   "matplotlib>=3.8",
   "numpy>=1.26",
   "scikit-learn>=1.4",
-  "torch>=2.2",
+  "torch>=2.6,<3",
   "tqdm>=4.66",
   "transformers>=4.44",
 ]
