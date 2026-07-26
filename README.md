@@ -7,7 +7,73 @@ SAE で記述し、因果介入で検証するための実験コードです。
 「同じ窓の位置間では再現し、別の窓では変化する低ランク部分空間」です。
 平均はその状態の window ごとの座標として使います。
 
-## クイックスタート
+## 研究用クイックスタート（推奨）
+
+次を実行すると、controlled benchmark生成から、複数layerの同時抽出、nested
+group splitによるmodel selection、完全に未使用なouter test、因果介入、
+publication figure、HTML reportまで一括実行します。
+
+```bash
+git clone https://github.com/fumin0ri/my-sae.git
+cd my-sae
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e .
+bash scripts/research_quickstart.sh
+```
+
+完了後、次をブラウザで開いてください。
+
+```text
+runs/research/report/index.html
+```
+
+同じ数値からPNGとPDFも生成されます。
+
+```text
+runs/research/report/figures/layer-window-icc.{png,pdf}
+runs/research/report/figures/depth-profile.{png,pdf}
+runs/research/report/figures/locked-test.{png,pdf}
+runs/research/report/figures/shared-spectrum.{png,pdf}
+runs/research/report/figures/causal-interventions.{png,pdf}
+runs/research/report/figures/patch-directionality.{png,pdf}
+```
+
+GPUがない場合:
+
+```bash
+FIT_DEVICE=cpu bash scripts/research_quickstart.sh
+```
+
+modelや調べるlayerは環境変数で変更できます。
+
+```bash
+MODEL=EleutherAI/pythia-410m-deduped \
+LAYERS=0,3,6,9,12,15,18,21,23 \
+bash scripts/research_quickstart.sh
+```
+
+この研究用pipelineは以下を分離しています。
+
+1. **Inner grouped validation:** layer、window幅、rank、ridgeの選択専用。
+2. **Locked outer test:** 選択中には一度も参照しない最終評価。
+3. **Group bootstrap:** paraphraseを独立標本と誤認せず、問題単位で95% CIを計算。
+4. **Position-shuffled null:** 同じwindowに属する関係を壊した帰無分布。
+5. **Rank-matched baselines:** window mean PCAとlast-token PCAを同じrankで比較。
+6. **Split-half stability:** 独立した問題集合で同じsubspaceが再現するか評価。
+7. **Causal tests:** contradictory patch、learned ablation、norm-matched random
+   ablationを独立した問題pairで比較。
+8. **Paired inference:** learned-vs-random介入差についてbootstrap CI、
+   sign-flip test、Cohen's dzを報告。
+
+benchmarkは4-state machineを用い、同じ潜在問題を4通りにparaphraseします。
+同一問題のparaphraseは必ず同じsplitに入り、表層文のtrain/test leakageを防ぎます。
+因果介入pairはsubspace推定用promptとは別に生成されます。
+仮説、主要評価項目、反証条件、replication matrixは
+[`docs/RESEARCH_PROTOCOL.md`](docs/RESEARCH_PROTOCOL.md) に固定しています。
+
+## 最小スモークテスト
 
 以下をそのまま実行すると、公開されている小型モデル
 `EleutherAI/pythia-70m-deduped` を使って、データ生成から residual 抽出、
@@ -81,7 +147,7 @@ control、split-half の部分空間角を計測します。
 
 ## インストール
 
-上のquickstartを実行済みなら、この節は不要です。
+上のいずれかのquickstartを実行済みなら、この節は不要です。
 
 ```bash
 git clone <this-directory-or-copy-it>

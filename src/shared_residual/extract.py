@@ -45,7 +45,11 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
             raise KeyError(f"row {i} has no {args.text_key!r}")
 
     model, tokenizer = load_hf_model(
-        args.model, args.dtype, args.device_map, args.trust_remote_code
+        args.model,
+        args.dtype,
+        args.device_map,
+        args.trust_remote_code,
+        args.revision,
     )
     layer_path, layer_module = get_layer(model, args.layer)
     activations: list[torch.Tensor] = []
@@ -116,6 +120,12 @@ def extract_hf(args: argparse.Namespace) -> dict[str, Any]:
             "window_mode": args.window_mode,
             "stride": args.stride,
             "dtype": args.dtype,
+            "requested_revision": args.revision,
+            "resolved_model_revision": getattr(
+                model.config,
+                "_commit_hash",
+                None,
+            ),
         },
     }
 
@@ -225,6 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preview-chars", type=int, default=160)
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     p.add_argument("--device-map", default="auto")
+    p.add_argument("--revision")
     p.add_argument("--tl-device", default="cuda")
     p.add_argument("--trust-remote-code", action="store_true")
     return p

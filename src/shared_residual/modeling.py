@@ -31,9 +31,12 @@ def load_hf_model(
     dtype: str = "bfloat16",
     device_map: str = "auto",
     trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> tuple[Any, Any]:
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=trust_remote_code
+        model_name,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -43,6 +46,7 @@ def load_hf_model(
         torch_dtype=parse_dtype(dtype),
         device_map=device_map,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     model.eval()
     return model, tokenizer

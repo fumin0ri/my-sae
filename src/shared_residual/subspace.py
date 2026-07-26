@@ -57,7 +57,41 @@ def fit_generalized_subspace(
     y: torch.Tensor,
     rank: int,
     ridge: float = 1e-3,
+    pre_rank: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    if pre_rank is not None and pre_rank > 0 and y.shape[-1] > pre_rank:
+        flat = y.reshape(-1, y.shape[-1])
+        q = min(pre_rank, flat.shape[0] - 1, flat.shape[1] - 1)
+        if q < rank:
+            raise ValueError(
+                f"pre_rank={pre_rank} leaves q={q}, smaller than rank={rank}"
+            )
+        _, singular_values, projection = torch.pca_lowrank(
+            flat,
+            q=q,
+            center=False,
+            niter=4,
+        )
+        reduced_basis, eigenvalues, stats = fit_generalized_subspace(
+            y @ projection,
+            rank,
+            ridge,
+            pre_rank=None,
+        )
+        basis, _ = torch.linalg.qr(
+            projection @ reduced_basis,
+            mode="reduced",
+        )
+        stats.update(
+            {
+                "pre_rank": float(q),
+                "preprojection_variance_fraction": float(
+                    singular_values.square().sum().item()
+                    / flat.square().sum().clamp_min(1e-12).item()
+                ),
+            }
+        )
+        return basis, eigenvalues, stats
     sigma_z, sigma_eps = random_effect_covariances(y)
     d = y.shape[-1]
     ridge_abs = ridge * float(torch.trace(sigma_eps).item()) / d
@@ -162,7 +196,11 @@ def _probe(
     x_train = scaler.transform(train_features)
     x_test = scaler.transform(test_features)
     if len(encoder.classes_) <= 20:
-        model = LogisticRegression(max_iter=3000, class_weight="balanced")
+        model = LogisticRegression(
+            max_iter=3000,
+            class_weight="balanced",
+            random_state=0,
+        )
         model.fit(x_train, y_train)
         pred = model.predict(x_test)
         return {

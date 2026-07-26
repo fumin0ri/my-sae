@@ -52,8 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-key", default="source_text")
     p.add_argument("--target-key", default="target_text")
     p.add_argument("--answer-key", default="answer")
+    p.add_argument(
+        "--contrast-answer-key",
+        default="source_answer",
+        help="Optional alternative answer used to measure directional patching",
+    )
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     p.add_argument("--device-map", default="auto")
+    p.add_argument("--revision")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -82,8 +88,23 @@ def main() -> None:
         if fitted is not None and fitted != requested:
             mismatches.append(f"{key}: fitted={fitted!r}, requested={requested!r}")
     model, tokenizer = load_hf_model(
-        args.model, args.dtype, args.device_map, args.trust_remote_code
+        args.model,
+        args.dtype,
+        args.device_map,
+        args.trust_remote_code,
+        args.revision,
     )
+    fitted_revision = source_cfg.get("resolved_model_revision")
+    loaded_revision = getattr(model.config, "_commit_hash", None)
+    if (
+        fitted_revision is not None
+        and loaded_revision is not None
+        and fitted_revision != loaded_revision
+    ):
+        mismatches.append(
+            "model revision: "
+            f"fitted={fitted_revision!r}, loaded={loaded_revision!r}"
+        )
     layer_path, layer = get_layer(model, args.layer)
     fitted_layer_path = source_cfg.get("layer_path")
     if fitted_layer_path is not None:
@@ -175,6 +196,51 @@ def main() -> None:
         edited_lp = answer_logprob(
             edited_output.logits, target_ids, len(target_prefix_ids)
         )
+        contrast_metrics: dict[str, float] = {}
+        if args.contrast_answer_key in row:
+            contrast_answer_ids = tokenize_text(
+                tokenizer,
+                str(row[args.contrast_answer_key]),
+                add_special_tokens=False,
+            ).to(device)
+            contrast_ids = torch.cat(
+                [target_prefix_ids, contrast_answer_ids]
+            )
+            with torch.inference_mode():
+                contrast_baseline_output = model(
+                    input_ids=contrast_ids[None, :],
+                    use_cache=False,
+                )
+            with torch.inference_mode(), edit_residual(
+                layer,
+                args.hook_point,
+                apply_edit,
+            ):
+                contrast_edited_output = model(
+                    input_ids=contrast_ids[None, :],
+                    use_cache=False,
+                )
+            contrast_baseline_lp = answer_logprob(
+                contrast_baseline_output.logits,
+                contrast_ids,
+                len(target_prefix_ids),
+            )
+            contrast_edited_lp = answer_logprob(
+                contrast_edited_output.logits,
+                contrast_ids,
+                len(target_prefix_ids),
+            )
+            contrast_metrics = {
+                "baseline_contrast_answer_logprob": contrast_baseline_lp,
+                "edited_contrast_answer_logprob": contrast_edited_lp,
+                "delta_contrast_answer_logprob": (
+                    contrast_edited_lp - contrast_baseline_lp
+                ),
+                "delta_contrast_minus_target_logprob": (
+                    (contrast_edited_lp - contrast_baseline_lp)
+                    - (edited_lp - baseline_lp)
+                ),
+            }
         first_answer_position = len(target_prefix_ids) - 1
         baseline_dist = F.log_softmax(
             baseline_output.logits[0, first_answer_position].float(), dim=-1
@@ -195,6 +261,7 @@ def main() -> None:
                 "delta_answer_logprob": edited_lp - baseline_lp,
                 "first_token_kl_baseline_to_edited": float(kl.item()),
                 "intervention_l2": float(delta.float().norm().item()),
+                **contrast_metrics,
                 "metadata": {
                     k: v
                     for k, v in row.items()

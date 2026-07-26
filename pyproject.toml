@@ -9,6 +9,7 @@ description = "Extract and causally test token-shared residual-stream representa
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",
+  "matplotlib>=3.8",
   "numpy>=1.26",
   "scikit-learn>=1.4",
   "torch>=2.2",
@@ -22,10 +23,13 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 sr-extract = "shared_residual.extract:main"
+sr-extract-grid = "shared_residual.extract_grid:main"
 sr-fit = "shared_residual.subspace:main"
+sr-research = "shared_residual.research:main"
 sr-sae = "shared_residual.sae_analysis:main"
 sr-intervene = "shared_residual.intervene:main"
 sr-train-group-sae = "shared_residual.group_sae:main"
+sr-visualize = "shared_residual.visualize_results:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
