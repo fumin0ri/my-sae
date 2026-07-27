@@ -1,22 +1,31 @@
-# Persistent and predictive sparse residual streams
+# Forecastable sparse residual trajectories
 
-## 現在の主実験: z₀をz₁...z₉へ個別に合わせる
+## 現在の主実験: offset-conditioned transition JEPA-SAE
 
-現在の最小アーキテクチャでは、frozen LLMから10 tokenのresidual window
-`h₀...h₉`を取り出します。`h₀`をonline SAE encoderへ入れた
-`z₀`をcontext、`h₁...h₉`をEMA target SAE encoderへ入れた
-`z₁...z₉`をtargetとします。
+Frozen LLMから同じ系列の10-token residual trajectory `h₀...h₉`を取り出し、
+現在の疎表現`z₀`とoffset `k`だけから未来のEMA SAE表現`zₖ`を予測します。
 
 ```text
-h₀ ── online SAE ── z₀ ─┬─ match ─ stopgrad(z₁) ── EMA SAE(h₁)
-                         ├─ match ─ stopgrad(z₂) ── EMA SAE(h₂)
-                         ├─ ...
-                         └─ match ─ stopgrad(z₉) ── EMA SAE(h₉)
+h₀ ─ online Top-K SAE ─ z₀ ─┐
+                              ├─ offset-conditioned MLP ─ softplus ─ ẑₖ
+offset embedding(k) ──────────┘
+
+hₖ ─ EMA target SAE ─ stopgrad(zₖ)
 ```
 
-`z₁...z₉`の平均targetは作りません。9個の損失を個別に計算してから平均します。
-小型Transformer、predictor、position embeddingも使いません。通常のSAE再構成に加え、
-同じwindow/groupを別windowから識別するgroup-aware contrastive controlを用います。
+主張は、完全な未来状態ではなく、後続tokenを観測する前から
+**予測可能な未来residual成分**を疎な辞書へ集中できるか、です。
+`z₀`と`zₖ`を直接同一化しないため、時間的に変化する表現を許します。
+
+全方式は同じstandard SAE checkpointから開始します。
+
+- `joint`: predictorとonline SAE辞書を共同学習
+- `fixed`: standard SAEを固定してpredictorだけ学習
+- `k_only`: `z₀`を遮断し、offsetだけで予測
+- shuffled `z₀`: evaluation時の対応関係null
+
+online SAEの再構成は`h₀`だけでなく全10位置で学習します。target平均は作らず、
+offset 1...9を個別に予測します。predictorは小型MLPで、Transformerは使いません。
 
 CUDA 12.1 / `torch==2.5.1+cu121` / 単一RTX 4090向けの一発実行:
 
@@ -29,12 +38,13 @@ pip install -U pip
 python -m pip install \
   torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 python -m pip install --upgrade -e .
-bash scripts/persistent_quickstart.sh
+bash scripts/transition_jepa_quickstart.sh
 ```
 
-結果は `runs/persistent-research/report/index.html` に出ます。offset 1...9ごとの
-cosine、feature survival、support Jaccard、different-window null、retrieval、
-standard SAE control、state probe、因果patch/ablationをPNG/PDF/HTMLで確認できます。
+結果は `runs/transition-jepa-research/report/index.html` に出ます。offset 1...9ごとの
+cosine、normalized MSE、support precision/recall、true-minus-shuffled context、
+joint-minus-fixed、innovation energy、state probe、因果patch/ablationを
+PNG/PDF/HTMLで確認できます。
 
 軽量smoke test:
 
@@ -43,21 +53,26 @@ MODEL=EleutherAI/pythia-70m-deduped \
 LAYER=3 \
 D_SAE=2048 \
 K=32 \
-STEPS=300 \
+PREDICTOR_WIDTH=64 \
+STANDARD_STEPS=300 \
+FORECAST_STEPS=300 \
+PREDICTOR_WARMUP_STEPS=50 \
 PROBLEMS=40 \
 EXTRACT_BATCH_SIZE=32 \
 RUN_CAUSAL=0 \
-bash scripts/persistent_quickstart.sh
+bash scripts/transition_jepa_quickstart.sh
 ```
 
-従来のJEPA版は削除していません。再現にはそのまま次を使えます。
+Temporal SAEに近いdirect matching版と、従来のcontext-Transformer JEPA版は
+削除していません。
 
 ```bash
+bash scripts/persistent_quickstart.sh
 bash scripts/research_quickstart.sh
 ```
 
 主仮説、評価指標、棄却条件、replication matrixは
-[docs/PERSISTENT_SAE_PROTOCOL.md](docs/PERSISTENT_SAE_PROTOCOL.md)に固定しています。
+[docs/TRANSITION_JEPA_PROTOCOL.md](docs/TRANSITION_JEPA_PROTOCOL.md)に固定しています。
 
 LLMの「近接tokenに共通する内部状態」を、単なる平均や低ランク相関ではなく、**離れた文脈から予測可能な疎なresidual-space feature**として同定する研究コードです。
 

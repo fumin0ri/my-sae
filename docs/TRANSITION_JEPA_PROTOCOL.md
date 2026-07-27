@@ -1,0 +1,145 @@
+# Offset-conditioned transition JEPA-SAE protocol
+
+## Confirmatory question
+
+Can joint latent forecasting reshape an SAE dictionary so that a sparse code
+at the present position exposes more of the future residual trajectory's
+forecastable state than a standard SAE dictionary?
+
+For a prespecified ten-token window:
+
+```text
+z0_x = TopK(ReLU(E_online(normalize(h0))))
+zk_y = stopgrad(TopK(ReLU(E_EMA(normalize(hk)))))
+z_hat_k = softplus(P(z0_x, embedding(k))), k = 1,...,9
+```
+
+The online SAE reconstructs all ten positions. The EMA target encoder is
+initialized from the online encoder and updated only during joint training.
+No target representations are averaged.
+
+## Interpretation boundary
+
+`P(z0, k)` does not receive intervening tokens. It estimates the component of
+`zk` that is forecastable from the present state and offset under the training
+distribution:
+
+```text
+P(z0, k) approximately estimates E[zk | z0, k].
+```
+
+It is not claimed to be a deterministic transition operator. The innovation
+contains later token information, lexical realization, and other
+unforecastable updates.
+
+## Training stages
+
+1. Train one standard Top-K SAE on all ten positions.
+2. Copy its online encoder into the EMA target encoder.
+3. Initialize all forecasting conditions from this exact checkpoint.
+4. Warm up the predictor with the SAE frozen.
+5. For the joint condition only, unfreeze the online encoder and decoder,
+   ramp the forecasting weight, and update the target encoder by EMA.
+
+The fixed and offset-only controls receive the same number of predictor
+optimizer steps as the joint condition.
+
+## Objective
+
+```text
+L = L_reconstruction
+  + lambda_prediction * (
+      mean_k[1 - cosine(z_hat_k, zk_y)
+             + 0.25 * MSE(z_hat_k, zk_y) / energy(zk_y)]
+      + lambda_residual * FVU(decode(TopK(z_hat_k)), hk)
+    )
+  + lambda_variance * L_variance
+```
+
+The predictor output stays dense and non-negative during training. Top-K is
+used for support metrics, residual decoding, and causal intervention.
+
+## Confirmatory comparison
+
+The primary comparison is:
+
+```text
+joint JEPA-SAE minus fixed standard-SAE predictor
+```
+
+The statistic is the per-window mean target-code cosine across offsets 1...9,
+with a problem-group bootstrap 95% confidence interval.
+
+The joint claim requires all of the following:
+
+- joint forecasting exceeds the fixed-SAE predictor;
+- the true context exceeds a different-group shuffled context;
+- the true context exceeds the offset-only predictor;
+- reconstruction remains close to the standard SAE;
+- the representation does not collapse;
+- any causal effect exceeds a norm-matched random control.
+
+## Controls
+
+- standard SAE checkpoint shared by all conditions;
+- fixed standard SAE plus the same predictor;
+- offset-only predictor with z0 removed;
+- shuffled z0 at evaluation;
+- direct temporal matching retained as a Temporal-SAE-like baseline;
+- context-Transformer JEPA retained as a higher-capacity baseline.
+
+Future extensions should add an intervening-token-conditioned transition model
+and a faithful reproduction of the published Temporal SAE.
+
+## Locked-test outcomes
+
+For each offset 1...9:
+
+- target-code cosine and normalized MSE;
+- true-context minus shuffled-context cosine;
+- Top-K support precision, recall, and Jaccard;
+- residual prediction FVU;
+- innovation-to-target energy ratio;
+- predictor and target norms.
+
+Secondary outcomes:
+
+- future task-state probes from z0 and predicted z9;
+- paraphrase invariance and state specificity;
+- dead-feature and variance-participation diagnostics;
+- top forecastable features and activating examples;
+- forecastable-component patching and ablation.
+
+## Causal intervention
+
+The actual future code is not replaced. Only the forecastable component is
+edited:
+
+```text
+delta_hk = D(
+    TopK(P(z0_source, k))
+    - TopK(P(z0_target, k))
+)
+```
+
+Ablation removes `D(TopK(P(z0_target, k)))`. Every learned edit is compared
+with an independently sampled norm-matched random direction.
+
+## Falsification conditions
+
+The main claim is rejected or weakened if:
+
+- the group-bootstrap interval for joint minus fixed includes zero;
+- shuffled z0 performs as well as the corresponding true z0;
+- the offset-only model explains the apparent forecasting performance;
+- the joint dictionary gains prediction only by materially degrading
+  reconstruction;
+- forecasted features collapse to position/template shortcuts;
+- learned causal edits are indistinguishable from norm-matched random edits;
+- results fail across model, layer, task family, or feature seed.
+
+## Replication
+
+The unit of replication is model x layer x task family x feature seed. The
+recommended matrix uses Pythia 1.4B, 2.8B, and 6.9B; three prespecified layer
+fractions; finite-state, arithmetic, and logic tasks; and at least three seeds.

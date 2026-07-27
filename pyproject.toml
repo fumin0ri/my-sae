@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.3.0"
-description = "Learn and causally test persistent and predictive sparse states in LLM residual streams"
+version = "0.4.0"
+description = "Learn and causally test forecastable sparse states in LLM residual trajectories"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",
@@ -39,6 +39,10 @@ sr-train-persistent-sae = "shared_residual.persistent_sae:main"
 sr-evaluate-persistent-sae = "shared_residual.persistent_eval:main"
 sr-intervene-persistent-sae = "shared_residual.persistent_intervene:main"
 sr-visualize-persistent-sae = "shared_residual.persistent_visualize:main"
+sr-train-transition-jepa-sae = "shared_residual.transition_jepa_sae:main"
+sr-evaluate-transition-jepa-sae = "shared_residual.transition_jepa_eval:main"
+sr-intervene-transition-jepa-sae = "shared_residual.transition_jepa_intervene:main"
+sr-visualize-transition-jepa-sae = "shared_residual.transition_jepa_visualize:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

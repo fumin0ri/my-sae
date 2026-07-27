@@ -332,6 +332,8 @@ def main() -> None:
     bundle = torch_load(args.activations)
     x = bundle["activations"].float()
     metadata = bundle["metadata"]
+    source_config = bundle.get("config", {})
+    del bundle
     if x.ndim != 3:
         raise ValueError("activations must have shape [windows, tokens, d_model]")
     if x.shape[1] != 10:
@@ -472,7 +474,7 @@ def main() -> None:
             },
             "config": asdict(cfg),
             "train_args": vars(args),
-            "source_config": bundle.get("config", {}),
+            "source_config": source_config,
             "split": split,
         },
         output_dir / "persistent_sae.pt",
