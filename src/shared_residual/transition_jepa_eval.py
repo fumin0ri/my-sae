@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,6 @@ from .evaluation import (
     collapse_diagnostics,
     different_group_permutation,
     fit_probe,
-    invariance_analysis,
     pca_embedding,
     select_probe_dimensions,
 )
@@ -31,6 +31,12 @@ from .transition_jepa_sae import (
     TransitionJEPASAE,
     support_metrics,
 )
+
+PROBE_LABELS = {
+    "semantics": "semantic_answer",
+    "context": "context_category",
+    "syntax": "syntax_template",
+}
 
 
 def load_model(
@@ -319,8 +325,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixed-checkpoint", required=True)
     parser.add_argument("--k-only-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--label-key", default="state")
-    parser.add_argument("--group-key", default="group_id")
+    parser.add_argument("--mmlu-model-results", required=True)
+    parser.add_argument("--group-key", default="question_id")
+    parser.add_argument("--semantics-key", default=PROBE_LABELS["semantics"])
+    parser.add_argument("--context-key", default=PROBE_LABELS["context"])
+    parser.add_argument("--syntax-key", default=PROBE_LABELS["syntax"])
+    parser.add_argument("--probe-max-dim", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--test-fraction", type=float, default=0.2)
@@ -332,6 +342,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.probe_max_dim < 1:
+        raise ValueError("--probe-max-dim must be positive")
     device = torch.device(
         args.device
         if not args.device.startswith("cuda") or torch.cuda.is_available()
@@ -342,6 +354,21 @@ def main() -> None:
     x = bundle["activations"].float()
     metadata = bundle["metadata"]
     del bundle
+    probe_labels = {
+        "semantics": args.semantics_key,
+        "context": args.context_key,
+        "syntax": args.syntax_key,
+    }
+    for axis, key in probe_labels.items():
+        if any(key not in row for row in metadata):
+            raise KeyError(f"MMLU {axis} label {key!r} is missing")
+    mmlu_model_results = json.loads(
+        Path(args.mmlu_model_results).read_text(encoding="utf-8")
+    )
+    if int(mmlu_model_results.get("n", -1)) != len(metadata):
+        raise ValueError(
+            "base-model MMLU results and activation rows have different sizes"
+        )
     train_indices, validation_indices, test_indices = grouped_three_way_split(
         metadata,
         args.validation_fraction,
@@ -415,10 +442,12 @@ def main() -> None:
         probe_contexts[method] = select_probe_dimensions(
             context.float(),
             development_indices,
+            args.probe_max_dim,
         ).to(torch.float16)
         probe_predictions[method] = select_probe_dimensions(
             final_prediction.float(),
             development_indices,
+            args.probe_max_dim,
         ).to(torch.float16)
         if method in {"joint", "fixed"}:
             test_contexts[method] = context[test_indices].clone()
@@ -448,35 +477,29 @@ def main() -> None:
         "joint_predicted_z9": probe_predictions["joint"].float(),
         "fixed_predicted_z9": probe_predictions["fixed"].float(),
         "k_only_predicted_z9": probe_predictions["k_only"].float(),
-        "raw_h0": select_probe_dimensions(x[:, 0], development_indices),
-    }
-    probes = {
-        name: fit_probe(
-            values,
-            metadata,
+        "raw_h0": select_probe_dimensions(
+            x[:, 0],
             development_indices,
-            test_indices,
-            args.label_key,
-            args.group_key,
-            args.seed,
-        )[0]
-        for name, values in tqdm(
-            representations.items(),
-            desc="state probes",
-        )
+            args.probe_max_dim,
+        ),
     }
-    invariance = {
-        name: invariance_analysis(
-            values,
-            metadata,
-            test_indices,
-            args.group_key,
-            args.label_key,
-            args.seed + index,
-        )
-        for index, (name, values) in enumerate(representations.items())
-        if name in {"joint_z0", "standard_sae_z0", "joint_predicted_z9"}
-    }
+    probes: dict[str, dict[str, Any]] = {}
+    for axis_index, (axis, label_key) in enumerate(probe_labels.items()):
+        probes[axis] = {
+            name: fit_probe(
+                values,
+                metadata,
+                development_indices,
+                test_indices,
+                label_key,
+                args.group_key,
+                args.seed + 1000 * axis_index,
+            )[0]
+            for name, values in tqdm(
+                representations.items(),
+                desc=f"MMLU {axis} probes",
+            )
+        }
     assert joint_final_prediction is not None
     assert joint_final_target is not None
     comparison = clustered_mean_ci(
@@ -508,6 +531,20 @@ def main() -> None:
             "predictor": "offset-conditioned MLP",
             "target_aggregation": "none",
         },
+        "benchmark": {
+            "name": "MMLU",
+            "dataset": metadata[0].get("dataset"),
+            "dataset_revision": metadata[0].get("dataset_revision"),
+            "dataset_split": metadata[0].get("dataset_split"),
+            "n_questions": len(metadata),
+            "probe_labels": probe_labels,
+            "definitions": {
+                "semantics": "correct option A/B/C/D after balanced permutation",
+                "context": "official MMLU broad subject category",
+                "syntax": "balanced surface prompt template",
+            },
+            "base_model_accuracy": mmlu_model_results,
+        },
         "split": {
             "group_key": args.group_key,
             "split_seed": args.split_seed,
@@ -518,8 +555,7 @@ def main() -> None:
         "locked_test_offset_curve": curves,
         "primary_joint_minus_fixed_code_cosine": comparison,
         "reconstruction_fvu": reconstruction_fvu,
-        "locked_test_state_probes": probes,
-        "paraphrase_and_semantic_invariance": invariance,
+        "locked_test_mmlu_probes": probes,
         "collapse_diagnostics": {
             "joint_z0": collapse_diagnostics(
                 test_contexts["joint"].float()
@@ -581,6 +617,39 @@ def main() -> None:
                         "context_gain_ci95_high": gain["ci95_high"],
                     }
                 )
+    with (output_dir / "mmlu_probe_accuracy.csv").open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        fieldnames = [
+            "axis",
+            "representation",
+            "accuracy",
+            "balanced_accuracy",
+            "chance_accuracy",
+            "ci95_low",
+            "ci95_high",
+            "n_development",
+            "n_locked_test",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for axis, axis_probes in probes.items():
+            for representation, result in axis_probes.items():
+                writer.writerow(
+                    {
+                        "axis": axis,
+                        "representation": representation,
+                        "accuracy": result["accuracy"],
+                        "balanced_accuracy": result["balanced_accuracy"],
+                        "chance_accuracy": result["chance_accuracy"],
+                        "ci95_low": result["group_bootstrap"]["ci95_low"],
+                        "ci95_high": result["group_bootstrap"]["ci95_high"],
+                        "n_development": result["n_development"],
+                        "n_locked_test": result["n_locked_test"],
+                    }
+                )
     sparse_final = topk_relu(
         joint_final_prediction.float(),
         reference_cfg.k,
@@ -590,9 +659,16 @@ def main() -> None:
             "embedding": pca_embedding(
                 test_contexts["joint"].float()
             ),
-            "labels": [
-                str(metadata[index][args.label_key])
+            "semantic_labels": [
+                str(metadata[index][args.semantics_key])
                 for index in test_indices
+            ],
+            "context_labels": [
+                str(metadata[index][args.context_key])
+                for index in test_indices
+            ],
+            "syntax_labels": [
+                str(metadata[index][args.syntax_key]) for index in test_indices
             ],
             "feature_ids": feature_ids,
             "feature_activations": sparse_final[:, feature_ids],

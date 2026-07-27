@@ -73,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stride", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument(
+        "--truncation-side",
+        choices=["left", "right"],
+        default="right",
+    )
     parser.add_argument("--preview-chars", type=int, default=160)
     parser.add_argument(
         "--dtype",
@@ -109,6 +114,7 @@ def main() -> None:
         args.revision,
         use_safetensors=True if args.use_safetensors else None,
     )
+    tokenizer.truncation_side = args.truncation_side
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -254,6 +260,7 @@ def main() -> None:
                     "init_kwargs",
                     {},
                 ).get("_commit_hash"),
+                "truncation_side": args.truncation_side,
                 "multi_layer_extraction": True,
             },
         }

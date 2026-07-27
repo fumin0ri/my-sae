@@ -11,6 +11,36 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 
+def cluster_bootstrap_means(
+    values: np.ndarray,
+    groups: np.ndarray,
+    seed: int,
+    samples: int,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    groups = np.asarray(groups)
+    if len(values) != len(groups) or not len(values):
+        raise ValueError("values and groups must have equal nonzero length")
+    unique, inverse = np.unique(groups, return_inverse=True)
+    cluster_sums = np.bincount(inverse, weights=values)
+    cluster_counts = np.bincount(inverse)
+    rng = np.random.default_rng(seed)
+    bootstrap = np.empty(samples, dtype=float)
+    for start in range(0, samples, chunk_size):
+        end = min(start + chunk_size, samples)
+        sampled = rng.integers(
+            0,
+            len(unique),
+            size=(end - start, len(unique)),
+        )
+        bootstrap[start:end] = (
+            cluster_sums[sampled].sum(axis=1)
+            / cluster_counts[sampled].sum(axis=1)
+        )
+    return bootstrap
+
+
 def different_group_permutation(groups: np.ndarray, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(groups))
@@ -34,15 +64,12 @@ def clustered_mean_ci(
     seed: int,
     samples: int = 2000,
 ) -> dict[str, float | int]:
-    unique = np.unique(groups)
-    rng = np.random.default_rng(seed)
-    bootstrap = []
-    for _ in range(samples):
-        chosen = rng.choice(unique, size=len(unique), replace=True)
-        indices = np.concatenate(
-            [np.flatnonzero(groups == group) for group in chosen]
-        )
-        bootstrap.append(float(values[indices].mean()))
+    bootstrap = cluster_bootstrap_means(
+        values,
+        groups,
+        seed,
+        samples,
+    )
     low, high = np.quantile(bootstrap, [0.025, 0.975])
     return {
         "mean": float(values.mean()),
@@ -59,15 +86,12 @@ def group_bootstrap_accuracy(
     seed: int,
     samples: int = 2000,
 ) -> dict[str, float | int]:
-    unique = np.unique(groups)
-    rng = np.random.default_rng(seed)
-    values = []
-    for _ in range(samples):
-        sampled = rng.choice(unique, size=len(unique), replace=True)
-        indices = np.concatenate(
-            [np.flatnonzero(groups == group) for group in sampled]
-        )
-        values.append(float(np.mean(truth[indices] == prediction[indices])))
+    values = cluster_bootstrap_means(
+        truth == prediction,
+        groups,
+        seed,
+        samples,
+    )
     low, high = np.quantile(values, [0.025, 0.975])
     return {
         "ci95_low": float(low),

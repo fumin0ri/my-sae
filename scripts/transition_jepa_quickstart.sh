@@ -47,9 +47,12 @@ PILE_DATASET_TRUST_REMOTE_CODE="${PILE_DATASET_TRUST_REMOTE_CODE:-0}"
 PILE_REQUIRE_ALL_DOMAINS="${PILE_REQUIRE_ALL_DOMAINS:-0}"
 EVAL_EXTRACT_BATCH_SIZE="${EVAL_EXTRACT_BATCH_SIZE:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
-EVAL_PROBLEMS="${EVAL_PROBLEMS:-512}"
+MMLU_MAX_QUESTIONS="${MMLU_MAX_QUESTIONS:-0}"
+MMLU_DATASET="${MMLU_DATASET:-cais/mmlu}"
+MMLU_DATASET_CONFIG="${MMLU_DATASET_CONFIG:-all}"
+MMLU_DATASET_REVISION="${MMLU_DATASET_REVISION:-c30699e8356da336a370243923dbaf21066bb9fe}"
+MMLU_MAX_LENGTH="${MMLU_MAX_LENGTH:-1536}"
 PAIRS="${PAIRS:-128}"
-TASK_FAMILY="${TASK_FAMILY:-fsm}"
 SEED="${SEED:-0}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
@@ -72,7 +75,7 @@ python -m pip freeze > "$RUN_DIR/python-environment.txt"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
   > "$RUN_DIR/gpu-environment.csv"
 
-echo "[1/10] Stream the official Pile mixture and extract residual shards"
+echo "[1/11] Stream the official Pile mixture and extract residual shards"
 PILE_DATA_ARGS=(--dataset "$PILE_DATASET" --dataset-config "$PILE_DATASET_CONFIG")
 if [[ -n "$PILE_DATASET_REVISION" ]]; then
   PILE_DATA_ARGS+=(--dataset-revision "$PILE_DATASET_REVISION")
@@ -100,17 +103,18 @@ sr-extract-pile \
 
 ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
 
-echo "[2/10] Generate an independent controlled locked-test benchmark"
-python scripts/make_research_data.py \
+echo "[2/11] Build the balanced MMLU locked-test benchmark"
+sr-make-mmlu \
   --prompts-output data/transition-jepa/prompts.jsonl \
   --pairs-output data/transition-jepa/pairs.jsonl \
-  --problems "$EVAL_PROBLEMS" \
-  --paraphrases 4 \
+  --dataset "$MMLU_DATASET" \
+  --dataset-config "$MMLU_DATASET_CONFIG" \
+  --dataset-revision "$MMLU_DATASET_REVISION" \
+  --max-questions "$MMLU_MAX_QUESTIONS" \
   --pairs "$PAIRS" \
-  --task-family "$TASK_FAMILY" \
   --seed "$SEED"
 
-echo "[3/10] Extract controlled trajectories for evaluation only"
+echo "[3/11] Extract MMLU residual trajectories for evaluation only"
 sr-extract-grid \
   "${MODEL_LOAD_ARGS[@]}" \
   --data data/transition-jepa/prompts.jsonl \
@@ -119,13 +123,23 @@ sr-extract-grid \
   --hook-point post \
   --window-size "$WINDOW_SIZE" \
   --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
-  --max-length 384 \
+  --max-length "$MMLU_MAX_LENGTH" \
+  --truncation-side left \
   --dtype bfloat16 \
   --storage-dtype bfloat16
 
 EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
 
-echo "[4/10] Pretrain the common all-position standard SAE on The Pile"
+echo "[4/11] Measure zero-shot base-LLM MMLU answer accuracy"
+sr-score-mmlu \
+  "${MODEL_LOAD_ARGS[@]}" \
+  --data data/transition-jepa/prompts.jsonl \
+  --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
+  --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
+  --max-length "$MMLU_MAX_LENGTH" \
+  --dtype bfloat16
+
+echo "[5/11] Pretrain the common all-position standard SAE on The Pile"
 sr-train-standard-sae \
   --activation-manifest "$ACTIVATION_MANIFEST" \
   --output-dir "$RUN_DIR/standard" \
@@ -162,40 +176,40 @@ COMMON_FORECAST_ARGS=(
   --seed "$SEED"
 )
 
-echo "[5/10] Jointly tune the SAE dictionary and predictor on The Pile"
+echo "[6/11] Jointly tune the SAE dictionary and predictor on The Pile"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/joint" \
   --objective joint
 
-echo "[6/10] Train a predictor on the frozen standard-SAE dictionary"
+echo "[7/11] Train a predictor on the frozen standard-SAE dictionary"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/fixed" \
   --objective fixed
 
-echo "[7/10] Train the offset-only shortcut control with z0 removed"
+echo "[8/11] Train the offset-only shortcut control with z0 removed"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/k_only" \
   --objective k_only
 
-echo "[8/10] Open the independent locked problem-group test"
+echo "[9/11] Open the question-grouped MMLU locked test"
 sr-evaluate-transition-jepa-sae \
   --activations "$EVAL_ACTIVATIONS" \
   --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
   --fixed-checkpoint "$RUN_DIR/fixed/transition_jepa_sae.pt" \
   --k-only-checkpoint "$RUN_DIR/k_only/transition_jepa_sae.pt" \
+  --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
   --output-dir "$RUN_DIR/analysis" \
-  --label-key state \
-  --group-key group_id \
+  --group-key question_id \
   --batch-size "$EVAL_BATCH_SIZE" \
   --device "$TRAIN_DEVICE" \
   --seed "$SEED" \
   --split-seed "$SPLIT_SEED"
 
 if [[ "$RUN_CAUSAL" == "1" ]]; then
-  echo "[9/10] Patch, ablate, and norm-match forecastable features"
+  echo "[10/11] Patch, ablate, and norm-match MMLU forecastable features"
   sr-intervene-transition-jepa-sae \
     "${MODEL_LOAD_ARGS[@]}" \
     --pairs data/transition-jepa/pairs.jsonl \
@@ -224,10 +238,10 @@ if [[ "$RUN_CAUSAL" == "1" ]]; then
     --mode random_ablate \
     --seed "$SEED"
 else
-  echo "[9/10] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+  echo "[10/11] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
 fi
 
-echo "[10/10] Build PNG/PDF figures and a self-contained HTML report"
+echo "[11/11] Build PNG/PDF figures and a self-contained HTML report"
 sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 
 echo

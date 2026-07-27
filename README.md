@@ -3,7 +3,7 @@
 Frozen autoregressive LLMの10-token residual trajectoryから、現在位置で
 すでに予測可能な未来の内部状態を疎な辞書として抽出する研究コードです。
 SAEとpredictorの学習にはThe Pileの公式22-subcorpus mixtureを使い、
-finite-state benchmarkは学習に混ぜずlocked評価だけに使います。
+MMLUは学習に混ぜずlocked評価だけに使います。
 
 ```text
 h₀ ─ online Top-K SAE ─ z₀ ─┐
@@ -65,6 +65,7 @@ bash scripts/transition_jepa_quickstart.sh
 | standard SAE | 12,000 steps |
 | JEPA conditions | 各8,000 steps |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
+| evaluation | MMLU test 14,042 questions |
 
 結果は次の自己完結HTMLに出ます。
 
@@ -86,7 +87,7 @@ PILE_SHARD_WINDOWS=512 \
 STANDARD_STEPS=300 \
 FORECAST_STEPS=300 \
 PREDICTOR_WARMUP_STEPS=50 \
-EVAL_PROBLEMS=40 \
+MMLU_MAX_QUESTIONS=320 \
 PILE_EXTRACT_BATCH_SIZE=32 \
 EVAL_EXTRACT_BATCH_SIZE=32 \
 RUN_CAUSAL=0 \
@@ -143,7 +144,7 @@ The Pileにはsubcorpusごとに異なるライセンスと利用条件があり
 - `joint`: predictor warm-up後、predictor・online encoder・decoderを共同学習
 - `fixed`: standard SAEを固定し、同じpredictorだけ学習
 - `k_only`: `z₀`を遮断し、offsetだけから予測
-- shuffled context: locked testで別problem groupの`z₀`へ交換
+- shuffled context: locked testで別MMLU questionの`z₀`へ交換
 
 online SAEは10位置すべてを再構成します。EMA target encoderはjoint条件だけで
 更新されます。predictor出力は学習時にはdense non-negative softplusとし、
@@ -163,13 +164,16 @@ L = L_reconstruction
 
 ## 評価と可視化
 
-Pileと独立なlocked problem-group testで次を出力します。
+Pileと独立なMMLU question-grouped locked testで次を出力します。
 
 - offset 1...9のcode cosine、normalized MSE、support precision/recall/Jaccard
 - true-context minus shuffled-context
-- joint minus fixedのproblem-group bootstrap 95% CI
+- joint minus fixedのquestion-group bootstrap 95% CI
 - residual prediction FVUとinnovation energy
-- task-state probe、paraphrase invariance、collapse診断
+- semantics accuracy: balanced option permutation後の正答A/B/C/D
+- context accuracy: 公式MMLU大分類（STEM/humanities/social sciences/other）
+- syntax accuracy: 内容と独立に均衡割付した4種類のprompt形式
+- base LLMのzero-shot MMLU accuracy、collapse診断
 - top forecastable featureと活性化例
 - forecastable componentだけのpatch・ablation・norm-matched random対照
 - PNG、PDF、CSV、JSON、自己完結HTML
@@ -180,26 +184,35 @@ Pileと独立なlocked problem-group testで次を出力します。
 Δhₖ = D(TopK(P(z₀_source,k)) - TopK(P(z₀_target,k)))
 ```
 
+MMLUは`cais/mmlu` commit
+`c30699e8356da336a370243923dbaf21066bb9fe`へ固定しています。既定ではtest
+14,042問すべてを1回ずつ使います。短い確認実験だけ
+`MMLU_MAX_QUESTIONS`を設定してください。base LLM scoreは表層形式を統制した
+zero-shot評価であり、公式leaderboardの5-shot protocolとは区別して報告します。
+
 ## Replication
 
-task family、seed、出力先を環境変数で分離できます。
+model、layer、seed、出力先を環境変数で分離できます。
 
 ```bash
-TASK_FAMILY=logic \
+MODEL=EleutherAI/pythia-2.8b-deduped \
+LAYER=16 \
 SEED=1 \
 SPLIT_SEED=1 \
-RUN_DIR=runs/transition-jepa-pile-logic-seed1 \
+RUN_DIR=runs/transition-jepa-pile-mmlu-seed1 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-`TASK_FAMILY`は`fsm`、`arithmetic`、`logic`を選べます。モデル・層・task
-family・feature seedを独立したreplication unitとして扱ってください。
+モデル・層・data split seed・feature seedを独立したreplication unitとして
+扱ってください。
 
 ## コード構成
 
 ```text
 src/shared_residual/
   pile_extract.py              Pile streaming・residual shard生成
+  mmlu_data.py                 MMLU均衡prompt・causal pair生成
+  mmlu_score.py                base LLM MMLU accuracy
   activation_store.py          shard-aware training iterator
   standard_sae.py              reconstruction-only初期SAE
   transition_jepa_sae.py       JEPA-SAE学習と3条件
@@ -212,7 +225,6 @@ src/shared_residual/
 
 scripts/
   transition_jepa_quickstart.sh
-  make_research_data.py
 
 docs/
   TRANSITION_JEPA_PROTOCOL.md

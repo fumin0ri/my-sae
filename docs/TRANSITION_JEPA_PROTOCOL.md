@@ -47,9 +47,9 @@ unforecastable updates.
 The fixed and offset-only controls receive the same number of predictor
 optimizer steps as the joint condition.
 
-The controlled finite-state, arithmetic, and logic prompts are never used for
-SAE or predictor optimization. They are generated independently and opened
-only for locked evaluation and causal intervention.
+MMLU is never used for SAE or predictor optimization. Its test questions are
+loaded from a pinned dataset revision and opened only for locked evaluation and
+causal intervention.
 
 ## Training corpus
 
@@ -96,7 +96,7 @@ joint JEPA-SAE minus fixed standard-SAE predictor
 ```
 
 The statistic is the per-window mean target-code cosine across offsets 1...9,
-with a problem-group bootstrap 95% confidence interval.
+with a question-group bootstrap 95% confidence interval.
 
 The joint claim requires all of the following:
 
@@ -129,11 +129,17 @@ For each offset 1...9:
 
 Secondary outcomes:
 
-- future task-state probes from z0 and predicted z9;
-- paraphrase invariance and state specificity;
+- semantics accuracy: linear decoding of the balanced correct option A/B/C/D;
+- context accuracy: linear decoding of the official four broad MMLU domains;
+- syntax accuracy: linear decoding of four independently balanced prompt forms;
+- zero-shot answer accuracy of the frozen base LLM;
 - dead-feature and variance-participation diagnostics;
 - top forecastable features and activating examples;
 - forecastable-component patching and ablation.
+
+The base-model answer score uses the same balanced zero-shot prompt forms as
+the representation analysis and is not presented as the official five-shot
+MMLU leaderboard protocol.
 
 ## Causal intervention
 
@@ -161,10 +167,10 @@ The main claim is rejected or weakened if:
   reconstruction;
 - forecasted features collapse to position/template shortcuts;
 - learned causal edits are indistinguishable from norm-matched random edits;
-- results fail across model, layer, task family, or feature seed.
+- results fail across model, layer, MMLU split seed, or feature seed.
 
 ## Replication
 
-The unit of replication is model x layer x task family x feature seed. The
+The unit of replication is model x layer x MMLU split seed x feature seed. The
 recommended matrix uses Pythia 1.4B, 2.8B, and 6.9B; three prespecified layer
-fractions; finite-state, arithmetic, and logic tasks; and at least three seeds.
+fractions; and at least three seeds.

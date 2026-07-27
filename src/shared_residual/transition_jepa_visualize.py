@@ -175,61 +175,110 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
     save_figure(fig, figures, "support-and-innovation")
 
 
-def probe_plot(report: dict[str, Any], figures: Path) -> None:
-    probes = report["locked_test_state_probes"]
+def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
+    probes = report["locked_test_mmlu_probes"]
     order = [
-        ("Joint z₀", "joint_z0", COLORS["joint"]),
-        ("Standard SAE z₀", "standard_sae_z0", COLORS["fixed"]),
-        ("Joint forecast z₉", "joint_predicted_z9", "#0f766e"),
-        ("Fixed forecast z₉", "fixed_predicted_z9", "#65a30d"),
-        ("k-only forecast z₉", "k_only_predicted_z9", COLORS["k_only"]),
-        ("Raw h₀", "raw_h0", "#334155"),
+        ("Joint z0", "joint_z0", COLORS["joint"]),
+        ("Standard SAE z0", "standard_sae_z0", COLORS["fixed"]),
+        ("Joint predicted z9", "joint_predicted_z9", "#0f766e"),
+        ("Raw h0", "raw_h0", "#334155"),
     ]
-    values = [probes[key]["accuracy"] for _, key, _ in order]
-    low = [
-        values[index] - probes[key]["group_bootstrap"]["ci95_low"]
-        for index, (_, key, _) in enumerate(order)
-    ]
-    high = [
-        probes[key]["group_bootstrap"]["ci95_high"] - values[index]
-        for index, (_, key, _) in enumerate(order)
-    ]
-    fig, ax = plt.subplots(figsize=(10.2, 4.9))
+    titles = {
+        "semantics": "Semantics: correct answer",
+        "context": "Context: MMLU domain",
+        "syntax": "Syntax: prompt format",
+    }
     positions = np.arange(len(order))
-    ax.bar(positions, values, color=[color for _, _, color in order])
-    ax.errorbar(
-        positions,
-        values,
-        yerr=np.asarray([low, high]),
-        fmt="none",
-        color="black",
-        capsize=4,
-    )
-    ax.axhline(
-        probes["joint_z0"]["chance_accuracy"],
-        linestyle="--",
-        color="#111827",
-        label="Majority chance",
-    )
-    ax.set_xticks(
-        positions,
-        [label for label, _, _ in order],
-        rotation=20,
-        ha="right",
-    )
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Locked-test state accuracy")
-    ax.set_title("Where does forecast-relevant task state concentrate?")
-    ax.grid(axis="y", alpha=0.2)
-    ax.legend(frameon=False)
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8), sharey=True)
+    for axis, (probe_axis, title) in zip(axes, titles.items()):
+        values = [
+            probes[probe_axis][key]["accuracy"] for _, key, _ in order
+        ]
+        low = [
+            values[index]
+            - probes[probe_axis][key]["group_bootstrap"]["ci95_low"]
+            for index, (_, key, _) in enumerate(order)
+        ]
+        high = [
+            probes[probe_axis][key]["group_bootstrap"]["ci95_high"]
+            - values[index]
+            for index, (_, key, _) in enumerate(order)
+        ]
+        axis.bar(
+            positions,
+            values,
+            color=[color for _, _, color in order],
+        )
+        axis.errorbar(
+            positions,
+            values,
+            yerr=np.asarray([low, high]),
+            fmt="none",
+            color="black",
+            capsize=4,
+        )
+        axis.axhline(
+            probes[probe_axis]["joint_z0"]["chance_accuracy"],
+            linestyle="--",
+            color="#111827",
+            label="Majority chance",
+        )
+        axis.set_xticks(
+            positions,
+            [label for label, _, _ in order],
+            rotation=23,
+            ha="right",
+        )
+        axis.set_ylim(0, 1)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.2)
+        axis.legend(frameon=False)
+    axes[0].set_ylabel("Locked-test linear-probe accuracy")
     fig.tight_layout()
-    save_figure(fig, figures, "state-probes")
+    save_figure(fig, figures, "mmlu-probes")
+
+
+def mmlu_model_plot(report: dict[str, Any], figures: Path) -> None:
+    results = report["benchmark"]["base_model_accuracy"]
+    context = results["by_context"]
+    syntax = results["by_syntax"]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.5), sharey=True)
+    for axis, values, title in (
+        (axes[0], context, "Base LLM accuracy by MMLU context"),
+        (axes[1], syntax, "Base LLM accuracy by syntax template"),
+    ):
+        labels = list(values)
+        accuracy = [values[label]["accuracy"] for label in labels]
+        axis.bar(
+            np.arange(len(labels)),
+            accuracy,
+            color=COLORS["joint"],
+        )
+        axis.axhline(
+            results["chance_accuracy"],
+            linestyle="--",
+            color="#111827",
+            label="Random chance",
+        )
+        axis.set_xticks(
+            np.arange(len(labels)),
+            labels,
+            rotation=20,
+            ha="right",
+        )
+        axis.set_ylim(0, 1)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.2)
+        axis.legend(frameon=False)
+    axes[0].set_ylabel("Zero-shot answer accuracy")
+    fig.tight_layout()
+    save_figure(fig, figures, "mmlu-base-model")
 
 
 def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     bundle = torch_load(run_dir / "analysis" / "transition_visualization.pt")
     embedding = bundle["embedding"].float().numpy()
-    labels = np.asarray(bundle["labels"])
+    labels = np.asarray(bundle["context_labels"])
     fig, ax = plt.subplots(figsize=(7.3, 5.2))
     cmap = plt.get_cmap("tab10")
     for index, label in enumerate(sorted(set(labels))):
@@ -251,7 +300,8 @@ def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     save_figure(fig, figures, "context-embedding")
 
     heat = bundle["feature_activations"].float().numpy().T
-    order = np.argsort(labels)
+    semantic_labels = np.asarray(bundle["semantic_labels"])
+    order = np.argsort(semantic_labels)
     scale = np.quantile(heat[heat > 0], 0.98) if np.any(heat > 0) else 1.0
     fig, ax = plt.subplots(figsize=(11.5, 5.2))
     image = ax.imshow(
@@ -264,9 +314,14 @@ def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     )
     ax.set_yticks(range(len(bundle["feature_ids"])), bundle["feature_ids"])
     ax.set_ylabel("Forecastable SAE feature")
-    ax.set_xlabel("Locked-test windows (sorted by state)")
+    ax.set_xlabel("Locked-test MMLU questions (sorted by correct answer)")
     ax.set_title("Top offset-9 forecast features")
-    boundaries = np.flatnonzero(labels[order][1:] != labels[order][:-1]) + 0.5
+    boundaries = (
+        np.flatnonzero(
+            semantic_labels[order][1:] != semantic_labels[order][:-1]
+        )
+        + 0.5
+    )
     for boundary in boundaries:
         ax.axvline(boundary, color="white", linewidth=0.8, alpha=0.8)
     fig.colorbar(image, ax=ax, label="Top-K forecast activation")
@@ -367,11 +422,14 @@ def write_html(
     joint_last = report["locked_test_offset_curve"]["joint"][-1]
     fixed_last = report["locked_test_offset_curve"]["fixed"][-1]
     k_only_last = report["locked_test_offset_curve"]["k_only"][-1]
+    mmlu = report["benchmark"]["base_model_accuracy"]
+    probes = report["locked_test_mmlu_probes"]
     figures = [
         ("Training dynamics", "figures/training-curves.png"),
         ("Offset forecast and context gain", "figures/offset-forecast.png"),
         ("Support and innovation", "figures/support-and-innovation.png"),
-        ("Locked-test state probes", "figures/state-probes.png"),
+        ("MMLU semantics, context, and syntax", "figures/mmlu-probes.png"),
+        ("Base LLM MMLU accuracy", "figures/mmlu-base-model.png"),
         ("JEPA-SAE context embedding", "figures/context-embedding.png"),
         ("Forecast feature heatmap", "figures/forecast-feature-heatmap.png"),
     ]
@@ -415,12 +473,16 @@ code {{ color:inherit; }}
 <div class="metric"><span>Fixed offset-9 cosine</span><strong>{fmt(fixed_last['code_cosine'])}</strong></div>
 <div class="metric"><span>k-only offset-9 cosine</span><strong>{fmt(k_only_last['code_cosine'])}</strong></div>
 <div class="metric"><span>Joint offset-9 context gain</span><strong>{fmt(joint_last['context_gain']['mean'])}</strong></div>
+<div class="metric"><span>Base LLM MMLU answer accuracy</span><strong>{fmt(mmlu['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z9 semantics</span><strong>{fmt(probes['semantics']['joint_predicted_z9']['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z9 context</span><strong>{fmt(probes['context']['joint_predicted_z9']['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z9 syntax</span><strong>{fmt(probes['syntax']['joint_predicted_z9']['accuracy'])}</strong></div>
 </div>
 {figure_html}
 {causal_html}
 <section><h2>Interpretation boundary</h2>
 <p><code>P(z₀,k)</code> estimates what is forecastable before observing intervening tokens. It is not a deterministic transition operator. The innovation contains later token information, lexical realization, and unforecastable updates.</p></section>
-<p class="subtitle">Machine-readable results: <code>analysis/transition_jepa_report.json</code>, <code>analysis/transition_offset_metrics.csv</code>, and <code>analysis/transition_visualization.pt</code>.</p>
+<p class="subtitle">Machine-readable results: <code>analysis/transition_jepa_report.json</code>, <code>analysis/mmlu_probe_accuracy.csv</code>, <code>analysis/transition_offset_metrics.csv</code>, and <code>analysis/transition_visualization.pt</code>.</p>
 </main></body></html>"""
     (output_dir / "index.html").write_text(
         document,
@@ -448,7 +510,8 @@ def main() -> None:
     training_plot(run_dir, figures)
     offset_plot(report, figures)
     support_innovation_plot(report, figures)
-    probe_plot(report, figures)
+    mmlu_probe_plot(report, figures)
+    mmlu_model_plot(report, figures)
     embedding_and_heatmap(run_dir, figures)
     interventions = intervention_plot(run_dir / "analysis", figures)
     write_html(output_dir, report, interventions)
@@ -459,7 +522,8 @@ def main() -> None:
                 "primary_joint_minus_fixed_code_cosine"
             ],
             "offset_curve": report["locked_test_offset_curve"],
-            "state_probes": report["locked_test_state_probes"],
+            "mmlu_probes": report["locked_test_mmlu_probes"],
+            "base_mmlu_model": report["benchmark"]["base_model_accuracy"],
             "interventions": interventions,
             "figures": sorted(path.name for path in figures.glob("*.png")),
         },
