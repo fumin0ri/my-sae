@@ -10,16 +10,17 @@ import torch
 import torch.nn.functional as F
 
 from .group_sae import topk_relu
-from .io import torch_load, write_json
-from .persistent_eval import (
+from .evaluation import (
     clustered_mean_ci,
     collapse_diagnostics,
     different_group_permutation,
+    fit_probe,
+    invariance_analysis,
     pca_embedding,
     select_probe_dimensions,
 )
-from .predictive_eval import fit_probe, invariance_analysis
-from .predictive_sae import autocast_context, configure_accelerator
+from .io import torch_load, write_json
+from .training import autocast_context, configure_accelerator
 from .transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,

@@ -2,9 +2,9 @@ from dataclasses import asdict
 
 import torch
 
-from shared_residual.persistent_sae import (
-    PersistentSAEConfig,
-    PersistentSparseAutoencoder,
+from shared_residual.standard_sae import (
+    StandardSAEConfig,
+    StandardSparseAutoencoder,
 )
 from shared_residual.transition_jepa_sae import (
     TransitionJEPAConfig,
@@ -16,13 +16,13 @@ from shared_residual.transition_jepa_sae import (
 
 def make_model() -> tuple[TransitionJEPASAE, torch.Tensor]:
     x = torch.randn(8, 10, 12)
-    standard_cfg = PersistentSAEConfig(
+    standard_cfg = StandardSAEConfig(
         d_in=12,
         d_sae=24,
         k=3,
         window_size=10,
     )
-    standard = PersistentSparseAutoencoder(standard_cfg)
+    standard = StandardSparseAutoencoder(standard_cfg)
     standard.initialize_from_data(x)
     checkpoint = {
         "config": asdict(standard_cfg),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import math
+import copy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,11 +14,11 @@ from tqdm import trange
 
 from .group_sae import topk_relu
 from .io import torch_load, write_json
-from .persistent_sae import (
-    PersistentSAEConfig,
-    PersistentSparseAutoencoder,
+from .standard_sae import (
+    StandardSAEConfig,
+    StandardSparseAutoencoder,
 )
-from .predictive_sae import (
+from .training import (
     autocast_context,
     configure_accelerator,
     cosine_learning_rate,
@@ -79,20 +79,22 @@ class OffsetConditionedPredictor(nn.Module):
         return F.softplus(self.output(hidden)), state
 
 
-class TransitionJEPASAE(PersistentSparseAutoencoder):
+class TransitionJEPASAE(StandardSparseAutoencoder):
     """Sparse offset-conditioned forecasting over a frozen LLM trajectory."""
 
     def __init__(self, cfg: TransitionJEPAConfig):
         super().__init__(
-            PersistentSAEConfig(
+            StandardSAEConfig(
                 d_in=cfg.d_in,
                 d_sae=cfg.d_sae,
                 k=cfg.k,
                 window_size=cfg.window_size,
-                ema_decay=cfg.ema_decay,
             )
         )
         self.cfg = cfg
+        self.target_encoder = copy.deepcopy(self.encoder)
+        for parameter in self.target_encoder.parameters():
+            parameter.requires_grad_(False)
         self.transition_predictor = OffsetConditionedPredictor(cfg)
 
     @torch.no_grad()
@@ -118,7 +120,7 @@ class TransitionJEPASAE(PersistentSparseAutoencoder):
         allowed_missing = {
             name
             for name in self.state_dict()
-            if name.startswith("transition_predictor.")
+            if name.startswith(("target_encoder.", "transition_predictor."))
         }
         if set(missing) != allowed_missing or unexpected:
             raise ValueError(
@@ -126,6 +128,21 @@ class TransitionJEPASAE(PersistentSparseAutoencoder):
                 f"missing={missing}, unexpected={unexpected}"
             )
         self.target_encoder.load_state_dict(self.encoder.state_dict())
+
+    @torch.no_grad()
+    def update_target_encoder(self, decay: float | None = None) -> None:
+        rate = self.cfg.ema_decay if decay is None else decay
+        for target, online in zip(
+            self.target_encoder.parameters(),
+            self.encoder.parameters(),
+        ):
+            target.mul_(rate).add_(online.detach(), alpha=1.0 - rate)
+
+    @torch.no_grad()
+    def encode_target(self, x: torch.Tensor) -> torch.Tensor:
+        return self.target_encoder(
+            (x - self.pre_bias.detach()) / self.pre_scale
+        )
 
     def set_sae_trainable(self, trainable: bool) -> None:
         self.pre_bias.requires_grad_(trainable)

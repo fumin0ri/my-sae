@@ -5,9 +5,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 # Offset-conditioned JEPA-SAE on one RTX 4090 (24GB), CUDA 12.1 compatible.
-# Retained baselines:
-#   scripts/persistent_quickstart.sh (direct temporal matching)
-#   scripts/research_quickstart.sh   (context-Transformer JEPA)
 MODEL="${MODEL:-EleutherAI/pythia-6.9b-deduped}"
 default_safetensors_revision() {
   case "$1" in
@@ -91,10 +88,9 @@ sr-extract-grid \
 ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
 
 echo "[3/9] Pretrain the common all-position standard SAE"
-sr-train-persistent-sae \
+sr-train-standard-sae \
   --activations "$ACTIVATIONS" \
   --output-dir "$RUN_DIR/standard" \
-  --objective standard \
   --d-sae "$D_SAE" \
   --k "$K" \
   --steps "$STANDARD_STEPS" \
@@ -109,7 +105,7 @@ sr-train-persistent-sae \
   --seed "$SEED" \
   --split-seed "$SPLIT_SEED"
 
-STANDARD_CHECKPOINT="$RUN_DIR/standard/persistent_sae.pt"
+STANDARD_CHECKPOINT="$RUN_DIR/standard/standard_sae.pt"
 COMMON_FORECAST_ARGS=(
   --activations "$ACTIVATIONS"
   --init-checkpoint "$STANDARD_CHECKPOINT"
@@ -201,5 +197,3 @@ sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 
 echo
 echo "Done. Open: $RUN_DIR/report/index.html"
-echo "Direct temporal baseline: bash scripts/persistent_quickstart.sh"
-echo "Context-Transformer JEPA: bash scripts/research_quickstart.sh"

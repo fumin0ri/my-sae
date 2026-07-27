@@ -1,3 +1,3 @@
-"""Tools for token-shared residual-stream analysis."""
+"""Offset-conditioned JEPA-SAE for frozen LLM residual trajectories."""
 
-__version__ = "0.1.0"
+__version__ = "0.5.0"

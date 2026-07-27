@@ -85,11 +85,8 @@ The joint claim requires all of the following:
 - fixed standard SAE plus the same predictor;
 - offset-only predictor with z0 removed;
 - shuffled z0 at evaluation;
-- direct temporal matching retained as a Temporal-SAE-like baseline;
-- context-Transformer JEPA retained as a higher-capacity baseline.
 
-Future extensions should add an intervening-token-conditioned transition model
-and a faithful reproduction of the published Temporal SAE.
+Future extensions should add an intervening-token-conditioned transition model.
 
 ## Locked-test outcomes
 

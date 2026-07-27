@@ -407,7 +407,7 @@ section {{ margin-top:34px; }} section img {{ width:100%; background:white; bord
 code {{ color:inherit; }}
 </style></head><body><main>
 <h1>Offset-conditioned transition JEPA-SAE</h1>
-<p class="subtitle">A Top-K code at h₀ and offset k forecast an EMA SAE code at hₖ. Unlike direct temporal matching, the target may change with k. Unlike the retained context-Transformer JEPA, the hypothesis is restricted to one present state and one offset.</p>
+<p class="subtitle">A Top-K code at h₀ and offset k forecasts an EMA SAE code at hₖ. The target may change with k, while the predictor is restricted to one present state and one offset.</p>
 <div class="metrics">
 <div class="metric"><span>Joint − fixed cosine</span><strong>{fmt(comparison['mean'])}</strong></div>
 <div class="metric"><span>Group-bootstrap 95% CI</span><strong>{fmt(comparison['ci95_low'])} to {fmt(comparison['ci95_high'])}</strong></div>

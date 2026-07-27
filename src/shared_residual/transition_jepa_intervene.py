@@ -17,8 +17,11 @@ from .modeling import (
     load_hf_model,
     parse_dtype,
 )
-from .persistent_intervene import parse_offsets
-from .predictive_intervene import parse_feature_ids, restrict_features
+from .intervention_utils import (
+    parse_feature_ids,
+    parse_offsets,
+    restrict_features,
+)
 from .transition_jepa_sae import TransitionJEPAConfig, TransitionJEPASAE
 
 
