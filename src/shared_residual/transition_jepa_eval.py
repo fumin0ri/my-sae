@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from .group_sae import topk_relu
 from .evaluation import (
@@ -20,7 +21,11 @@ from .evaluation import (
     select_probe_dimensions,
 )
 from .io import torch_load, write_json
-from .training import autocast_context, configure_accelerator
+from .training import (
+    autocast_context,
+    configure_accelerator,
+    grouped_three_way_split,
+)
 from .transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
@@ -50,6 +55,7 @@ def collect_model_outputs(
     amp_dtype: str,
     use_context: bool,
     seed: int,
+    label: str,
 ) -> dict[str, torch.Tensor | float]:
     contexts: list[torch.Tensor] = []
     final_predictions: list[torch.Tensor] = []
@@ -60,7 +66,10 @@ def collect_model_outputs(
         device=device,
         dtype=torch.long,
     )
-    for start in range(0, len(x), batch_size):
+    for start in tqdm(
+        range(0, len(x), batch_size),
+        desc=f"{label}: encode/reconstruct",
+    ):
         batch = x[start : start + batch_size].to(device, non_blocking=True)
         with autocast_context(device, amp_dtype):
             codes = model.encode(batch)
@@ -85,7 +94,10 @@ def collect_model_outputs(
     predictions: list[torch.Tensor] = []
     residual_error: list[torch.Tensor] = []
     residual_energy: list[torch.Tensor] = []
-    for start in range(0, len(test_x), batch_size):
+    for start in tqdm(
+        range(0, len(test_x), batch_size),
+        desc=f"{label}: locked predictions",
+    ):
         batch = test_x[start : start + batch_size].to(
             device,
             non_blocking=True,
@@ -128,7 +140,10 @@ def collect_model_outputs(
         device=device,
         dtype=torch.long,
     )
-    for start in range(0, len(shuffled_context), batch_size):
+    for start in tqdm(
+        range(0, len(shuffled_context), batch_size),
+        desc=f"{label}: shuffled null",
+    ):
         batch_context = shuffled_context[start : start + batch_size].to(
             device=device,
             dtype=model.pre_bias.dtype,
@@ -161,6 +176,7 @@ def offset_curve(
     groups: np.ndarray,
     k: int,
     seed: int,
+    label: str,
 ) -> list[dict[str, Any]]:
     prediction = outputs["test_prediction"]
     shuffled = outputs["test_shuffled_prediction"]
@@ -173,7 +189,10 @@ def offset_curve(
     assert isinstance(residual_error, torch.Tensor)
     assert isinstance(residual_energy, torch.Tensor)
     rows = []
-    for offset in range(target.shape[1]):
+    for offset in tqdm(
+        range(target.shape[1]),
+        desc=f"{label}: offset metrics",
+    ):
         predicted = prediction[:, offset].float()
         shuffled_predicted = shuffled[:, offset].float()
         target_code = target[:, offset].float()
@@ -303,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-key", default="state")
     parser.add_argument("--group-key", default="group_id")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     return parser
@@ -320,6 +342,20 @@ def main() -> None:
     x = bundle["activations"].float()
     metadata = bundle["metadata"]
     del bundle
+    train_indices, validation_indices, test_indices = grouped_three_way_split(
+        metadata,
+        args.validation_fraction,
+        args.test_fraction,
+        args.group_key,
+        args.split_seed,
+    )
+    development_indices = train_indices + validation_indices
+    groups = np.asarray(
+        [
+            str(metadata[index].get(args.group_key, index))
+            for index in test_indices
+        ]
+    )
     paths = {
         "joint": args.joint_checkpoint,
         "fixed": args.fixed_checkpoint,
@@ -334,26 +370,15 @@ def main() -> None:
     window_cosines: dict[str, torch.Tensor] = {}
     joint_final_prediction: torch.Tensor | None = None
     joint_final_target: torch.Tensor | None = None
-    reference_split: dict[str, Any] | None = None
+    reference_fingerprint: str | None = None
     reference_cfg: TransitionJEPAConfig | None = None
     for method_index, (method, path) in enumerate(paths.items()):
         model, checkpoint = load_model(path, device)
-        if reference_split is None:
-            reference_split = checkpoint["split"]
+        if reference_fingerprint is None:
+            reference_fingerprint = checkpoint["data_fingerprint"]
             reference_cfg = model.cfg
-        elif checkpoint["split"] != reference_split:
-            raise ValueError("all checkpoints must use the same locked split")
-        split = checkpoint["split"]
-        development_indices = list(split["train_indices"]) + list(
-            split["validation_indices"]
-        )
-        test_indices = list(split["test_indices"])
-        groups = np.asarray(
-            [
-                str(metadata[index].get(args.group_key, index))
-                for index in test_indices
-            ]
-        )
+        elif checkpoint["data_fingerprint"] != reference_fingerprint:
+            raise ValueError("all checkpoints must use the same Pile training data")
         amp_dtype = (
             str(checkpoint["train_args"].get("amp_dtype", "bfloat16"))
             if device.type == "cuda"
@@ -369,12 +394,14 @@ def main() -> None:
             amp_dtype,
             use_context=method != "k_only",
             seed=args.seed,
+            label=method,
         )
         curves[method] = offset_curve(
             collected,
             groups,
             model.cfg.k,
             args.seed + method_index,
+            method,
         )
         reconstruction_fvu[method] = float(collected["reconstruction_fvu"])
         context = collected["context"]
@@ -413,18 +440,8 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    assert reference_split is not None
+    assert reference_fingerprint is not None
     assert reference_cfg is not None
-    development_indices = list(reference_split["train_indices"]) + list(
-        reference_split["validation_indices"]
-    )
-    test_indices = list(reference_split["test_indices"])
-    groups = np.asarray(
-        [
-            str(metadata[index].get(args.group_key, index))
-            for index in test_indices
-        ]
-    )
     representations: dict[str, torch.Tensor] = {
         "joint_z0": probe_contexts["joint"].float(),
         "standard_sae_z0": probe_contexts["fixed"].float(),
@@ -443,7 +460,10 @@ def main() -> None:
             args.group_key,
             args.seed,
         )[0]
-        for name, values in representations.items()
+        for name, values in tqdm(
+            representations.items(),
+            desc="state probes",
+        )
     }
     invariance = {
         name: invariance_analysis(
@@ -490,6 +510,7 @@ def main() -> None:
         },
         "split": {
             "group_key": args.group_key,
+            "split_seed": args.split_seed,
             "n_development_windows": len(development_indices),
             "n_locked_test_windows": len(test_indices),
             "n_locked_test_groups": len(np.unique(groups)),
@@ -515,6 +536,7 @@ def main() -> None:
         },
         "top_forecast_features_at_offset_9": features,
         "checkpoint_settings": checkpoints,
+        "pile_training_data_fingerprint": reference_fingerprint,
     }
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

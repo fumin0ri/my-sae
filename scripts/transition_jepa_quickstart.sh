@@ -35,16 +35,26 @@ PREDICTOR_WARMUP_STEPS="${PREDICTOR_WARMUP_STEPS:-1000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
-EXTRACT_BATCH_SIZE="${EXTRACT_BATCH_SIZE:-8}"
+PILE_EXTRACT_BATCH_SIZE="${PILE_EXTRACT_BATCH_SIZE:-8}"
+PILE_SEQUENCE_LENGTH="${PILE_SEQUENCE_LENGTH:-320}"
+PILE_TRAIN_WINDOWS="${PILE_TRAIN_WINDOWS:-524288}"
+PILE_VALIDATION_WINDOWS="${PILE_VALIDATION_WINDOWS:-16384}"
+PILE_SHARD_WINDOWS="${PILE_SHARD_WINDOWS:-4096}"
+PILE_DATASET="${PILE_DATASET:-EleutherAI/the_pile_deduplicated}"
+PILE_DATASET_CONFIG="${PILE_DATASET_CONFIG:-all}"
+PILE_DATASET_REVISION="${PILE_DATASET_REVISION:-fcbfcfde4222cbb1acd1d33bad0be250ee14b1bb}"
+PILE_DATASET_TRUST_REMOTE_CODE="${PILE_DATASET_TRUST_REMOTE_CODE:-0}"
+PILE_REQUIRE_ALL_DOMAINS="${PILE_REQUIRE_ALL_DOMAINS:-0}"
+EVAL_EXTRACT_BATCH_SIZE="${EVAL_EXTRACT_BATCH_SIZE:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
-PROBLEMS="${PROBLEMS:-2048}"
+EVAL_PROBLEMS="${EVAL_PROBLEMS:-512}"
 PAIRS="${PAIRS:-128}"
 TASK_FAMILY="${TASK_FAMILY:-fsm}"
 SEED="${SEED:-0}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
-RUN_DIR="${RUN_DIR:-runs/transition-jepa-research}"
+RUN_DIR="${RUN_DIR:-runs/transition-jepa-pile}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 
@@ -62,17 +72,45 @@ python -m pip freeze > "$RUN_DIR/python-environment.txt"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
   > "$RUN_DIR/gpu-environment.csv"
 
-echo "[1/9] Generate grouped deterministic trajectories and causal pairs"
+echo "[1/10] Stream the official Pile mixture and extract residual shards"
+PILE_DATA_ARGS=(--dataset "$PILE_DATASET" --dataset-config "$PILE_DATASET_CONFIG")
+if [[ -n "$PILE_DATASET_REVISION" ]]; then
+  PILE_DATA_ARGS+=(--dataset-revision "$PILE_DATASET_REVISION")
+fi
+if [[ "$PILE_DATASET_TRUST_REMOTE_CODE" == "1" ]]; then
+  PILE_DATA_ARGS+=(--dataset-trust-remote-code)
+fi
+if [[ "$PILE_REQUIRE_ALL_DOMAINS" == "1" ]]; then
+  PILE_DATA_ARGS+=(--require-all-domains)
+fi
+sr-extract-pile \
+  "${MODEL_LOAD_ARGS[@]}" \
+  "${PILE_DATA_ARGS[@]}" \
+  --output-dir "$RUN_DIR/pile-activations" \
+  --layer "$LAYER" \
+  --hook-point post \
+  --window-size "$WINDOW_SIZE" \
+  --sequence-length "$PILE_SEQUENCE_LENGTH" \
+  --train-windows "$PILE_TRAIN_WINDOWS" \
+  --validation-windows "$PILE_VALIDATION_WINDOWS" \
+  --shard-windows "$PILE_SHARD_WINDOWS" \
+  --batch-size "$PILE_EXTRACT_BATCH_SIZE" \
+  --dtype bfloat16 \
+  --seed "$SEED"
+
+ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
+
+echo "[2/10] Generate an independent controlled locked-test benchmark"
 python scripts/make_research_data.py \
   --prompts-output data/transition-jepa/prompts.jsonl \
   --pairs-output data/transition-jepa/pairs.jsonl \
-  --problems "$PROBLEMS" \
+  --problems "$EVAL_PROBLEMS" \
   --paraphrases 4 \
   --pairs "$PAIRS" \
   --task-family "$TASK_FAMILY" \
   --seed "$SEED"
 
-echo "[2/9] Extract ten-position residual trajectories from the frozen LLM"
+echo "[3/10] Extract controlled trajectories for evaluation only"
 sr-extract-grid \
   "${MODEL_LOAD_ARGS[@]}" \
   --data data/transition-jepa/prompts.jsonl \
@@ -80,16 +118,16 @@ sr-extract-grid \
   --layers "$LAYER" \
   --hook-point post \
   --window-size "$WINDOW_SIZE" \
-  --batch-size "$EXTRACT_BATCH_SIZE" \
+  --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
   --max-length 384 \
   --dtype bfloat16 \
   --storage-dtype bfloat16
 
-ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
+EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
 
-echo "[3/9] Pretrain the common all-position standard SAE"
+echo "[4/10] Pretrain the common all-position standard SAE on The Pile"
 sr-train-standard-sae \
-  --activations "$ACTIVATIONS" \
+  --activation-manifest "$ACTIVATION_MANIFEST" \
   --output-dir "$RUN_DIR/standard" \
   --d-sae "$D_SAE" \
   --k "$K" \
@@ -99,15 +137,13 @@ sr-train-standard-sae \
   --amp-dtype bfloat16 \
   --lr 0.0002 \
   --warmup-steps 500 \
-  --num-workers 2 \
   --log-every 500 \
   --device "$TRAIN_DEVICE" \
-  --seed "$SEED" \
-  --split-seed "$SPLIT_SEED"
+  --seed "$SEED"
 
 STANDARD_CHECKPOINT="$RUN_DIR/standard/standard_sae.pt"
 COMMON_FORECAST_ARGS=(
-  --activations "$ACTIVATIONS"
+  --activation-manifest "$ACTIVATION_MANIFEST"
   --init-checkpoint "$STANDARD_CHECKPOINT"
   --d-sae "$D_SAE"
   --k "$K"
@@ -121,34 +157,32 @@ COMMON_FORECAST_ARGS=(
   --predictor-lr 0.0003
   --sae-lr 0.0001
   --warmup-steps 300
-  --num-workers 2
   --log-every 400
   --device "$TRAIN_DEVICE"
   --seed "$SEED"
-  --split-seed "$SPLIT_SEED"
 )
 
-echo "[4/9] Jointly tune the SAE dictionary and offset-conditioned predictor"
+echo "[5/10] Jointly tune the SAE dictionary and predictor on The Pile"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/joint" \
   --objective joint
 
-echo "[5/9] Train a predictor on the frozen standard-SAE dictionary"
+echo "[6/10] Train a predictor on the frozen standard-SAE dictionary"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/fixed" \
   --objective fixed
 
-echo "[6/9] Train the offset-only shortcut control with z0 removed"
+echo "[7/10] Train the offset-only shortcut control with z0 removed"
 sr-train-transition-jepa-sae \
   "${COMMON_FORECAST_ARGS[@]}" \
   --output-dir "$RUN_DIR/k_only" \
   --objective k_only
 
-echo "[7/9] Open the locked problem-group test and compute offset curves"
+echo "[8/10] Open the independent locked problem-group test"
 sr-evaluate-transition-jepa-sae \
-  --activations "$ACTIVATIONS" \
+  --activations "$EVAL_ACTIVATIONS" \
   --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
   --fixed-checkpoint "$RUN_DIR/fixed/transition_jepa_sae.pt" \
   --k-only-checkpoint "$RUN_DIR/k_only/transition_jepa_sae.pt" \
@@ -157,10 +191,11 @@ sr-evaluate-transition-jepa-sae \
   --group-key group_id \
   --batch-size "$EVAL_BATCH_SIZE" \
   --device "$TRAIN_DEVICE" \
-  --seed "$SEED"
+  --seed "$SEED" \
+  --split-seed "$SPLIT_SEED"
 
 if [[ "$RUN_CAUSAL" == "1" ]]; then
-  echo "[8/9] Patch, ablate, and norm-match only forecastable features"
+  echo "[9/10] Patch, ablate, and norm-match forecastable features"
   sr-intervene-transition-jepa-sae \
     "${MODEL_LOAD_ARGS[@]}" \
     --pairs data/transition-jepa/pairs.jsonl \
@@ -189,10 +224,10 @@ if [[ "$RUN_CAUSAL" == "1" ]]; then
     --mode random_ablate \
     --seed "$SEED"
 else
-  echo "[8/9] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+  echo "[9/10] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
 fi
 
-echo "[9/9] Build PNG/PDF figures and a self-contained HTML report"
+echo "[10/10] Build PNG/PDF figures and a self-contained HTML report"
 sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 
 echo

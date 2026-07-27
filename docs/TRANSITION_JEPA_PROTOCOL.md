@@ -34,15 +34,43 @@ unforecastable updates.
 
 ## Training stages
 
-1. Train one standard Top-K SAE on all ten positions.
-2. Copy its online encoder into the EMA target encoder.
-3. Initialize all forecasting conditions from this exact checkpoint.
-4. Warm up the predictor with the SAE frozen.
-5. For the joint condition only, unfreeze the online encoder and decoder,
+1. Stream the official 22-component Pile mixture and extract disjoint
+   document-level train/validation residual shards.
+2. Train one standard Top-K SAE on all ten positions of the Pile windows.
+3. Copy its online encoder into the EMA target encoder.
+4. Initialize all forecasting conditions from this exact checkpoint and data
+   fingerprint.
+5. Warm up the predictor with the SAE frozen.
+6. For the joint condition only, unfreeze the online encoder and decoder,
    ramp the forecasting weight, and update the target encoder by EMA.
 
 The fixed and offset-only controls receive the same number of predictor
 optimizer steps as the joint condition.
+
+The controlled finite-state, arithmetic, and logic prompts are never used for
+SAE or predictor optimization. They are generated independently and opened
+only for locked evaluation and causal intervention.
+
+## Training corpus
+
+The default corpus is the `all` configuration of
+`EleutherAI/the_pile_deduplicated`, pinned to an immutable dataset revision and
+streamed from Parquet. It inherits the upstream preweighted 22-component Pile
+mixture and receives an additional finite shuffle buffer. The confirmatory
+default extracts 524,288 ten-token train windows (5,242,880 residual positions)
+and 16,384 validation windows.
+
+Every source document is assigned wholly to train or validation by a
+deterministic hash. Activations are stored as BF16 shards. The manifest records
+the observed counts for all 22 Pile components, normalization statistics,
+model revision, layer, and a data fingerprint. The public deduplicated Parquet
+schema contains text but not per-document component labels, so the manifest
+explicitly marks source metadata unavailable rather than reporting inferred
+component counts. Documents shorter than the model extraction sequence are
+right-padded and only their valid ten-token windows are retained, avoiding a
+systematic loss of short-document components. The legacy labelled release
+remains an opt-in audit path. A run is invalid if any training condition uses a
+different fingerprint.
 
 ## Objective
 

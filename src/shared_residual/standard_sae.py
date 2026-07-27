@@ -8,17 +8,21 @@ from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange
 
+from .activation_store import (
+    ShuffledShardBatches,
+    load_activation_manifest,
+    manifest_fingerprint,
+    validation_batches,
+)
 from .group_sae import topk_relu
-from .io import torch_load, write_json
+from .io import write_json
 from .training import (
     autocast_context,
     build_adamw,
     configure_accelerator,
     cosine_learning_rate,
-    grouped_three_way_split,
 )
 
 
@@ -59,9 +63,21 @@ class StandardSparseAutoencoder(nn.Module):
     @torch.no_grad()
     def initialize_from_data(self, x: torch.Tensor) -> None:
         mean = x.mean(dim=(0, 1))
-        self.pre_bias.copy_(mean.to(self.pre_bias))
         scale = (x - mean).square().mean().sqrt().clamp_min(1e-8)
-        self.pre_scale.copy_(scale.to(self.pre_scale))
+        self.initialize_from_statistics(mean, scale)
+
+    @torch.no_grad()
+    def initialize_from_statistics(
+        self,
+        mean: torch.Tensor,
+        scale: torch.Tensor | float,
+    ) -> None:
+        if mean.shape != self.pre_bias.shape:
+            raise ValueError("normalization mean does not match residual width")
+        self.pre_bias.copy_(mean.to(self.pre_bias))
+        self.pre_scale.copy_(
+            torch.as_tensor(scale).to(self.pre_scale)
+        )
         self.normalize_decoder()
         self.encoder.linear.weight.copy_(self.decoder)
         self.encoder.linear.bias.zero_()
@@ -136,14 +152,22 @@ def standard_sae_loss(
 @torch.no_grad()
 def evaluate_losses(
     model: StandardSparseAutoencoder,
-    loader: DataLoader,
+    root: Path,
+    manifest: dict[str, Any],
+    batch_size: int,
+    maximum_batches: int,
     device: torch.device,
     amp_dtype: str,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
     count = 0
-    for (x,) in loader:
+    for x in validation_batches(
+        root,
+        manifest,
+        batch_size,
+        maximum_batches,
+    ):
         x = x.to(device, non_blocking=True)
         with autocast_context(device, amp_dtype):
             _, metrics = standard_sae_loss(model, x)
@@ -168,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train the reconstruction-only SAE used to initialize JEPA"
     )
-    parser.add_argument("--activations", required=True)
+    parser.add_argument("--activation-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--d-sae", type=int, default=2048)
     parser.add_argument("--k", type=int, default=32)
@@ -185,12 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "bfloat16"],
         default="bfloat16",
     )
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
-    parser.add_argument("--test-fraction", type=float, default=0.2)
-    parser.add_argument("--group-key", default="group_id")
+    parser.add_argument("--validation-batches", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-every", type=int, default=100)
     return parser
@@ -202,10 +222,6 @@ def main() -> None:
         raise ValueError("--steps must be positive")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient-accumulation-steps must be positive")
-    if not 0.0 < args.validation_fraction < 0.5:
-        raise ValueError("--validation-fraction must be between 0 and 0.5")
-    if not 0.0 < args.test_fraction < 0.5:
-        raise ValueError("--test-fraction must be between 0 and 0.5")
     torch.manual_seed(args.seed)
     device = torch.device(
         args.device
@@ -216,46 +232,29 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    bundle = torch_load(args.activations)
-    x = bundle["activations"].float()
-    metadata = bundle["metadata"]
-    source_config = bundle.get("config", {})
-    del bundle
-    if x.ndim != 3 or x.shape[1] != 10:
-        raise ValueError("standard SAE requires [windows, 10, d_model]")
-    train_indices, validation_indices, test_indices = grouped_three_way_split(
-        metadata,
-        args.validation_fraction,
-        args.test_fraction,
-        args.group_key,
-        args.split_seed,
-    )
-    loader_options: dict[str, Any] = {
-        "pin_memory": device.type == "cuda",
-        "num_workers": args.num_workers,
-        "persistent_workers": args.num_workers > 0,
-    }
-    train_loader = DataLoader(
-        TensorDataset(x[train_indices]),
-        batch_size=args.batch_size,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(args.seed),
-        **loader_options,
-    )
-    validation_loader = DataLoader(
-        TensorDataset(x[validation_indices]),
-        batch_size=args.batch_size,
-        shuffle=False,
-        **loader_options,
+    root, manifest = load_activation_manifest(args.activation_manifest)
+    fingerprint = manifest_fingerprint(manifest)
+    normalization = manifest["normalization"]
+    iterator = iter(
+        ShuffledShardBatches(
+            root,
+            manifest,
+            "train",
+            args.batch_size,
+            args.seed,
+        )
     )
     cfg = StandardSAEConfig(
-        d_in=x.shape[-1],
+        d_in=int(manifest["d_in"]),
         d_sae=args.d_sae,
         k=args.k,
-        window_size=x.shape[1],
+        window_size=int(manifest["window_size"]),
     )
     model = StandardSparseAutoencoder(cfg).to(device)
-    model.initialize_from_data(x[train_indices])
+    model.initialize_from_statistics(
+        torch.tensor(normalization["mean"]),
+        torch.tensor(float(normalization["scalar_rms"])),
+    )
     optimizer, fused_optimizer = build_adamw(
         trainable_parameters(model),
         args.lr,
@@ -263,7 +262,6 @@ def main() -> None:
         device,
     )
     history: list[dict[str, Any]] = []
-    iterator = iter(train_loader)
     for step in trange(1, args.steps + 1, desc="standard SAE"):
         learning_rate = cosine_learning_rate(
             step,
@@ -282,11 +280,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         metric_sums: dict[str, float] = {}
         for _ in range(args.gradient_accumulation_steps):
-            try:
-                (batch,) = next(iterator)
-            except StopIteration:
-                iterator = iter(train_loader)
-                (batch,) = next(iterator)
+            batch = next(iterator)
             batch = batch.to(device, non_blocking=True)
             with autocast_context(device, args.amp_dtype):
                 loss, metrics = standard_sae_loss(
@@ -320,7 +314,10 @@ def main() -> None:
                     "train": metrics,
                     "validation": evaluate_losses(
                         model,
-                        validation_loader,
+                        root,
+                        manifest,
+                        args.batch_size,
+                        args.validation_batches,
                         device,
                         (
                             args.amp_dtype
@@ -333,12 +330,6 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    split = {
-        "group_key": args.group_key,
-        "train_indices": train_indices,
-        "validation_indices": validation_indices,
-        "test_indices": test_indices,
-    }
     torch.save(
         {
             "state_dict": {
@@ -347,8 +338,17 @@ def main() -> None:
             },
             "config": asdict(cfg),
             "train_args": vars(args),
-            "source_config": source_config,
-            "split": split,
+            "source_config": {
+                "model": manifest["model"],
+                "resolved_model_revision": manifest.get(
+                    "resolved_model_revision"
+                ),
+                "layer": manifest["layer"],
+                "layer_path": manifest["layer_path"],
+                "hook_point": manifest["hook_point"],
+            },
+            "activation_manifest": str(Path(args.activation_manifest)),
+            "data_fingerprint": fingerprint,
         },
         output_dir / "standard_sae.pt",
     )
@@ -356,9 +356,16 @@ def main() -> None:
         output_dir / "training_report.json",
         {
             "method": "standard reconstruction-only Top-K SAE",
-            "n_train_windows": len(train_indices),
-            "n_validation_windows": len(validation_indices),
-            "n_locked_test_windows": len(test_indices),
+            "data": {
+                "dataset": manifest["dataset"],
+                "fingerprint": fingerprint,
+                "n_train_windows": manifest["train"]["windows"],
+                "n_validation_windows": manifest["validation"]["windows"],
+                "train_domain_counts": manifest["train"]["domain_counts"],
+                "validation_domain_counts": manifest["validation"][
+                    "domain_counts"
+                ],
+            },
             "accelerator": {
                 "device": str(device),
                 "device_name": (

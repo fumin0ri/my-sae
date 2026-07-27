@@ -4,17 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.5.0"
+version = "0.6.0"
 description = "Learn and causally test forecastable sparse states in LLM residual trajectories"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",
+  "datasets>=2.20,<4",
   "matplotlib>=3.8",
   "numpy>=1.26",
   "scikit-learn>=1.4",
   "torch>=2.5,<3",
   "tqdm>=4.66",
   "transformers>=4.44",
+  "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +26,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 sr-extract = "shared_residual.extract:main"
 sr-extract-grid = "shared_residual.extract_grid:main"
+sr-extract-pile = "shared_residual.pile_extract:main"
 sr-fit = "shared_residual.subspace:main"
 sr-research = "shared_residual.research:main"
 sr-sae = "shared_residual.sae_analysis:main"
