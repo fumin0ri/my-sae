@@ -95,7 +95,7 @@ bash scripts/transition_jepa_quickstart.sh
 
 ## The Pile training data
 
-`EleutherAI/the_pile_deduplicated`の`all` configurationをstreamingで読みます。
+`EleutherAI/the_pile_deduplicated`の`default` configurationをstreamingで読みます。
 これはThe Pileの公式22-subcorpus mixtureへexact/near deduplicationを施した
 Parquet版です。上流のpreweighted mixtureを保ったまま、10,000-document
 bufferで追加shuffleします。datasetは再現性のためcommit

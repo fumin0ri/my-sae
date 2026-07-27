@@ -10,6 +10,7 @@ from shared_residual.activation_store import (
 )
 from shared_residual.pile_extract import (
     PILE_MIXTURE_WEIGHTS,
+    build_parser,
     document_split,
     pile_set_name,
 )
@@ -32,7 +33,10 @@ def make_manifest(tmp_path):
         )
     manifest = {
         "format": "shared-residual-activation-shards-v1",
-        "dataset": {"name": "EleutherAI/pile", "config": "all"},
+        "dataset": {
+            "name": "EleutherAI/the_pile_deduplicated",
+            "config": "default",
+        },
         "model": "test",
         "layer": 1,
         "layer_path": "layers.1",
@@ -87,6 +91,14 @@ def test_pile_metadata_and_official_mixture() -> None:
     assert len(PILE_MIXTURE_WEIGHTS) == 22
     assert abs(sum(PILE_MIXTURE_WEIGHTS.values()) - 1.0) < 1e-9
     assert pile_set_name({"text": "metadata-free Parquet row"}) == "unknown"
+
+
+def test_deduplicated_pile_uses_real_hugging_face_config() -> None:
+    args = build_parser().parse_args(
+        ["--model", "test", "--output-dir", "out", "--layer", "1"]
+    )
+    assert args.dataset == "EleutherAI/the_pile_deduplicated"
+    assert args.dataset_config == "default"
 
 
 def test_document_split_is_deterministic_and_nontrivial() -> None:

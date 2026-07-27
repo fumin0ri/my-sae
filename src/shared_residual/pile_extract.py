@@ -183,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         default="EleutherAI/the_pile_deduplicated",
     )
-    parser.add_argument("--dataset-config", default="all")
+    parser.add_argument("--dataset-config", default="default")
     parser.add_argument("--dataset-revision")
     parser.add_argument(
         "--dataset-trust-remote-code",

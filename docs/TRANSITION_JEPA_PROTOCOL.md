@@ -53,7 +53,7 @@ only for locked evaluation and causal intervention.
 
 ## Training corpus
 
-The default corpus is the `all` configuration of
+The default corpus is the `default` configuration of
 `EleutherAI/the_pile_deduplicated`, pinned to an immutable dataset revision and
 streamed from Parquet. It inherits the upstream preweighted 22-component Pile
 mixture and receives an additional finite shuffle buffer. The confirmatory
