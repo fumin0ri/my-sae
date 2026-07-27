@@ -1,4 +1,63 @@
-# Predictive sparse residual streams
+# Persistent and predictive sparse residual streams
+
+## 現在の主実験: z₀をz₁...z₉へ個別に合わせる
+
+現在の最小アーキテクチャでは、frozen LLMから10 tokenのresidual window
+`h₀...h₉`を取り出します。`h₀`をonline SAE encoderへ入れた
+`z₀`をcontext、`h₁...h₉`をEMA target SAE encoderへ入れた
+`z₁...z₉`をtargetとします。
+
+```text
+h₀ ── online SAE ── z₀ ─┬─ match ─ stopgrad(z₁) ── EMA SAE(h₁)
+                         ├─ match ─ stopgrad(z₂) ── EMA SAE(h₂)
+                         ├─ ...
+                         └─ match ─ stopgrad(z₉) ── EMA SAE(h₉)
+```
+
+`z₁...z₉`の平均targetは作りません。9個の損失を個別に計算してから平均します。
+小型Transformer、predictor、position embeddingも使いません。通常のSAE再構成に加え、
+同じwindow/groupを別windowから識別するgroup-aware contrastive controlを用います。
+
+CUDA 12.1 / `torch==2.5.1+cu121` / 単一RTX 4090向けの一発実行:
+
+```bash
+git clone https://github.com/fumin0ri/my-sae.git
+cd my-sae
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+python -m pip install \
+  torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install --upgrade -e .
+bash scripts/persistent_quickstart.sh
+```
+
+結果は `runs/persistent-research/report/index.html` に出ます。offset 1...9ごとの
+cosine、feature survival、support Jaccard、different-window null、retrieval、
+standard SAE control、state probe、因果patch/ablationをPNG/PDF/HTMLで確認できます。
+
+軽量smoke test:
+
+```bash
+MODEL=EleutherAI/pythia-70m-deduped \
+LAYER=3 \
+D_SAE=2048 \
+K=32 \
+STEPS=300 \
+PROBLEMS=40 \
+EXTRACT_BATCH_SIZE=32 \
+RUN_CAUSAL=0 \
+bash scripts/persistent_quickstart.sh
+```
+
+従来のJEPA版は削除していません。再現にはそのまま次を使えます。
+
+```bash
+bash scripts/research_quickstart.sh
+```
+
+主仮説、評価指標、棄却条件、replication matrixは
+[docs/PERSISTENT_SAE_PROTOCOL.md](docs/PERSISTENT_SAE_PROTOCOL.md)に固定しています。
 
 LLMの「近接tokenに共通する内部状態」を、単なる平均や低ランク相関ではなく、**離れた文脈から予測可能な疎なresidual-space feature**として同定する研究コードです。
 
