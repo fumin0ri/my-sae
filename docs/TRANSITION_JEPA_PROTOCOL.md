@@ -49,7 +49,11 @@ optimizer steps as the joint condition.
 
 MMLU is never used for SAE or predictor optimization. Its test questions are
 loaded from a pinned dataset revision and opened only for locked evaluation and
-causal intervention.
+causal intervention. For a window W, both residual extraction and frozen
+base-model scoring use exactly the questions whose rendered prompt contains at
+least W real tokens. Short prompts are excluded rather than creating artificial
+residual targets with padding. Stable MMLU question IDs are checked before the
+locked test is opened.
 
 ## Training corpus
 
@@ -150,8 +154,8 @@ Secondary outcomes:
 - forecastable-component patching and ablation.
 
 The base-model answer score uses the same balanced zero-shot prompt forms as
-the representation analysis and is not presented as the official five-shot
-MMLU leaderboard protocol.
+the representation analysis, applies the same minimum-W-token eligibility
+rule, and is not presented as the official five-shot MMLU leaderboard protocol.
 
 ## Causal intervention
 

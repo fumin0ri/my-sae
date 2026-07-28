@@ -1,10 +1,12 @@
 import numpy as np
+import pytest
 import torch
 
 from shared_residual.transition_jepa_eval import (
     OFFSET_STATISTIC_NAMES,
     batch_offset_statistics,
     collect_model_outputs,
+    validate_mmlu_alignment,
 )
 from shared_residual.transition_jepa_sae import (
     TransitionJEPAConfig,
@@ -95,3 +97,31 @@ def test_window_32_collection_retains_only_final_dense_test_codes() -> None:
     assert "test_prediction" not in collected
     assert "test_target" not in collected
     assert "test_shuffled_prediction" not in collected
+
+
+def test_mmlu_alignment_uses_question_ids_not_only_row_count() -> None:
+    metadata = [
+        {"question_id": "mmlu-00001"},
+        {"question_id": "mmlu-00002"},
+    ]
+    validate_mmlu_alignment(
+        metadata,
+        {
+            "n": 2,
+            "question_ids": ["mmlu-00002", "mmlu-00001"],
+        },
+    )
+    with pytest.raises(ValueError, match="different question IDs"):
+        validate_mmlu_alignment(
+            metadata,
+            {
+                "n": 2,
+                "question_ids": ["mmlu-00001", "mmlu-00003"],
+            },
+        )
+
+
+def test_legacy_full_mmlu_result_has_actionable_window_error() -> None:
+    metadata = [{"question_id": "mmlu-00001"}]
+    with pytest.raises(ValueError, match="Rerun stage 4"):
+        validate_mmlu_alignment(metadata, {"n": 14_042})

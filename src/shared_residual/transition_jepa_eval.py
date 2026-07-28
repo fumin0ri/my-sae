@@ -426,6 +426,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_mmlu_alignment(
+    metadata: list[dict[str, Any]],
+    results: dict[str, Any],
+) -> None:
+    activation_ids = [str(row["question_id"]) for row in metadata]
+    if len(set(activation_ids)) != len(activation_ids):
+        raise ValueError("activation rows contain duplicate MMLU question IDs")
+    result_n = int(results.get("n", -1))
+    result_ids_raw = results.get("question_ids")
+    if result_ids_raw is None:
+        if result_n != len(activation_ids):
+            raise ValueError(
+                "base-model MMLU results and activation rows cover different "
+                f"question sets (base n={result_n:,}, activations "
+                f"n={len(activation_ids):,}). This occurs when base scoring "
+                "includes prompts shorter than the residual window. Rerun "
+                "stage 4 with --minimum-tokens equal to WINDOW_SIZE; the "
+                "existing activations and trained checkpoints can be reused."
+            )
+        return
+    result_ids = [str(value) for value in result_ids_raw]
+    if result_n != len(result_ids):
+        raise ValueError(
+            "base-model MMLU report has inconsistent n and question_ids"
+        )
+    if len(set(result_ids)) != len(result_ids):
+        raise ValueError("base-model MMLU results contain duplicate question IDs")
+    missing = sorted(set(activation_ids) - set(result_ids))
+    extra = sorted(set(result_ids) - set(activation_ids))
+    if missing or extra:
+        raise ValueError(
+            "base-model MMLU results and activation rows cover different "
+            f"question IDs (missing={len(missing):,}, extra={len(extra):,}). "
+            "Rerun stage 4 with --minimum-tokens equal to WINDOW_SIZE."
+        )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.probe_max_dim < 1:
@@ -453,10 +490,7 @@ def main() -> None:
     mmlu_model_results = json.loads(
         Path(args.mmlu_model_results).read_text(encoding="utf-8")
     )
-    if int(mmlu_model_results.get("n", -1)) != len(metadata):
-        raise ValueError(
-            "base-model MMLU results and activation rows have different sizes"
-        )
+    validate_mmlu_alignment(metadata, mmlu_model_results)
     train_indices, validation_indices, test_indices = grouped_three_way_split(
         metadata,
         args.validation_fraction,

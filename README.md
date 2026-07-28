@@ -66,7 +66,7 @@ bash scripts/transition_jepa_quickstart.sh
 | standard SAE | 12,000 steps |
 | JEPA conditions | 各8,000 steps |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
-| evaluation | MMLU test 14,042 questions |
+| evaluation | MMLU test最大14,042問（実token長 ≥ W） |
 
 結果は次の自己完結HTMLに出ます。
 
@@ -126,6 +126,20 @@ WINDOW_SIZE=32 \
 START_STAGE=9 \
 RUN_CAUSAL=0 \
 RUN_DIR=runs/transition-jepa-pile \
+bash scripts/transition_jepa_quickstart.sh
+```
+
+`END_STAGE`を指定すると単一stageだけを安全に再実行できます。Wを変更した旧runで
+stage 9に`base-model MMLU results and activation rows`の不一致が出た場合は、
+checkpointとactivationを作り直さずstage 4だけを再採点してから再開します。
+
+```bash
+WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
+START_STAGE=4 END_STAGE=4 \
+bash scripts/transition_jepa_quickstart.sh
+
+WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
+START_STAGE=9 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
@@ -233,7 +247,9 @@ Pileと独立なMMLU question-grouped locked testで次を出力します。
 
 MMLUは`cais/mmlu` commit
 `c30699e8356da336a370243923dbaf21066bb9fe`へ固定しています。既定ではtest
-14,042問すべてを1回ずつ使います。短い確認実験だけ
+14,042問から、人工paddingを避けるため実token長が`WINDOW_SIZE`以上のquestionを
+使います。activation抽出とbase LLM accuracyは同じquestion ID集合で検証されます。
+W=10では通常ほぼ全問、Wが大きいほど短いpromptが除外されます。短い確認実験だけ
 `MMLU_MAX_QUESTIONS`を設定してください。base LLM scoreは表層形式を統制した
 zero-shot評価であり、公式leaderboardの5-shot protocolとは区別して報告します。
 

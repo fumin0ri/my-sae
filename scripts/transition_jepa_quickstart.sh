@@ -80,8 +80,13 @@ TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/transition-jepa-pile}"
 START_STAGE="${START_STAGE:-1}"
-if (( START_STAGE < 1 || START_STAGE > 11 )); then
-  echo "START_STAGE must lie in [1, 11]" >&2
+END_STAGE="${END_STAGE:-11}"
+if (( START_STAGE < 1 || START_STAGE > 11 || END_STAGE < 1 || END_STAGE > 11 )); then
+  echo "START_STAGE and END_STAGE must lie in [1, 11]" >&2
+  exit 2
+fi
+if (( START_STAGE > END_STAGE )); then
+  echo "START_STAGE cannot exceed END_STAGE" >&2
   exit 2
 fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -134,7 +139,7 @@ fi
 if [[ "$PILE_SKIP_DISK_SPACE_CHECK" == "1" ]]; then
   PILE_BUDGET_ARGS+=(--skip-disk-space-check)
 fi
-if (( START_STAGE <= 1 )); then
+if (( START_STAGE <= 1 && END_STAGE >= 1 )); then
   echo "[1/11] Stream the official Pile mixture and extract residual shards"
   sr-extract-pile \
     "${MODEL_LOAD_ARGS[@]}" \
@@ -150,7 +155,7 @@ if (( START_STAGE <= 1 )); then
     --seed "$SEED"
 fi
 
-if (( START_STAGE <= 2 )); then
+if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
   echo "[2/11] Build the balanced MMLU locked-test benchmark"
   sr-make-mmlu \
     --prompts-output data/transition-jepa/prompts.jsonl \
@@ -163,7 +168,7 @@ if (( START_STAGE <= 2 )); then
     --seed "$SEED"
 fi
 
-if (( START_STAGE <= 3 )); then
+if (( START_STAGE <= 3 && END_STAGE >= 3 )); then
   echo "[3/11] Extract MMLU residual trajectories for evaluation only"
   sr-extract-grid \
     "${MODEL_LOAD_ARGS[@]}" \
@@ -179,7 +184,7 @@ if (( START_STAGE <= 3 )); then
     --storage-dtype bfloat16
 fi
 
-if (( START_STAGE <= 4 )); then
+if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
   echo "[4/11] Measure zero-shot base-LLM MMLU answer accuracy"
   sr-score-mmlu \
     "${MODEL_LOAD_ARGS[@]}" \
@@ -187,10 +192,11 @@ if (( START_STAGE <= 4 )); then
     --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
     --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
     --max-length "$MMLU_MAX_LENGTH" \
+    --minimum-tokens "$WINDOW_SIZE" \
     --dtype bfloat16
 fi
 
-if (( START_STAGE <= 5 )); then
+if (( START_STAGE <= 5 && END_STAGE >= 5 )); then
   echo "[5/11] Pretrain the common all-position standard SAE on The Pile"
   sr-train-standard-sae \
     --activation-manifest "$ACTIVATION_MANIFEST" \
@@ -228,7 +234,7 @@ COMMON_FORECAST_ARGS=(
   --seed "$SEED"
 )
 
-if (( START_STAGE <= 6 )); then
+if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
   echo "[6/11] Jointly tune the SAE dictionary and predictor on The Pile"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
@@ -236,7 +242,7 @@ if (( START_STAGE <= 6 )); then
     --objective joint
 fi
 
-if (( START_STAGE <= 7 )); then
+if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
   echo "[7/11] Train a predictor on the frozen standard-SAE dictionary"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
@@ -244,7 +250,7 @@ if (( START_STAGE <= 7 )); then
     --objective fixed
 fi
 
-if (( START_STAGE <= 8 )); then
+if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
   echo "[8/11] Train the offset-only shortcut control with z0 removed"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
@@ -252,7 +258,7 @@ if (( START_STAGE <= 8 )); then
     --objective k_only
 fi
 
-if (( START_STAGE <= 9 )); then
+if (( START_STAGE <= 9 && END_STAGE >= 9 )); then
   echo "[9/11] Open the question-grouped MMLU locked test"
   sr-evaluate-transition-jepa-sae \
     --activations "$EVAL_ACTIVATIONS" \
@@ -268,7 +274,7 @@ if (( START_STAGE <= 9 )); then
     --split-seed "$SPLIT_SEED"
 fi
 
-if (( START_STAGE <= 10 )); then
+if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
   if [[ "$RUN_CAUSAL" == "1" ]]; then
     echo "[10/11] Patch, ablate, and norm-match MMLU forecastable features"
     sr-intervene-transition-jepa-sae \
@@ -303,10 +309,14 @@ if (( START_STAGE <= 10 )); then
   fi
 fi
 
-if (( START_STAGE <= 11 )); then
+if (( START_STAGE <= 11 && END_STAGE >= 11 )); then
   echo "[11/11] Build PNG/PDF figures and a self-contained HTML report"
   sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 fi
 
 echo
-echo "Done. Open: $RUN_DIR/report/index.html"
+if (( END_STAGE == 11 )); then
+  echo "Done. Open: $RUN_DIR/report/index.html"
+else
+  echo "Done. Completed stages $START_STAGE through $END_STAGE."
+fi

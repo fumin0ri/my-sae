@@ -52,6 +52,23 @@ def accuracy_summary(
     }
 
 
+def eligible_indices(
+    attention_mask: torch.Tensor,
+    minimum_tokens: int,
+) -> list[int]:
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape [batch, sequence]")
+    if minimum_tokens < 1:
+        raise ValueError("minimum_tokens must be positive")
+    lengths = attention_mask.sum(dim=1)
+    return (
+        torch.nonzero(lengths >= minimum_tokens, as_tuple=False)
+        .flatten()
+        .cpu()
+        .tolist()
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Score the frozen base LLM on the balanced MMLU prompts"
@@ -61,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=1536)
+    parser.add_argument(
+        "--minimum-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Score only prompts with at least this many real tokens. Set this "
+            "to the residual window size so base accuracy and activation rows "
+            "cover exactly the same MMLU questions."
+        ),
+    )
     parser.add_argument(
         "--dtype",
         choices=["float32", "float16", "bfloat16"],
@@ -75,6 +102,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.minimum_tokens < 1:
+        raise ValueError("--minimum-tokens must be positive")
+    if args.minimum_tokens > args.max_length:
+        raise ValueError("--minimum-tokens cannot exceed --max-length")
     rows = read_jsonl(args.data)
     if not rows:
         raise ValueError("MMLU JSONL is empty")
@@ -105,6 +136,7 @@ def main() -> None:
 
     truth: list[str] = []
     prediction: list[str] = []
+    scored_rows: list[dict[str, Any]] = []
     for start in tqdm(
         range(0, len(rows), args.batch_size),
         desc="base LLM MMLU",
@@ -118,6 +150,17 @@ def main() -> None:
             pad_to_multiple_of=8,
             return_tensors="pt",
         )
+        selected = eligible_indices(
+            encoded["attention_mask"],
+            args.minimum_tokens,
+        )
+        if not selected:
+            continue
+        batch = [batch[index] for index in selected]
+        encoded = {
+            key: value[selected]
+            for key, value in encoded.items()
+        }
         encoded = {
             key: value.to(model_device) for key, value in encoded.items()
         }
@@ -134,7 +177,13 @@ def main() -> None:
             predicted = choice_logits.argmax(dim=1).cpu().tolist()
         truth.extend(str(row["semantic_answer"]) for row in batch)
         prediction.extend(ANSWER_LABELS[index] for index in predicted)
+        scored_rows.extend(batch)
 
+    if not scored_rows:
+        raise ValueError(
+            "No MMLU prompts meet --minimum-tokens; reduce it or increase "
+            "--max-length"
+        )
     report = {
         "benchmark": {
             "dataset": rows[0].get("dataset"),
@@ -146,12 +195,22 @@ def main() -> None:
         "model": args.model,
         "requested_model_revision": args.revision,
         "resolved_model_revision": getattr(model.config, "_commit_hash", None),
-        **accuracy_summary(truth, prediction, rows),
+        "selection": {
+            "minimum_tokens": args.minimum_tokens,
+            "input_n": len(rows),
+            "excluded_short_n": len(rows) - len(scored_rows),
+        },
+        "question_ids": [
+            str(row["question_id"]) for row in scored_rows
+        ],
+        **accuracy_summary(truth, prediction, scored_rows),
     }
     write_json(Path(args.output), report)
     print(
         f"base LLM MMLU accuracy={report['accuracy']:.4f} "
-        f"on n={report['n']:,}"
+        f"on n={report['n']:,} "
+        f"(excluded {report['selection']['excluded_short_n']:,} prompts "
+        f"shorter than {args.minimum_tokens} tokens)"
     )
 
 
