@@ -70,6 +70,11 @@ SPLIT_SEED="${SPLIT_SEED:-0}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/transition-jepa-pile}"
+START_STAGE="${START_STAGE:-1}"
+if (( START_STAGE < 1 || START_STAGE > 11 )); then
+  echo "START_STAGE must lie in [1, 11]" >&2
+  exit 2
+fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 
@@ -87,7 +92,10 @@ python -m pip freeze > "$RUN_DIR/python-environment.txt"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
   > "$RUN_DIR/gpu-environment.csv"
 
-echo "[1/11] Stream the official Pile mixture and extract residual shards"
+ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
+EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
+STANDARD_CHECKPOINT="$RUN_DIR/standard/standard_sae.pt"
+
 PILE_DATA_ARGS=(--dataset "$PILE_DATASET" --dataset-config "$PILE_DATASET_CONFIG")
 if [[ -n "$PILE_DATASET_REVISION" ]]; then
   PILE_DATA_ARGS+=(--dataset-revision "$PILE_DATASET_REVISION")
@@ -98,76 +106,82 @@ fi
 if [[ "$PILE_REQUIRE_ALL_DOMAINS" == "1" ]]; then
   PILE_DATA_ARGS+=(--require-all-domains)
 fi
-sr-extract-pile \
-  "${MODEL_LOAD_ARGS[@]}" \
-  "${PILE_DATA_ARGS[@]}" \
-  --output-dir "$RUN_DIR/pile-activations" \
-  --layer "$LAYER" \
-  --hook-point post \
-  --window-size "$WINDOW_SIZE" \
-  --sequence-length "$PILE_SEQUENCE_LENGTH" \
-  --train-windows "$PILE_TRAIN_WINDOWS" \
-  --validation-windows "$PILE_VALIDATION_WINDOWS" \
-  --shard-windows "$PILE_SHARD_WINDOWS" \
-  --batch-size "$PILE_EXTRACT_BATCH_SIZE" \
-  --dtype bfloat16 \
-  --seed "$SEED"
+if (( START_STAGE <= 1 )); then
+  echo "[1/11] Stream the official Pile mixture and extract residual shards"
+  sr-extract-pile \
+    "${MODEL_LOAD_ARGS[@]}" \
+    "${PILE_DATA_ARGS[@]}" \
+    --output-dir "$RUN_DIR/pile-activations" \
+    --layer "$LAYER" \
+    --hook-point post \
+    --window-size "$WINDOW_SIZE" \
+    --sequence-length "$PILE_SEQUENCE_LENGTH" \
+    --train-windows "$PILE_TRAIN_WINDOWS" \
+    --validation-windows "$PILE_VALIDATION_WINDOWS" \
+    --shard-windows "$PILE_SHARD_WINDOWS" \
+    --batch-size "$PILE_EXTRACT_BATCH_SIZE" \
+    --dtype bfloat16 \
+    --seed "$SEED"
+fi
 
-ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
+if (( START_STAGE <= 2 )); then
+  echo "[2/11] Build the balanced MMLU locked-test benchmark"
+  sr-make-mmlu \
+    --prompts-output data/transition-jepa/prompts.jsonl \
+    --pairs-output data/transition-jepa/pairs.jsonl \
+    --dataset "$MMLU_DATASET" \
+    --dataset-config "$MMLU_DATASET_CONFIG" \
+    --dataset-revision "$MMLU_DATASET_REVISION" \
+    --max-questions "$MMLU_MAX_QUESTIONS" \
+    --pairs "$PAIRS" \
+    --seed "$SEED"
+fi
 
-echo "[2/11] Build the balanced MMLU locked-test benchmark"
-sr-make-mmlu \
-  --prompts-output data/transition-jepa/prompts.jsonl \
-  --pairs-output data/transition-jepa/pairs.jsonl \
-  --dataset "$MMLU_DATASET" \
-  --dataset-config "$MMLU_DATASET_CONFIG" \
-  --dataset-revision "$MMLU_DATASET_REVISION" \
-  --max-questions "$MMLU_MAX_QUESTIONS" \
-  --pairs "$PAIRS" \
-  --seed "$SEED"
+if (( START_STAGE <= 3 )); then
+  echo "[3/11] Extract MMLU residual trajectories for evaluation only"
+  sr-extract-grid \
+    "${MODEL_LOAD_ARGS[@]}" \
+    --data data/transition-jepa/prompts.jsonl \
+    --output-dir "$RUN_DIR/activations" \
+    --layers "$LAYER" \
+    --hook-point post \
+    --window-size "$WINDOW_SIZE" \
+    --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
+    --max-length "$MMLU_MAX_LENGTH" \
+    --truncation-side left \
+    --dtype bfloat16 \
+    --storage-dtype bfloat16
+fi
 
-echo "[3/11] Extract MMLU residual trajectories for evaluation only"
-sr-extract-grid \
-  "${MODEL_LOAD_ARGS[@]}" \
-  --data data/transition-jepa/prompts.jsonl \
-  --output-dir "$RUN_DIR/activations" \
-  --layers "$LAYER" \
-  --hook-point post \
-  --window-size "$WINDOW_SIZE" \
-  --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
-  --max-length "$MMLU_MAX_LENGTH" \
-  --truncation-side left \
-  --dtype bfloat16 \
-  --storage-dtype bfloat16
+if (( START_STAGE <= 4 )); then
+  echo "[4/11] Measure zero-shot base-LLM MMLU answer accuracy"
+  sr-score-mmlu \
+    "${MODEL_LOAD_ARGS[@]}" \
+    --data data/transition-jepa/prompts.jsonl \
+    --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
+    --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
+    --max-length "$MMLU_MAX_LENGTH" \
+    --dtype bfloat16
+fi
 
-EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
+if (( START_STAGE <= 5 )); then
+  echo "[5/11] Pretrain the common all-position standard SAE on The Pile"
+  sr-train-standard-sae \
+    --activation-manifest "$ACTIVATION_MANIFEST" \
+    --output-dir "$RUN_DIR/standard" \
+    --d-sae "$D_SAE" \
+    --k "$K" \
+    --steps "$STANDARD_STEPS" \
+    --batch-size "$BATCH_SIZE" \
+    --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
+    --amp-dtype bfloat16 \
+    --lr 0.0002 \
+    --warmup-steps 500 \
+    --log-every 500 \
+    --device "$TRAIN_DEVICE" \
+    --seed "$SEED"
+fi
 
-echo "[4/11] Measure zero-shot base-LLM MMLU answer accuracy"
-sr-score-mmlu \
-  "${MODEL_LOAD_ARGS[@]}" \
-  --data data/transition-jepa/prompts.jsonl \
-  --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
-  --batch-size "$EVAL_EXTRACT_BATCH_SIZE" \
-  --max-length "$MMLU_MAX_LENGTH" \
-  --dtype bfloat16
-
-echo "[5/11] Pretrain the common all-position standard SAE on The Pile"
-sr-train-standard-sae \
-  --activation-manifest "$ACTIVATION_MANIFEST" \
-  --output-dir "$RUN_DIR/standard" \
-  --d-sae "$D_SAE" \
-  --k "$K" \
-  --steps "$STANDARD_STEPS" \
-  --batch-size "$BATCH_SIZE" \
-  --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
-  --amp-dtype bfloat16 \
-  --lr 0.0002 \
-  --warmup-steps 500 \
-  --log-every 500 \
-  --device "$TRAIN_DEVICE" \
-  --seed "$SEED"
-
-STANDARD_CHECKPOINT="$RUN_DIR/standard/standard_sae.pt"
 COMMON_FORECAST_ARGS=(
   --activation-manifest "$ACTIVATION_MANIFEST"
   --init-checkpoint "$STANDARD_CHECKPOINT"
@@ -188,73 +202,85 @@ COMMON_FORECAST_ARGS=(
   --seed "$SEED"
 )
 
-echo "[6/11] Jointly tune the SAE dictionary and predictor on The Pile"
-sr-train-transition-jepa-sae \
-  "${COMMON_FORECAST_ARGS[@]}" \
-  --output-dir "$RUN_DIR/joint" \
-  --objective joint
-
-echo "[7/11] Train a predictor on the frozen standard-SAE dictionary"
-sr-train-transition-jepa-sae \
-  "${COMMON_FORECAST_ARGS[@]}" \
-  --output-dir "$RUN_DIR/fixed" \
-  --objective fixed
-
-echo "[8/11] Train the offset-only shortcut control with z0 removed"
-sr-train-transition-jepa-sae \
-  "${COMMON_FORECAST_ARGS[@]}" \
-  --output-dir "$RUN_DIR/k_only" \
-  --objective k_only
-
-echo "[9/11] Open the question-grouped MMLU locked test"
-sr-evaluate-transition-jepa-sae \
-  --activations "$EVAL_ACTIVATIONS" \
-  --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-  --fixed-checkpoint "$RUN_DIR/fixed/transition_jepa_sae.pt" \
-  --k-only-checkpoint "$RUN_DIR/k_only/transition_jepa_sae.pt" \
-  --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
-  --output-dir "$RUN_DIR/analysis" \
-  --group-key question_id \
-  --batch-size "$EVAL_BATCH_SIZE" \
-  --device "$TRAIN_DEVICE" \
-  --seed "$SEED" \
-  --split-seed "$SPLIT_SEED"
-
-if [[ "$RUN_CAUSAL" == "1" ]]; then
-  echo "[10/11] Patch, ablate, and norm-match MMLU forecastable features"
-  sr-intervene-transition-jepa-sae \
-    "${MODEL_LOAD_ARGS[@]}" \
-    --pairs data/transition-jepa/pairs.jsonl \
-    --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-    --output "$RUN_DIR/analysis/intervention-patch.jsonl" \
-    --layer "$LAYER" \
-    --hook-point post \
-    --mode patch \
-    --seed "$SEED"
-  sr-intervene-transition-jepa-sae \
-    "${MODEL_LOAD_ARGS[@]}" \
-    --pairs data/transition-jepa/pairs.jsonl \
-    --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-    --output "$RUN_DIR/analysis/intervention-ablate.jsonl" \
-    --layer "$LAYER" \
-    --hook-point post \
-    --mode ablate \
-    --seed "$SEED"
-  sr-intervene-transition-jepa-sae \
-    "${MODEL_LOAD_ARGS[@]}" \
-    --pairs data/transition-jepa/pairs.jsonl \
-    --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-    --output "$RUN_DIR/analysis/intervention-random.jsonl" \
-    --layer "$LAYER" \
-    --hook-point post \
-    --mode random_ablate \
-    --seed "$SEED"
-else
-  echo "[10/11] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+if (( START_STAGE <= 6 )); then
+  echo "[6/11] Jointly tune the SAE dictionary and predictor on The Pile"
+  sr-train-transition-jepa-sae \
+    "${COMMON_FORECAST_ARGS[@]}" \
+    --output-dir "$RUN_DIR/joint" \
+    --objective joint
 fi
 
-echo "[11/11] Build PNG/PDF figures and a self-contained HTML report"
-sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
+if (( START_STAGE <= 7 )); then
+  echo "[7/11] Train a predictor on the frozen standard-SAE dictionary"
+  sr-train-transition-jepa-sae \
+    "${COMMON_FORECAST_ARGS[@]}" \
+    --output-dir "$RUN_DIR/fixed" \
+    --objective fixed
+fi
+
+if (( START_STAGE <= 8 )); then
+  echo "[8/11] Train the offset-only shortcut control with z0 removed"
+  sr-train-transition-jepa-sae \
+    "${COMMON_FORECAST_ARGS[@]}" \
+    --output-dir "$RUN_DIR/k_only" \
+    --objective k_only
+fi
+
+if (( START_STAGE <= 9 )); then
+  echo "[9/11] Open the question-grouped MMLU locked test"
+  sr-evaluate-transition-jepa-sae \
+    --activations "$EVAL_ACTIVATIONS" \
+    --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
+    --fixed-checkpoint "$RUN_DIR/fixed/transition_jepa_sae.pt" \
+    --k-only-checkpoint "$RUN_DIR/k_only/transition_jepa_sae.pt" \
+    --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
+    --output-dir "$RUN_DIR/analysis" \
+    --group-key question_id \
+    --batch-size "$EVAL_BATCH_SIZE" \
+    --device "$TRAIN_DEVICE" \
+    --seed "$SEED" \
+    --split-seed "$SPLIT_SEED"
+fi
+
+if (( START_STAGE <= 10 )); then
+  if [[ "$RUN_CAUSAL" == "1" ]]; then
+    echo "[10/11] Patch, ablate, and norm-match MMLU forecastable features"
+    sr-intervene-transition-jepa-sae \
+      "${MODEL_LOAD_ARGS[@]}" \
+      --pairs data/transition-jepa/pairs.jsonl \
+      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
+      --output "$RUN_DIR/analysis/intervention-patch.jsonl" \
+      --layer "$LAYER" \
+      --hook-point post \
+      --mode patch \
+      --seed "$SEED"
+    sr-intervene-transition-jepa-sae \
+      "${MODEL_LOAD_ARGS[@]}" \
+      --pairs data/transition-jepa/pairs.jsonl \
+      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
+      --output "$RUN_DIR/analysis/intervention-ablate.jsonl" \
+      --layer "$LAYER" \
+      --hook-point post \
+      --mode ablate \
+      --seed "$SEED"
+    sr-intervene-transition-jepa-sae \
+      "${MODEL_LOAD_ARGS[@]}" \
+      --pairs data/transition-jepa/pairs.jsonl \
+      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
+      --output "$RUN_DIR/analysis/intervention-random.jsonl" \
+      --layer "$LAYER" \
+      --hook-point post \
+      --mode random_ablate \
+      --seed "$SEED"
+  else
+    echo "[10/11] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+  fi
+fi
+
+if (( START_STAGE <= 11 )); then
+  echo "[11/11] Build PNG/PDF figures and a self-contained HTML report"
+  sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
+fi
 
 echo
 echo "Done. Open: $RUN_DIR/report/index.html"

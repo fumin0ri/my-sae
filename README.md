@@ -109,6 +109,21 @@ WINDOW_SIZE=16 bash scripts/transition_jepa_quickstart.sh
 省略時は約320 tokenを超えない最大の倍数へ自動調整されます。異なるwindow
 sizeのrunは別の`RUN_DIR`へ保存することを推奨します。
 
+途中で失敗したrunは`START_STAGE`で既存artifactから再開できます。たとえば
+stage 9の評価だけをやり直してreportまで生成する場合:
+
+```bash
+WINDOW_SIZE=32 \
+START_STAGE=9 \
+RUN_CAUSAL=0 \
+RUN_DIR=runs/transition-jepa-pile \
+bash scripts/transition_jepa_quickstart.sh
+```
+
+stage 9はoffsetごとのdense codeを全件保持せず、batch内でscalar statisticsへ
+集約します。大きいwindowでも、最終offsetのfeature解析に必要なcodeだけを
+保持します。
+
 ## The Pile training data
 
 `EleutherAI/the_pile_deduplicated`の`default` configurationをstreamingで読みます。

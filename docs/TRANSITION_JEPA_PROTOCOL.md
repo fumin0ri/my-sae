@@ -128,6 +128,11 @@ For each offset 1...W-1:
 - innovation-to-target energy ratio;
 - predictor and target norms.
 
+Evaluation computes these quantities batch by batch and retains only scalar
+per-question, per-offset statistics. Dense target, prediction, and shuffled
+prediction tensors are not retained across the locked test. Dense codes are
+kept only at the final offset for feature analysis.
+
 Secondary outcomes:
 
 - semantics accuracy: linear decoding of the balanced correct option A/B/C/D;

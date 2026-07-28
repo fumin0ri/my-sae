@@ -29,7 +29,6 @@ from .training import (
 from .transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
-    support_metrics,
 )
 
 PROBE_LABELS = {
@@ -37,6 +36,18 @@ PROBE_LABELS = {
     "context": "context_category",
     "syntax": "syntax_template",
 }
+OFFSET_STATISTIC_NAMES = (
+    "code_cosine",
+    "shuffled_context_cosine",
+    "code_nrmse",
+    "support_precision",
+    "support_recall",
+    "support_jaccard",
+    "residual_error",
+    "residual_energy",
+    "prediction_norm",
+    "target_norm",
+)
 
 
 def load_model(
@@ -51,6 +62,71 @@ def load_model(
 
 
 @torch.no_grad()
+def batch_offset_statistics(
+    outputs: dict[str, torch.Tensor],
+    shuffled_prediction: torch.Tensor,
+    pre_bias: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    prediction = outputs["predicted_codes"]
+    sparse_prediction = outputs["sparse_predicted_codes"]
+    target = outputs["target_codes"]
+    batch_size, n_offsets, _ = prediction.shape
+    statistics = {
+        name: torch.empty(
+            (batch_size, n_offsets),
+            device=prediction.device,
+            dtype=torch.float32,
+        )
+        for name in OFFSET_STATISTIC_NAMES
+    }
+    for offset in range(n_offsets):
+        predicted = prediction[:, offset].float()
+        shuffled = shuffled_prediction[:, offset].float()
+        target_code = target[:, offset].float()
+        cosine = F.cosine_similarity(predicted, target_code, dim=-1)
+        shuffled_cosine = F.cosine_similarity(
+            shuffled,
+            target_code,
+            dim=-1,
+        )
+        target_energy = target_code.square().mean(dim=-1).clamp_min(1e-8)
+        predicted_active = sparse_prediction[:, offset] > 0
+        target_active = target[:, offset] > 0
+        intersection = (predicted_active & target_active).sum(dim=-1).float()
+        predicted_count = predicted_active.sum(dim=-1).float().clamp_min(1)
+        target_count = target_active.sum(dim=-1).float().clamp_min(1)
+        union = (
+            (predicted_active | target_active)
+            .sum(dim=-1)
+            .float()
+            .clamp_min(1)
+        )
+        residual_error = (
+            outputs["predictable_residual"][:, offset].float()
+            - outputs["target_residual"][:, offset].float()
+        ).square().mean(dim=-1)
+        residual_energy = (
+            outputs["target_residual"][:, offset].float()
+            - pre_bias.float()
+        ).square().mean(dim=-1)
+        statistics["code_cosine"][:, offset] = cosine
+        statistics["shuffled_context_cosine"][:, offset] = shuffled_cosine
+        statistics["code_nrmse"][:, offset] = (
+            (predicted - target_code).square().mean(dim=-1) / target_energy
+        )
+        statistics["support_precision"][:, offset] = (
+            intersection / predicted_count
+        )
+        statistics["support_recall"][:, offset] = intersection / target_count
+        statistics["support_jaccard"][:, offset] = intersection / union
+        statistics["residual_error"][:, offset] = residual_error
+        statistics["residual_energy"][:, offset] = residual_energy
+        statistics["prediction_norm"][:, offset] = predicted.norm(dim=-1)
+        statistics["target_norm"][:, offset] = target_code.norm(dim=-1)
+    return statistics
+
+
+@torch.no_grad()
 def collect_model_outputs(
     model: TransitionJEPASAE,
     x: torch.Tensor,
@@ -62,9 +138,13 @@ def collect_model_outputs(
     use_context: bool,
     seed: int,
     label: str,
-) -> dict[str, torch.Tensor | float]:
-    contexts: list[torch.Tensor] = []
-    final_predictions: list[torch.Tensor] = []
+    retain_final_test_codes: bool,
+) -> dict[str, Any]:
+    context = torch.empty(
+        (len(x), model.cfg.d_sae),
+        dtype=torch.float16,
+    )
+    final_prediction = torch.empty_like(context)
     reconstruction_error = 0.0
     reconstruction_scale = 0.0
     final_offset = torch.tensor(
@@ -76,7 +156,12 @@ def collect_model_outputs(
         range(0, len(x), batch_size),
         desc=f"{label}: encode/reconstruct",
     ):
-        batch = x[start : start + batch_size].to(device, non_blocking=True)
+        end = min(start + batch_size, len(x))
+        batch = x[start:end].to(
+            device=device,
+            dtype=model.pre_bias.dtype,
+            non_blocking=True,
+        )
         with autocast_context(device, amp_dtype):
             codes = model.encode(batch)
             reconstruction = model.decode(codes)
@@ -85,8 +170,10 @@ def collect_model_outputs(
                 offsets=final_offset,
                 use_context=use_context,
             )
-        contexts.append(codes[:, 0].float().cpu())
-        final_predictions.append(prediction[:, 0].float().cpu())
+        context[start:end].copy_(codes[:, 0].to(torch.float16).cpu())
+        final_prediction[start:end].copy_(
+            prediction[:, 0].to(torch.float16).cpu()
+        )
         reconstruction_error += float(
             (reconstruction - batch).float().square().sum().item()
         )
@@ -94,52 +181,34 @@ def collect_model_outputs(
             (batch - model.pre_bias).float().square().sum().item()
         )
 
-    context = torch.cat(contexts)
-    test_x = x[test_indices]
-    targets: list[torch.Tensor] = []
-    predictions: list[torch.Tensor] = []
-    residual_error: list[torch.Tensor] = []
-    residual_energy: list[torch.Tensor] = []
-    for start in tqdm(
-        range(0, len(test_x), batch_size),
-        desc=f"{label}: locked predictions",
-    ):
-        batch = test_x[start : start + batch_size].to(
-            device,
-            non_blocking=True,
-        )
-        with autocast_context(device, amp_dtype):
-            outputs = model(batch, use_context=use_context)
-        targets.append(outputs["target_codes"].float().cpu())
-        predictions.append(outputs["predicted_codes"].float().cpu())
-        residual_error.append(
-            (
-                outputs["predictable_residual"]
-                - outputs["target_residual"]
-            )
-            .float()
-            .square()
-            .mean(dim=-1)
-            .cpu()
-        )
-        residual_energy.append(
-            (
-                outputs["target_residual"] - model.pre_bias
-            )
-            .float()
-            .square()
-            .mean(dim=-1)
-            .cpu()
-        )
-    target = torch.cat(targets)
-    prediction = torch.cat(predictions)
-
+    n_test = len(test_indices)
+    n_offsets = model.cfg.window_size - 1
+    avoided_dense_gib = (
+        3 * n_test * n_offsets * model.cfg.d_sae * 2 / 2**30
+    )
+    print(
+        f"{label}: streaming offset statistics; avoiding approximately "
+        f"{avoided_dense_gib:.1f} GiB of retained dense test codes"
+    )
+    offset_statistics = {
+        name: torch.empty((n_test, n_offsets), dtype=torch.float32)
+        for name in OFFSET_STATISTIC_NAMES
+    }
+    final_test_prediction = (
+        torch.empty((n_test, model.cfg.d_sae), dtype=torch.float16)
+        if retain_final_test_codes
+        else None
+    )
+    final_test_target = (
+        torch.empty_like(final_test_prediction)
+        if final_test_prediction is not None
+        else None
+    )
     permutation = torch.as_tensor(
         different_group_permutation(groups, seed),
         dtype=torch.long,
     )
     shuffled_context = context[test_indices].index_select(0, permutation)
-    shuffled_predictions: list[torch.Tensor] = []
     offsets = torch.arange(
         1,
         model.cfg.window_size,
@@ -147,76 +216,85 @@ def collect_model_outputs(
         dtype=torch.long,
     )
     for start in tqdm(
-        range(0, len(shuffled_context), batch_size),
-        desc=f"{label}: shuffled null",
+        range(0, n_test, batch_size),
+        desc=f"{label}: locked streaming metrics",
     ):
-        batch_context = shuffled_context[start : start + batch_size].to(
+        end = min(start + batch_size, n_test)
+        indices = test_indices[start:end]
+        batch = x[indices].to(
+            device=device,
+            dtype=model.pre_bias.dtype,
+            non_blocking=True,
+        )
+        batch_context = shuffled_context[start:end].to(
             device=device,
             dtype=model.pre_bias.dtype,
             non_blocking=True,
         )
         with autocast_context(device, amp_dtype):
-            shuffled, _ = model.predict_from_code(
-                batch_context,
-                offsets=offsets,
-                use_context=use_context,
+            outputs = model(batch, use_context=use_context)
+            if use_context:
+                shuffled, _ = model.predict_from_code(
+                    batch_context,
+                    offsets=offsets,
+                    use_context=True,
+                )
+            else:
+                shuffled = outputs["predicted_codes"]
+        batch_statistics = batch_offset_statistics(
+            outputs,
+            shuffled,
+            model.pre_bias,
+        )
+        stacked_statistics = torch.stack(
+            [batch_statistics[name] for name in OFFSET_STATISTIC_NAMES]
+        ).cpu()
+        for statistic_index, name in enumerate(OFFSET_STATISTIC_NAMES):
+            offset_statistics[name][start:end].copy_(
+                stacked_statistics[statistic_index]
             )
-        shuffled_predictions.append(shuffled.float().cpu())
+        if final_test_prediction is not None:
+            assert final_test_target is not None
+            final_test_prediction[start:end].copy_(
+                outputs["predicted_codes"][:, -1]
+                .to(torch.float16)
+                .cpu()
+            )
+            final_test_target[start:end].copy_(
+                outputs["target_codes"][:, -1]
+                .to(torch.float16)
+                .cpu()
+            )
     return {
-        "context": context.to(torch.float16),
-        "final_prediction": torch.cat(final_predictions).to(torch.float16),
-        "test_target": target.to(torch.float16),
-        "test_prediction": prediction.to(torch.float16),
-        "test_shuffled_prediction": torch.cat(
-            shuffled_predictions
-        ).to(torch.float16),
-        "residual_error": torch.cat(residual_error),
-        "residual_energy": torch.cat(residual_energy),
+        "context": context,
+        "final_prediction": final_prediction,
+        "offset_statistics": offset_statistics,
+        "window_code_cosine": offset_statistics["code_cosine"].mean(dim=1),
+        "final_test_prediction": final_test_prediction,
+        "final_test_target": final_test_target,
         "reconstruction_fvu": reconstruction_error
         / max(reconstruction_scale, 1e-12),
     }
 
 
 def offset_curve(
-    outputs: dict[str, torch.Tensor | float],
+    outputs: dict[str, Any],
     groups: np.ndarray,
-    k: int,
     seed: int,
     label: str,
 ) -> list[dict[str, Any]]:
-    prediction = outputs["test_prediction"]
-    shuffled = outputs["test_shuffled_prediction"]
-    target = outputs["test_target"]
-    residual_error = outputs["residual_error"]
-    residual_energy = outputs["residual_energy"]
-    assert isinstance(prediction, torch.Tensor)
-    assert isinstance(shuffled, torch.Tensor)
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(residual_error, torch.Tensor)
-    assert isinstance(residual_energy, torch.Tensor)
+    statistics = outputs["offset_statistics"]
+    assert isinstance(statistics, dict)
+    n_offsets = statistics["code_cosine"].shape[1]
     rows = []
     for offset in tqdm(
-        range(target.shape[1]),
+        range(n_offsets),
         desc=f"{label}: offset metrics",
     ):
-        predicted = prediction[:, offset].float()
-        shuffled_predicted = shuffled[:, offset].float()
-        target_code = target[:, offset].float()
-        cosine = F.cosine_similarity(predicted, target_code, dim=-1)
-        shuffled_cosine = F.cosine_similarity(
-            shuffled_predicted,
-            target_code,
-            dim=-1,
-        )
-        nrmse = (
-            (predicted - target_code).square().mean(dim=-1)
-            / target_code.square().mean(dim=-1).clamp_min(1e-8)
-        )
-        precision, recall, jaccard = support_metrics(
-            predicted,
-            target_code,
-            k,
-        )
+        cosine = statistics["code_cosine"][:, offset]
+        shuffled_cosine = statistics["shuffled_context_cosine"][:, offset]
+        residual_error = statistics["residual_error"][:, offset]
+        residual_energy = statistics["residual_energy"][:, offset]
         context_gain = cosine.numpy() - shuffled_cosine.numpy()
         rows.append(
             {
@@ -230,26 +308,34 @@ def offset_curve(
                     groups,
                     seed + 101 * offset,
                 ),
-                "code_nrmse": float(nrmse.mean().item()),
-                "support_precision": float(precision.mean().item()),
-                "support_recall": float(recall.mean().item()),
-                "support_jaccard": float(jaccard.mean().item()),
+                "code_nrmse": float(
+                    statistics["code_nrmse"][:, offset].mean().item()
+                ),
+                "support_precision": float(
+                    statistics["support_precision"][:, offset].mean().item()
+                ),
+                "support_recall": float(
+                    statistics["support_recall"][:, offset].mean().item()
+                ),
+                "support_jaccard": float(
+                    statistics["support_jaccard"][:, offset].mean().item()
+                ),
                 "residual_prediction_fvu": float(
-                    residual_error[:, offset].mean().div(
-                        residual_energy[:, offset].mean().clamp_min(1e-8)
+                    residual_error.mean().div(
+                        residual_energy.mean().clamp_min(1e-8)
                     ).item()
                 ),
                 "innovation_energy_fraction": float(
-                    residual_error[:, offset]
-                    .div(residual_energy[:, offset].clamp_min(1e-8))
+                    residual_error
+                    .div(residual_energy.clamp_min(1e-8))
                     .mean()
                     .item()
                 ),
                 "prediction_norm": float(
-                    predicted.norm(dim=-1).mean().item()
+                    statistics["prediction_norm"][:, offset].mean().item()
                 ),
                 "target_norm": float(
-                    target_code.norm(dim=-1).mean().item()
+                    statistics["target_norm"][:, offset].mean().item()
                 ),
             }
         )
@@ -351,7 +437,9 @@ def main() -> None:
     )
     configure_accelerator(device)
     bundle = torch_load(args.activations)
-    x = bundle["activations"].float()
+    # Keep the stored BF16 activations in their compact form. Batches are
+    # promoted only when transferred to the evaluation device.
+    x = bundle["activations"]
     metadata = bundle["metadata"]
     del bundle
     probe_labels = {
@@ -427,50 +515,48 @@ def main() -> None:
             use_context=method != "k_only",
             seed=args.seed,
             label=method,
+            retain_final_test_codes=method == "joint",
         )
         curves[method] = offset_curve(
             collected,
             groups,
-            model.cfg.k,
             args.seed + method_index,
             method,
         )
         reconstruction_fvu[method] = float(collected["reconstruction_fvu"])
         context = collected["context"]
         final_prediction = collected["final_prediction"]
-        test_prediction = collected["test_prediction"]
-        test_target = collected["test_target"]
+        window_code_cosine = collected["window_code_cosine"]
+        final_test_prediction = collected["final_test_prediction"]
+        final_test_target = collected["final_test_target"]
         assert isinstance(context, torch.Tensor)
         assert isinstance(final_prediction, torch.Tensor)
-        assert isinstance(test_prediction, torch.Tensor)
-        assert isinstance(test_target, torch.Tensor)
+        assert isinstance(window_code_cosine, torch.Tensor)
         probe_contexts[method] = select_probe_dimensions(
-            context.float(),
+            context,
             development_indices,
             args.probe_max_dim,
         ).to(torch.float16)
         probe_predictions[method] = select_probe_dimensions(
-            final_prediction.float(),
+            final_prediction,
             development_indices,
             args.probe_max_dim,
         ).to(torch.float16)
         if method in {"joint", "fixed"}:
             test_contexts[method] = context[test_indices].clone()
-        window_cosines[method] = F.cosine_similarity(
-            test_prediction.float(),
-            test_target.float(),
-            dim=-1,
-        ).mean(dim=1)
+        window_cosines[method] = window_code_cosine
         if method == "joint":
-            joint_final_prediction = test_prediction[:, -1].clone()
-            joint_final_target = test_target[:, -1].clone()
+            assert isinstance(final_test_prediction, torch.Tensor)
+            assert isinstance(final_test_target, torch.Tensor)
+            joint_final_prediction = final_test_prediction
+            joint_final_target = final_test_target
         checkpoints[method] = {
             "train_args": checkpoint["train_args"],
             "config": checkpoint["config"],
         }
         model.to("cpu")
         del model, checkpoint, collected, context, final_prediction
-        del test_prediction, test_target
+        del final_test_prediction, final_test_target
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -539,6 +625,10 @@ def main() -> None:
             ),
             "predictor": "offset-conditioned MLP",
             "target_aggregation": "none",
+            "evaluation_aggregation": (
+                "stream scalar offset statistics; retain dense codes only "
+                "for the final-offset feature analysis"
+            ),
         },
         "benchmark": {
             "name": "MMLU",
