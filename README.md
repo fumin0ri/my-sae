@@ -60,9 +60,9 @@ bash scripts/transition_jepa_quickstart.sh
 | sparsity | Top-K 64 |
 | predictor | width 512, offset-conditioned MLP |
 | residual window | 10 positions（`WINDOW_SIZE`で変更可能） |
-| Pile train sample | 524,288 windows = 5,242,880 token positions |
-| Pile validation | 16,384 windows |
-| activation storage | BF16 shards、約40 GiB（約43 GB） |
+| Pile train sample | 5,242,880 token positions（W=10では524,288 windows） |
+| Pile validation | 163,840 token positions（W=10では16,384 windows） |
+| activation storage | BF16 shards、実データ約41 GiB |
 | standard SAE | 12,000 steps |
 | JEPA conditions | 各8,000 steps |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
@@ -109,7 +109,16 @@ WINDOW_SIZE=16 bash scripts/transition_jepa_quickstart.sh
 省略時は約320 tokenを超えない最大の倍数へ自動調整されます。異なるwindow
 sizeのrunは別の`RUN_DIR`へ保存することを推奨します。
 
-途中で失敗したrunは`START_STAGE`で既存artifactから再開できます。たとえば
+既定の抽出量とshardサイズはwindow数ではなくtoken position数で固定されます。
+したがって`WINDOW_SIZE=128`ではtrain 40,960 windows、validation 1,280
+windows、1 shard 320 windowsとなり、W=10とほぼ同じ約41 GiBに収まります。
+比較する独立window数を明示的に固定したい場合だけ`PILE_TRAIN_WINDOWS`、
+`PILE_VALIDATION_WINDOWS`、`PILE_SHARD_WINDOWS`で上書きしてください。この場合は
+必要容量がwindow sizeに比例します。
+`BATCH_SIZE`と`EVAL_BATCH_SIZE`も既定では約320 positions/batchになるよう調整され、
+W=128では2 windowsになります。VRAMに余裕がある場合は明示的に上書きできます。
+
+完了済みstageがあるrunは`START_STAGE`で既存artifactから再開できます。たとえば
 stage 9の評価だけをやり直してreportまで生成する場合:
 
 ```bash
@@ -147,9 +156,17 @@ bash scripts/transition_jepa_quickstart.sh
 ```
 
 documentは決定論的hashでtrain/validationへ分離するため、同じdocument由来の
-windowが両方へ入ることはありません。抽出結果は単一巨大tensorではなく、
-4,096-window単位のBF16 shardとして保存されます。320 token未満の短いdocument
-も右paddingして実トークン部分だけを保存するため、短文中心のsubcorpusを捨てません。
+windowが両方へ入ることはありません。抽出結果は単一巨大tensorではなく、既定で
+40,960-position単位（約320 MiB）のBF16 shardとして保存されます。320 token未満の
+短いdocumentも右paddingして実トークン部分だけを保存するため、短文中心の
+subcorpusを捨てません。
+
+抽出前には推定容量、filesystem空き容量、5 GiBのreserveを検査します。各shardは
+`.partial`へ書いてから原子的に確定するため、disk fullやquota超過で壊れた`.pt`を
+正式artifactとして残しません。stage 1で失敗した出力は自動再開しません。容量を
+確認して失敗した`pile-activations` directoryを削除するか、新しい`RUN_DIR`を
+指定してstage 1から再実行してください。quotaを別途確認済みの場合だけ
+`PILE_SKIP_DISK_SPACE_CHECK=1`で事前検査を無効化できます。
 
 ```text
 runs/transition-jepa-pile/pile-activations/

@@ -5,6 +5,7 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 import torch
@@ -47,6 +48,87 @@ PILE_MIXTURE_WEIGHTS = {
     "NIH ExPorter": 0.0030,
     "Enron Emails": 0.0014,
 }
+
+DEFAULT_TRAIN_POSITIONS = 5_242_880
+DEFAULT_VALIDATION_POSITIONS = 163_840
+DEFAULT_SHARD_POSITIONS = 40_960
+STORAGE_SAFETY_FACTOR = 1.05
+
+
+def windows_from_position_budget(positions: int, window_size: int) -> int:
+    if positions < 1:
+        raise ValueError("position budgets must be positive")
+    if window_size < 1:
+        raise ValueError("window size must be positive")
+    return max(positions // window_size, 1)
+
+
+def resolve_window_count(
+    explicit_windows: int | None,
+    position_budget: int,
+    window_size: int,
+) -> int:
+    if explicit_windows is not None:
+        return explicit_windows
+    return windows_from_position_budget(position_budget, window_size)
+
+
+def estimate_storage_bytes(
+    windows: int,
+    window_size: int,
+    d_in: int,
+) -> int:
+    positions = windows * window_size
+    # BF16 residuals and int64 token IDs dominate. Source IDs are int16 per
+    # window; the multiplier covers serialization metadata and alignment.
+    raw_bytes = positions * (d_in * 2 + 8) + windows * 2
+    return int(raw_bytes * STORAGE_SAFETY_FACTOR)
+
+
+def human_gib(size: int) -> str:
+    return f"{size / 2**30:.1f} GiB"
+
+
+def ensure_new_output(output_dir: Path) -> None:
+    artifacts = []
+    manifest = output_dir / "manifest.json"
+    if manifest.exists():
+        artifacts.append(manifest)
+    for split in ("train", "validation"):
+        directory = output_dir / split
+        if directory.exists():
+            artifacts.extend(directory.glob("shard-*.pt"))
+            artifacts.extend(directory.glob("shard-*.pt.partial"))
+    if artifacts:
+        sample = ", ".join(str(path) for path in artifacts[:3])
+        raise FileExistsError(
+            f"{output_dir} already contains extraction artifacts ({sample}). "
+            "Use a new --output-dir, or remove the failed extraction directory "
+            "after verifying it is no longer needed."
+        )
+
+
+def check_disk_capacity(
+    output_dir: Path,
+    estimated_bytes: int,
+    reserve_gib: float,
+) -> None:
+    free_bytes = shutil.disk_usage(output_dir).free
+    reserve_bytes = int(reserve_gib * 2**30)
+    print(
+        "activation storage preflight: "
+        f"estimated={human_gib(estimated_bytes)}, "
+        f"free={human_gib(free_bytes)}, reserve={reserve_gib:.1f} GiB"
+    )
+    if free_bytes < estimated_bytes + reserve_bytes:
+        raise RuntimeError(
+            "Insufficient filesystem space for the requested activation "
+            f"shards: need approximately {human_gib(estimated_bytes)} plus "
+            f"{reserve_gib:.1f} GiB reserve, but {human_gib(free_bytes)} is "
+            "free. Reduce the position/window budget, choose another "
+            "--output-dir, or pass --skip-disk-space-check only after "
+            "checking filesystem and user quota."
+        )
 
 
 def pile_set_name(row: dict[str, Any]) -> str:
@@ -138,14 +220,28 @@ class ShardWriter:
         output_sources, source_ids = source_ids[:count], source_ids[count:]
         shard_index = len(self.shards)
         relative = f"{self.split}/shard-{shard_index:05d}.pt"
-        torch.save(
-            {
-                "activations": output_x.contiguous(),
-                "token_ids": output_tokens.contiguous(),
-                "source_ids": output_sources.contiguous(),
-            },
-            self.directory / f"shard-{shard_index:05d}.pt",
-        )
+        output_path = self.directory / f"shard-{shard_index:05d}.pt"
+        partial_path = output_path.with_suffix(".pt.partial")
+        try:
+            torch.save(
+                {
+                    "activations": output_x.contiguous(),
+                    "token_ids": output_tokens.contiguous(),
+                    "source_ids": output_sources.contiguous(),
+                },
+                partial_path,
+            )
+            partial_path.replace(output_path)
+        except Exception as error:
+            partial_path.unlink(missing_ok=True)
+            try:
+                free = human_gib(shutil.disk_usage(self.directory).free)
+            except OSError:
+                free = "unknown"
+            raise RuntimeError(
+                f"Failed to atomically write {output_path}; filesystem free "
+                f"space is {free}. Check both disk space and user quota."
+            ) from error
         self.shards.append(relative)
         self.written += count
         self.buffer_x = [activations] if len(activations) else []
@@ -192,13 +288,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--text-key", default="text")
-    parser.add_argument("--train-windows", type=int, default=524288)
-    parser.add_argument("--validation-windows", type=int, default=16384)
+    parser.add_argument(
+        "--train-windows",
+        type=int,
+        help=(
+            "Explicit train window count. By default this is derived from "
+            "--train-positions so storage does not grow with window size."
+        ),
+    )
+    parser.add_argument(
+        "--validation-windows",
+        type=int,
+        help=(
+            "Explicit validation window count. By default this is derived "
+            "from --validation-positions."
+        ),
+    )
+    parser.add_argument(
+        "--train-positions",
+        type=int,
+        default=DEFAULT_TRAIN_POSITIONS,
+    )
+    parser.add_argument(
+        "--validation-positions",
+        type=int,
+        default=DEFAULT_VALIDATION_POSITIONS,
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.03)
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--sequence-length", type=int, default=320)
     parser.add_argument("--max-document-tokens", type=int, default=16384)
-    parser.add_argument("--shard-windows", type=int, default=4096)
+    parser.add_argument(
+        "--shard-windows",
+        type=int,
+        help=(
+            "Explicit windows per shard. By default this is derived from "
+            "--shard-positions to bound shard size and host RAM."
+        ),
+    )
+    parser.add_argument(
+        "--shard-positions",
+        type=int,
+        default=DEFAULT_SHARD_POSITIONS,
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=0)
@@ -221,6 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--revision")
     parser.add_argument("--use-safetensors", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--disk-reserve-gib", type=float, default=5.0)
+    parser.add_argument("--skip-disk-space-check", action="store_true")
     return parser
 
 
@@ -231,12 +365,38 @@ def main() -> None:
     if args.sequence_length % args.window_size:
         raise ValueError("--sequence-length must be divisible by --window-size")
     if min(
+        args.train_positions,
+        args.validation_positions,
+        args.shard_positions,
+    ) < 1:
+        raise ValueError("position budgets must be positive")
+    explicit_train_windows = args.train_windows
+    explicit_validation_windows = args.validation_windows
+    explicit_shard_windows = args.shard_windows
+    args.train_windows = resolve_window_count(
+        args.train_windows,
+        args.train_positions,
+        args.window_size,
+    )
+    args.validation_windows = resolve_window_count(
+        args.validation_windows,
+        args.validation_positions,
+        args.window_size,
+    )
+    args.shard_windows = resolve_window_count(
+        args.shard_windows,
+        args.shard_positions,
+        args.window_size,
+    )
+    if min(
         args.train_windows,
         args.validation_windows,
         args.shard_windows,
         args.batch_size,
     ) < 1:
         raise ValueError("window counts, shard size, and batch size must be positive")
+    if args.disk_reserve_gib < 0:
+        raise ValueError("--disk-reserve-gib cannot be negative")
     if not 0.0 < args.validation_fraction < 0.5:
         raise ValueError("--validation-fraction must lie in (0, 0.5)")
 
@@ -250,6 +410,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_new_output(output_dir)
     stream = load_dataset(
         args.dataset,
         args.dataset_config,
@@ -270,6 +431,25 @@ def main() -> None:
         args.revision,
         use_safetensors=True if args.use_safetensors else None,
     )
+    d_in = int(model.get_input_embeddings().weight.shape[-1])
+    estimated_storage = estimate_storage_bytes(
+        args.train_windows + args.validation_windows,
+        args.window_size,
+        d_in,
+    )
+    print(
+        "resolved extraction budget: "
+        f"window_size={args.window_size}, "
+        f"train={args.train_windows:,} windows, "
+        f"validation={args.validation_windows:,} windows, "
+        f"shard={args.shard_windows:,} windows"
+    )
+    if not args.skip_disk_space_check:
+        check_disk_capacity(
+            output_dir,
+            estimated_storage,
+            args.disk_reserve_gib,
+        )
     configure_accelerator(input_device(model))
     layer_path, layer = get_layer(model, args.layer)
     captured: dict[str, torch.Tensor] = {}
@@ -466,6 +646,19 @@ def main() -> None:
         "sequence_length": args.sequence_length,
         "d_in": int(train_writer.sum.numel()),
         "storage_dtype": "bfloat16",
+        "storage": {
+            "estimated_bytes": estimated_storage,
+            "safety_factor": STORAGE_SAFETY_FACTOR,
+            "disk_reserve_gib": args.disk_reserve_gib,
+        },
+        "sampling_budget": {
+            "train_positions": args.train_positions,
+            "validation_positions": args.validation_positions,
+            "shard_positions": args.shard_positions,
+            "train_windows_explicit": explicit_train_windows,
+            "validation_windows_explicit": explicit_validation_windows,
+            "shard_windows_explicit": explicit_shard_windows,
+        },
         "normalization": {
             "mean": mean.float().tolist(),
             "scalar_rms": scale,

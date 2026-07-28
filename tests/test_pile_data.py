@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 
+import pytest
 import torch
 
 from shared_residual.activation_store import (
@@ -9,10 +11,16 @@ from shared_residual.activation_store import (
     validation_batches,
 )
 from shared_residual.pile_extract import (
+    DEFAULT_SHARD_POSITIONS,
+    DEFAULT_TRAIN_POSITIONS,
+    DEFAULT_VALIDATION_POSITIONS,
     PILE_MIXTURE_WEIGHTS,
+    ShardWriter,
     build_parser,
     document_split,
+    estimate_storage_bytes,
     pile_set_name,
+    resolve_window_count,
 )
 
 
@@ -121,6 +129,64 @@ def test_pile_parser_accepts_nondefault_window_size() -> None:
         ]
     )
     assert args.window_size == 16
+    assert args.train_windows is None
+    assert args.validation_windows is None
+    assert args.shard_windows is None
+
+
+def test_position_budget_keeps_window_128_storage_bounded() -> None:
+    train = resolve_window_count(None, DEFAULT_TRAIN_POSITIONS, 128)
+    validation = resolve_window_count(
+        None,
+        DEFAULT_VALIDATION_POSITIONS,
+        128,
+    )
+    shard = resolve_window_count(None, DEFAULT_SHARD_POSITIONS, 128)
+    assert train == 40_960
+    assert validation == 1_280
+    assert shard == 320
+    window_10_bytes = estimate_storage_bytes(
+        524_288 + 16_384,
+        10,
+        4096,
+    )
+    window_128_bytes = estimate_storage_bytes(
+        train + validation,
+        128,
+        4096,
+    )
+    assert abs(window_128_bytes - window_10_bytes) < 2**21
+    assert 40 * 2**30 < window_128_bytes < 45 * 2**30
+
+
+def test_explicit_window_count_overrides_position_budget() -> None:
+    assert resolve_window_count(123, DEFAULT_TRAIN_POSITIONS, 128) == 123
+
+
+def test_shard_write_failure_leaves_no_corrupt_final_file(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    writer = ShardWriter(
+        tmp_path,
+        split="train",
+        shard_windows=1,
+        target_windows=1,
+    )
+
+    def fail_after_partial_write(_payload, path) -> None:
+        Path(path).write_bytes(b"partial")
+        raise OSError("disk quota exceeded")
+
+    monkeypatch.setattr(torch, "save", fail_after_partial_write)
+    with pytest.raises(RuntimeError, match="disk space and user quota"):
+        writer.append(
+            torch.zeros(1, 2, 4),
+            torch.zeros(1, 2, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+            ["test"],
+        )
+    assert not list((tmp_path / "train").iterdir())
 
 
 def test_document_split_is_deterministic_and_nontrivial() -> None:

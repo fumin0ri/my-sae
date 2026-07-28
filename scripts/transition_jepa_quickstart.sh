@@ -37,7 +37,11 @@ STANDARD_STEPS="${STANDARD_STEPS:-12000}"
 FORECAST_STEPS="${FORECAST_STEPS:-8000}"
 PREDICTOR_WARMUP_STEPS="${PREDICTOR_WARMUP_STEPS:-1000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+DEFAULT_WINDOW_BATCH_SIZE=$((320 / WINDOW_SIZE))
+if (( DEFAULT_WINDOW_BATCH_SIZE < 1 )); then
+  DEFAULT_WINDOW_BATCH_SIZE=1
+fi
+BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_WINDOW_BATCH_SIZE}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
 PILE_EXTRACT_BATCH_SIZE="${PILE_EXTRACT_BATCH_SIZE:-8}"
 DEFAULT_WINDOWS_PER_SEQUENCE=$((320 / WINDOW_SIZE))
@@ -49,16 +53,21 @@ if (( PILE_SEQUENCE_LENGTH % WINDOW_SIZE != 0 )); then
   echo "PILE_SEQUENCE_LENGTH must be divisible by WINDOW_SIZE" >&2
   exit 2
 fi
-PILE_TRAIN_WINDOWS="${PILE_TRAIN_WINDOWS:-524288}"
-PILE_VALIDATION_WINDOWS="${PILE_VALIDATION_WINDOWS:-16384}"
-PILE_SHARD_WINDOWS="${PILE_SHARD_WINDOWS:-4096}"
+PILE_TRAIN_POSITIONS="${PILE_TRAIN_POSITIONS:-5242880}"
+PILE_VALIDATION_POSITIONS="${PILE_VALIDATION_POSITIONS:-163840}"
+PILE_SHARD_POSITIONS="${PILE_SHARD_POSITIONS:-40960}"
+PILE_TRAIN_WINDOWS="${PILE_TRAIN_WINDOWS:-}"
+PILE_VALIDATION_WINDOWS="${PILE_VALIDATION_WINDOWS:-}"
+PILE_SHARD_WINDOWS="${PILE_SHARD_WINDOWS:-}"
+PILE_DISK_RESERVE_GIB="${PILE_DISK_RESERVE_GIB:-5}"
+PILE_SKIP_DISK_SPACE_CHECK="${PILE_SKIP_DISK_SPACE_CHECK:-0}"
 PILE_DATASET="${PILE_DATASET:-EleutherAI/the_pile_deduplicated}"
 PILE_DATASET_CONFIG="${PILE_DATASET_CONFIG:-default}"
 PILE_DATASET_REVISION="${PILE_DATASET_REVISION:-fcbfcfde4222cbb1acd1d33bad0be250ee14b1bb}"
 PILE_DATASET_TRUST_REMOTE_CODE="${PILE_DATASET_TRUST_REMOTE_CODE:-0}"
 PILE_REQUIRE_ALL_DOMAINS="${PILE_REQUIRE_ALL_DOMAINS:-0}"
 EVAL_EXTRACT_BATCH_SIZE="${EVAL_EXTRACT_BATCH_SIZE:-8}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-$DEFAULT_WINDOW_BATCH_SIZE}"
 MMLU_MAX_QUESTIONS="${MMLU_MAX_QUESTIONS:-0}"
 MMLU_DATASET="${MMLU_DATASET:-cais/mmlu}"
 MMLU_DATASET_CONFIG="${MMLU_DATASET_CONFIG:-all}"
@@ -79,6 +88,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
+echo "Window config: W=$WINDOW_SIZE, train batch=$BATCH_SIZE windows, evaluation batch=$EVAL_BATCH_SIZE windows"
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then
   MODEL_LOAD_ARGS+=(--revision "$REVISION")
@@ -106,6 +116,24 @@ fi
 if [[ "$PILE_REQUIRE_ALL_DOMAINS" == "1" ]]; then
   PILE_DATA_ARGS+=(--require-all-domains)
 fi
+PILE_BUDGET_ARGS=(
+  --train-positions "$PILE_TRAIN_POSITIONS"
+  --validation-positions "$PILE_VALIDATION_POSITIONS"
+  --shard-positions "$PILE_SHARD_POSITIONS"
+  --disk-reserve-gib "$PILE_DISK_RESERVE_GIB"
+)
+if [[ -n "$PILE_TRAIN_WINDOWS" ]]; then
+  PILE_BUDGET_ARGS+=(--train-windows "$PILE_TRAIN_WINDOWS")
+fi
+if [[ -n "$PILE_VALIDATION_WINDOWS" ]]; then
+  PILE_BUDGET_ARGS+=(--validation-windows "$PILE_VALIDATION_WINDOWS")
+fi
+if [[ -n "$PILE_SHARD_WINDOWS" ]]; then
+  PILE_BUDGET_ARGS+=(--shard-windows "$PILE_SHARD_WINDOWS")
+fi
+if [[ "$PILE_SKIP_DISK_SPACE_CHECK" == "1" ]]; then
+  PILE_BUDGET_ARGS+=(--skip-disk-space-check)
+fi
 if (( START_STAGE <= 1 )); then
   echo "[1/11] Stream the official Pile mixture and extract residual shards"
   sr-extract-pile \
@@ -116,9 +144,7 @@ if (( START_STAGE <= 1 )); then
     --hook-point post \
     --window-size "$WINDOW_SIZE" \
     --sequence-length "$PILE_SEQUENCE_LENGTH" \
-    --train-windows "$PILE_TRAIN_WINDOWS" \
-    --validation-windows "$PILE_VALIDATION_WINDOWS" \
-    --shard-windows "$PILE_SHARD_WINDOWS" \
+    "${PILE_BUDGET_ARGS[@]}" \
     --batch-size "$PILE_EXTRACT_BATCH_SIZE" \
     --dtype bfloat16 \
     --seed "$SEED"

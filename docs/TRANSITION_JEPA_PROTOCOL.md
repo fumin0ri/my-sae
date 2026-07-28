@@ -57,20 +57,26 @@ The default corpus is the `default` configuration of
 `EleutherAI/the_pile_deduplicated`, pinned to an immutable dataset revision and
 streamed from Parquet. It inherits the upstream preweighted 22-component Pile
 mixture and receives an additional finite shuffle buffer. The confirmatory
-default extracts 524,288 train windows and 16,384 validation windows. With the
-default `W=10`, this is 5,242,880 training residual positions.
+default fixes the budget at 5,242,880 train and 163,840 validation residual
+positions. At `W=10` these become 524,288 and 16,384 windows; at `W=128` they
+become 40,960 and 1,280 windows. Keeping the position budget fixed prevents
+activation storage and extraction compute from scaling linearly with W.
 
 Every source document is assigned wholly to train or validation by a
-deterministic hash. Activations are stored as BF16 shards. The manifest records
-the observed counts for all 22 Pile components, normalization statistics,
-model revision, layer, and a data fingerprint. The public deduplicated Parquet
-schema contains text but not per-document component labels, so the manifest
-explicitly marks source metadata unavailable rather than reporting inferred
-component counts. Documents shorter than the model extraction sequence are
-right-padded and only their valid W-token windows are retained, avoiding a
-systematic loss of short-document components. The legacy labelled release
-remains an opt-in audit path. A run is invalid if any training condition uses a
-different fingerprint.
+deterministic hash. Activations are stored as BF16 shards with a fixed
+40,960-position default shard budget, so one Pythia-6.9B shard remains about
+320 MiB for every W. Writes use a same-filesystem partial file followed by an
+atomic rename. A capacity preflight includes serialization overhead and a
+5 GiB free-space reserve. The manifest records the observed counts for all 22
+Pile components, normalization statistics, model revision, layer, resolved
+budgets, storage estimate, and a data fingerprint. The public deduplicated
+Parquet schema contains text but not per-document component labels, so the
+manifest explicitly marks source metadata unavailable rather than reporting
+inferred component counts. Documents shorter than the model extraction
+sequence are right-padded and only their valid W-token windows are retained,
+avoiding a systematic loss of short-document components. The legacy labelled
+release remains an opt-in audit path. A run is invalid if any training
+condition uses a different fingerprint.
 
 ## Objective
 
