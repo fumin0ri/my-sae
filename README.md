@@ -1,6 +1,6 @@
 # Offset-conditioned Transition JEPA-SAE
 
-Frozen autoregressive LLMの10-token residual trajectoryから、現在位置で
+Frozen autoregressive LLMの可変長residual trajectoryから、現在位置で
 すでに予測可能な未来の内部状態を疎な辞書として抽出する研究コードです。
 SAEとpredictorの学習にはThe Pileの公式22-subcorpus mixtureを使い、
 MMLUは学習に混ぜずlocked評価だけに使います。
@@ -10,10 +10,10 @@ h₀ ─ online Top-K SAE ─ z₀ ─┐
                               ├─ offset-conditioned MLP ─ softplus ─ ẑₖ
 offset embedding(k) ──────────┘
 
-hₖ ─ EMA target SAE ─ stopgrad(zₖ),  k = 1,...,9
+hₖ ─ EMA target SAE ─ stopgrad(zₖ),  k = 1,...,W-1
 ```
 
-`z₀`とoffset `k`だけから、`z₁...z₉`を個別に予測します。targetの平均化や
+`z₀`とoffset `k`だけから、`z₁...z_{W-1}`を個別に予測します。targetの平均化や
 Transformer predictorは使いません。主張する対象は完全な未来状態ではなく、
 データ分布の下で`z₀`から予測可能な成分です。
 
@@ -59,6 +59,7 @@ bash scripts/transition_jepa_quickstart.sh
 | SAE dictionary | 32,768 features |
 | sparsity | Top-K 64 |
 | predictor | width 512, offset-conditioned MLP |
+| residual window | 10 positions（`WINDOW_SIZE`で変更可能） |
 | Pile train sample | 524,288 windows = 5,242,880 token positions |
 | Pile validation | 16,384 windows |
 | activation storage | BF16 shards、約40 GiB（約43 GB） |
@@ -93,6 +94,20 @@ EVAL_EXTRACT_BATCH_SIZE=32 \
 RUN_CAUSAL=0 \
 bash scripts/transition_jepa_quickstart.sh
 ```
+
+## Window size
+
+既定値は10ですが、2以上の任意のwindow lengthへ変更できます。Pile extraction、
+standard SAE、JEPA predictor、MMLU評価、causal intervention、可視化のすべてに
+同じ値が伝播します。
+
+```bash
+WINDOW_SIZE=16 bash scripts/transition_jepa_quickstart.sh
+```
+
+`PILE_SEQUENCE_LENGTH`を明示する場合は`WINDOW_SIZE`の倍数にしてください。
+省略時は約320 tokenを超えない最大の倍数へ自動調整されます。異なるwindow
+sizeのrunは別の`RUN_DIR`へ保存することを推奨します。
 
 ## The Pile training data
 
@@ -146,7 +161,7 @@ The Pileにはsubcorpusごとに異なるライセンスと利用条件があり
 - `k_only`: `z₀`を遮断し、offsetだけから予測
 - shuffled context: locked testで別MMLU questionの`z₀`へ交換
 
-online SAEは10位置すべてを再構成します。EMA target encoderはjoint条件だけで
+online SAEはwindow内の全位置を再構成します。EMA target encoderはjoint条件だけで
 更新されます。predictor出力は学習時にはdense non-negative softplusとし、
 support評価・residual decoding・因果介入でだけTop-Kを適用します。
 
@@ -166,7 +181,7 @@ L = L_reconstruction
 
 Pileと独立なMMLU question-grouped locked testで次を出力します。
 
-- offset 1...9のcode cosine、normalized MSE、support precision/recall/Jaccard
+- offset 1...`WINDOW_SIZE-1`のcode cosine、normalized MSE、support precision/recall/Jaccard
 - true-context minus shuffled-context
 - joint minus fixedのquestion-group bootstrap 95% CI
 - residual prediction FVUとinnovation energy

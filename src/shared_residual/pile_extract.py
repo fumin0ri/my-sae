@@ -226,8 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.window_size != 10:
-        raise ValueError("transition JEPA requires --window-size 10")
+    if args.window_size < 2:
+        raise ValueError("--window-size must be at least 2")
     if args.sequence_length % args.window_size:
         raise ValueError("--sequence-length must be divisible by --window-size")
     if min(

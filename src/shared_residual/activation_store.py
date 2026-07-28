@@ -17,8 +17,8 @@ def load_activation_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != "shared-residual-activation-shards-v1":
         raise ValueError(f"unsupported activation manifest: {manifest_path}")
-    if manifest["window_size"] != 10:
-        raise ValueError("transition JEPA requires ten-token activation windows")
+    if int(manifest["window_size"]) < 2:
+        raise ValueError("transition JEPA requires window_size >= 2")
     for split in ("train", "validation"):
         if not manifest[split]["shards"]:
             raise ValueError(f"activation manifest has no {split} shards")
@@ -66,11 +66,14 @@ def shard_paths(
     return [root / relative for relative in manifest[split]["shards"]]
 
 
-def load_shard(path: Path) -> torch.Tensor:
+def load_shard(path: Path, window_size: int) -> torch.Tensor:
     value = torch_load(path)
     activations = value["activations"] if isinstance(value, dict) else value
-    if activations.ndim != 3 or activations.shape[1] != 10:
-        raise ValueError(f"invalid activation shard shape at {path}")
+    if activations.ndim != 3 or activations.shape[1] != window_size:
+        raise ValueError(
+            f"invalid activation shard shape at {path}; expected "
+            f"[n, {window_size}, d_in]"
+        )
     return activations
 
 
@@ -86,6 +89,7 @@ class ShuffledShardBatches:
         seed: int,
     ):
         self.paths = shard_paths(root, manifest, split)
+        self.window_size = int(manifest["window_size"])
         self.batch_size = batch_size
         self.generator = torch.Generator().manual_seed(seed)
         self.path_order: list[int] = []
@@ -108,7 +112,7 @@ class ShuffledShardBatches:
             self.epoch += 1
         path = self.paths[self.path_order[self.path_position]]
         self.path_position += 1
-        self.current = load_shard(path)
+        self.current = load_shard(path, self.window_size)
         self.row_order = torch.randperm(
             len(self.current),
             generator=self.generator,
@@ -145,7 +149,7 @@ def validation_batches(
 ) -> Iterator[torch.Tensor]:
     emitted = 0
     for path in shard_paths(root, manifest, "validation"):
-        shard = load_shard(path)
+        shard = load_shard(path, int(manifest["window_size"]))
         for start in range(0, len(shard), batch_size):
             yield shard[start : start + batch_size]
             emitted += 1

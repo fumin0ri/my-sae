@@ -84,6 +84,7 @@ def training_plot(run_dir: Path, figures: Path) -> None:
 
 def offset_plot(report: dict[str, Any], figures: Path) -> None:
     curves = report["locked_test_offset_curve"]
+    all_offsets = [row["offset"] for row in curves["joint"]]
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.5))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
@@ -121,7 +122,7 @@ def offset_plot(report: dict[str, Any], figures: Path) -> None:
     axes[1].set_title("Does the matching z₀ matter?")
     axes[1].set_ylabel("True-context minus shuffled cosine")
     for axis in axes:
-        axis.set_xticks(range(1, 10))
+        axis.set_xticks(all_offsets)
         axis.set_xlabel("Future offset k")
         axis.grid(alpha=0.2)
         axis.legend(frameon=False)
@@ -131,6 +132,7 @@ def offset_plot(report: dict[str, Any], figures: Path) -> None:
 
 def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
     curves = report["locked_test_offset_curve"]
+    all_offsets = [row["offset"] for row in curves["joint"]]
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.2))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
@@ -167,7 +169,7 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
     axes[2].set_title("Unforecastable residual")
     axes[2].set_ylabel("Innovation / target energy")
     for axis in axes:
-        axis.set_xticks(range(1, 10))
+        axis.set_xticks(all_offsets)
         axis.set_xlabel("Future offset k")
         axis.grid(alpha=0.2)
         axis.legend(frameon=False)
@@ -177,10 +179,15 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
 
 def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
     probes = report["locked_test_mmlu_probes"]
+    final_offset = report["architecture"]["final_offset"]
     order = [
         ("Joint z0", "joint_z0", COLORS["joint"]),
         ("Standard SAE z0", "standard_sae_z0", COLORS["fixed"]),
-        ("Joint predicted z9", "joint_predicted_z9", "#0f766e"),
+        (
+            f"Joint predicted z{final_offset}",
+            "joint_predicted_final",
+            "#0f766e",
+        ),
         ("Raw h0", "raw_h0", "#334155"),
     ]
     titles = {
@@ -277,6 +284,7 @@ def mmlu_model_plot(report: dict[str, Any], figures: Path) -> None:
 
 def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     bundle = torch_load(run_dir / "analysis" / "transition_visualization.pt")
+    final_offset = int(bundle["final_offset"])
     embedding = bundle["embedding"].float().numpy()
     labels = np.asarray(bundle["context_labels"])
     fig, ax = plt.subplots(figsize=(7.3, 5.2))
@@ -315,7 +323,7 @@ def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     ax.set_yticks(range(len(bundle["feature_ids"])), bundle["feature_ids"])
     ax.set_ylabel("Forecastable SAE feature")
     ax.set_xlabel("Locked-test MMLU questions (sorted by correct answer)")
-    ax.set_title("Top offset-9 forecast features")
+    ax.set_title(f"Top offset-{final_offset} forecast features")
     boundaries = (
         np.flatnonzero(
             semantic_labels[order][1:] != semantic_labels[order][:-1]
@@ -424,6 +432,7 @@ def write_html(
     k_only_last = report["locked_test_offset_curve"]["k_only"][-1]
     mmlu = report["benchmark"]["base_model_accuracy"]
     probes = report["locked_test_mmlu_probes"]
+    final_offset = report["architecture"]["final_offset"]
     figures = [
         ("Training dynamics", "figures/training-curves.png"),
         ("Offset forecast and context gain", "figures/offset-forecast.png"),
@@ -469,14 +478,14 @@ code {{ color:inherit; }}
 <div class="metrics">
 <div class="metric"><span>Joint − fixed cosine</span><strong>{fmt(comparison['mean'])}</strong></div>
 <div class="metric"><span>Group-bootstrap 95% CI</span><strong>{fmt(comparison['ci95_low'])} to {fmt(comparison['ci95_high'])}</strong></div>
-<div class="metric"><span>Joint offset-9 cosine</span><strong>{fmt(joint_last['code_cosine'])}</strong></div>
-<div class="metric"><span>Fixed offset-9 cosine</span><strong>{fmt(fixed_last['code_cosine'])}</strong></div>
-<div class="metric"><span>k-only offset-9 cosine</span><strong>{fmt(k_only_last['code_cosine'])}</strong></div>
-<div class="metric"><span>Joint offset-9 context gain</span><strong>{fmt(joint_last['context_gain']['mean'])}</strong></div>
+<div class="metric"><span>Joint offset-{final_offset} cosine</span><strong>{fmt(joint_last['code_cosine'])}</strong></div>
+<div class="metric"><span>Fixed offset-{final_offset} cosine</span><strong>{fmt(fixed_last['code_cosine'])}</strong></div>
+<div class="metric"><span>k-only offset-{final_offset} cosine</span><strong>{fmt(k_only_last['code_cosine'])}</strong></div>
+<div class="metric"><span>Joint offset-{final_offset} context gain</span><strong>{fmt(joint_last['context_gain']['mean'])}</strong></div>
 <div class="metric"><span>Base LLM MMLU answer accuracy</span><strong>{fmt(mmlu['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z9 semantics</span><strong>{fmt(probes['semantics']['joint_predicted_z9']['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z9 context</span><strong>{fmt(probes['context']['joint_predicted_z9']['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z9 syntax</span><strong>{fmt(probes['syntax']['joint_predicted_z9']['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z{final_offset} semantics</span><strong>{fmt(probes['semantics']['joint_predicted_final']['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z{final_offset} context</span><strong>{fmt(probes['context']['joint_predicted_final']['accuracy'])}</strong></div>
+<div class="metric"><span>Joint predicted z{final_offset} syntax</span><strong>{fmt(probes['syntax']['joint_predicted_final']['accuracy'])}</strong></div>
 </div>
 {figure_html}
 {causal_html}

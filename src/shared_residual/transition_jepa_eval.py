@@ -401,6 +401,11 @@ def main() -> None:
     reference_cfg: TransitionJEPAConfig | None = None
     for method_index, (method, path) in enumerate(paths.items()):
         model, checkpoint = load_model(path, device)
+        if x.shape[1] != model.cfg.window_size:
+            raise ValueError(
+                "evaluation activation window does not match checkpoint: "
+                f"activations={x.shape[1]}, checkpoint={model.cfg.window_size}"
+            )
         if reference_fingerprint is None:
             reference_fingerprint = checkpoint["data_fingerprint"]
             reference_cfg = model.cfg
@@ -474,9 +479,9 @@ def main() -> None:
     representations: dict[str, torch.Tensor] = {
         "joint_z0": probe_contexts["joint"].float(),
         "standard_sae_z0": probe_contexts["fixed"].float(),
-        "joint_predicted_z9": probe_predictions["joint"].float(),
-        "fixed_predicted_z9": probe_predictions["fixed"].float(),
-        "k_only_predicted_z9": probe_predictions["k_only"].float(),
+        "joint_predicted_final": probe_predictions["joint"].float(),
+        "fixed_predicted_final": probe_predictions["fixed"].float(),
+        "k_only_predicted_final": probe_predictions["k_only"].float(),
         "raw_h0": select_probe_dimensions(
             x[:, 0],
             development_indices,
@@ -526,8 +531,12 @@ def main() -> None:
         ),
         "architecture": {
             "window_size": reference_cfg.window_size,
+            "final_offset": reference_cfg.window_size - 1,
             "context": "online Top-K SAE code at h0",
-            "targets": "stop-gradient EMA SAE codes at h1...h9",
+            "targets": (
+                "stop-gradient EMA SAE codes at h1..."
+                f"h{reference_cfg.window_size - 1}"
+            ),
             "predictor": "offset-conditioned MLP",
             "target_aggregation": "none",
         },
@@ -563,14 +572,17 @@ def main() -> None:
             "standard_sae_z0": collapse_diagnostics(
                 test_contexts["fixed"].float()
             ),
-            "joint_predicted_z9_topk": collapse_diagnostics(
+            "joint_predicted_final_topk": collapse_diagnostics(
                 topk_relu(
                     joint_final_prediction.float(),
                     reference_cfg.k,
                 )
             ),
         },
-        "top_forecast_features_at_offset_9": features,
+        "top_forecast_features": {
+            "offset": reference_cfg.window_size - 1,
+            "features": features,
+        },
         "checkpoint_settings": checkpoints,
         "pile_training_data_fingerprint": reference_fingerprint,
     }
@@ -656,6 +668,8 @@ def main() -> None:
     )
     torch.save(
         {
+            "window_size": reference_cfg.window_size,
+            "final_offset": reference_cfg.window_size - 1,
             "embedding": pca_embedding(
                 test_contexts["joint"].float()
             ),

@@ -16,17 +16,21 @@ from shared_residual.pile_extract import (
 )
 
 
-def make_manifest(tmp_path):
+def make_manifest(tmp_path, window_size=7):
     for split, count in (("train", 7), ("validation", 5)):
         directory = tmp_path / split
         directory.mkdir()
         torch.save(
             {
                 "activations": torch.arange(
-                    count * 10 * 4,
+                    count * window_size * 4,
                     dtype=torch.float32,
-                ).reshape(count, 10, 4),
-                "token_ids": torch.zeros(count, 10, dtype=torch.long),
+                ).reshape(count, window_size, 4),
+                "token_ids": torch.zeros(
+                    count,
+                    window_size,
+                    dtype=torch.long,
+                ),
                 "source_ids": torch.zeros(count, dtype=torch.int16),
             },
             directory / "shard-00000.pt",
@@ -41,7 +45,7 @@ def make_manifest(tmp_path):
         "layer": 1,
         "layer_path": "layers.1",
         "hook_point": "post",
-        "window_size": 10,
+        "window_size": window_size,
         "d_in": 4,
         "seed": 3,
         "normalization": {"mean": [0.0] * 4, "scalar_rms": 1.0},
@@ -76,8 +80,8 @@ def test_sharded_batches_cycle_without_loading_corpus_at_once(tmp_path) -> None:
             seed=9,
         )
     )
-    assert next(iterator).shape == (4, 10, 4)
-    assert next(iterator).shape == (4, 10, 4)
+    assert next(iterator).shape == (4, 7, 4)
+    assert next(iterator).shape == (4, 7, 4)
     held_out = list(validation_batches(root, manifest, 3, 2))
     assert [len(batch) for batch in held_out] == [3, 2]
 
@@ -99,6 +103,24 @@ def test_deduplicated_pile_uses_real_hugging_face_config() -> None:
     )
     assert args.dataset == "EleutherAI/the_pile_deduplicated"
     assert args.dataset_config == "default"
+
+
+def test_pile_parser_accepts_nondefault_window_size() -> None:
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "test",
+            "--output-dir",
+            "out",
+            "--layer",
+            "1",
+            "--window-size",
+            "16",
+            "--sequence-length",
+            "320",
+        ]
+    )
+    assert args.window_size == 16
 
 
 def test_document_split_is_deterministic_and_nontrivial() -> None:

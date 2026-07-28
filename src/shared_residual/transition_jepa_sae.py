@@ -719,11 +719,18 @@ def main() -> None:
                 "not a deterministic transition without intervening tokens."
             ),
             "architecture": {
+                "window_size": cfg.window_size,
+                "final_offset": cfg.window_size - 1,
                 "context": "Top-K online SAE code at h0",
-                "targets": "stop-gradient EMA SAE codes at h1...h9",
+                "targets": (
+                    "stop-gradient EMA SAE codes at h1..."
+                    f"h{cfg.window_size - 1}"
+                ),
                 "predictor": "offset-conditioned MLP with dense softplus output",
                 "target_aggregation": "none",
-                "sae_reconstruction_positions": "all ten positions",
+                "sae_reconstruction_positions": (
+                    f"all {cfg.window_size} positions"
+                ),
                 "normalization": "dataset mean and scalar RMS",
             },
             "optimizer_budget": {

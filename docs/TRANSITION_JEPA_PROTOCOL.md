@@ -6,15 +6,15 @@ Can joint latent forecasting reshape an SAE dictionary so that a sparse code
 at the present position exposes more of the future residual trajectory's
 forecastable state than a standard SAE dictionary?
 
-For a prespecified ten-token window:
+For a prespecified window of `W >= 2` token positions:
 
 ```text
 z0_x = TopK(ReLU(E_online(normalize(h0))))
 zk_y = stopgrad(TopK(ReLU(E_EMA(normalize(hk)))))
-z_hat_k = softplus(P(z0_x, embedding(k))), k = 1,...,9
+z_hat_k = softplus(P(z0_x, embedding(k))), k = 1,...,W-1
 ```
 
-The online SAE reconstructs all ten positions. The EMA target encoder is
+The online SAE reconstructs all W positions. The EMA target encoder is
 initialized from the online encoder and updated only during joint training.
 No target representations are averaged.
 
@@ -36,7 +36,7 @@ unforecastable updates.
 
 1. Stream the official 22-component Pile mixture and extract disjoint
    document-level train/validation residual shards.
-2. Train one standard Top-K SAE on all ten positions of the Pile windows.
+2. Train one standard Top-K SAE on all W positions of the Pile windows.
 3. Copy its online encoder into the EMA target encoder.
 4. Initialize all forecasting conditions from this exact checkpoint and data
    fingerprint.
@@ -57,8 +57,8 @@ The default corpus is the `default` configuration of
 `EleutherAI/the_pile_deduplicated`, pinned to an immutable dataset revision and
 streamed from Parquet. It inherits the upstream preweighted 22-component Pile
 mixture and receives an additional finite shuffle buffer. The confirmatory
-default extracts 524,288 ten-token train windows (5,242,880 residual positions)
-and 16,384 validation windows.
+default extracts 524,288 train windows and 16,384 validation windows. With the
+default `W=10`, this is 5,242,880 training residual positions.
 
 Every source document is assigned wholly to train or validation by a
 deterministic hash. Activations are stored as BF16 shards. The manifest records
@@ -67,7 +67,7 @@ model revision, layer, and a data fingerprint. The public deduplicated Parquet
 schema contains text but not per-document component labels, so the manifest
 explicitly marks source metadata unavailable rather than reporting inferred
 component counts. Documents shorter than the model extraction sequence are
-right-padded and only their valid ten-token windows are retained, avoiding a
+right-padded and only their valid W-token windows are retained, avoiding a
 systematic loss of short-document components. The legacy labelled release
 remains an opt-in audit path. A run is invalid if any training condition uses a
 different fingerprint.
@@ -95,7 +95,8 @@ The primary comparison is:
 joint JEPA-SAE minus fixed standard-SAE predictor
 ```
 
-The statistic is the per-window mean target-code cosine across offsets 1...9,
+The statistic is the per-window mean target-code cosine across offsets
+1...W-1,
 with a question-group bootstrap 95% confidence interval.
 
 The joint claim requires all of the following:
@@ -118,7 +119,7 @@ Future extensions should add an intervening-token-conditioned transition model.
 
 ## Locked-test outcomes
 
-For each offset 1...9:
+For each offset 1...W-1:
 
 - target-code cosine and normalized MSE;
 - true-context minus shuffled-context cosine;

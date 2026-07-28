@@ -37,6 +37,26 @@ def load_transition_model(
     return model, checkpoint
 
 
+def resolve_offsets(
+    requested: tuple[int, ...] | None,
+    window_size: int,
+) -> tuple[int, ...]:
+    offsets = (
+        tuple(range(1, window_size))
+        if requested is None
+        else tuple(requested)
+    )
+    if (
+        not offsets
+        or min(offsets) < 1
+        or max(offsets) >= window_size
+    ):
+        raise ValueError(
+            f"--offsets must lie in [1, {window_size - 1}]"
+        )
+    return offsets
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Causally edit offset-conditioned forecastable SAE features"
@@ -52,7 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["patch", "ablate", "random_ablate"],
         default="patch",
     )
-    parser.add_argument("--offsets", type=parse_offsets, default=tuple(range(1, 10)))
+    parser.add_argument(
+        "--offsets",
+        type=parse_offsets,
+        default=None,
+        help=(
+            "Comma-separated offsets. By default, use every checkpoint "
+            "offset from 1 through window_size-1."
+        ),
+    )
     parser.add_argument("--feature-ids", type=parse_feature_ids, default=())
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--source-key", default="source_text")
@@ -85,8 +113,7 @@ def main() -> None:
     if checkpoint["train_args"].get("objective") != "joint":
         raise ValueError("causal intervention requires the joint JEPA-SAE checkpoint")
     width = jepa.cfg.window_size
-    if min(args.offsets) < 1 or max(args.offsets) >= width:
-        raise ValueError(f"--offsets must lie in [1, {width - 1}]")
+    args.offsets = resolve_offsets(args.offsets, width)
     source_cfg = checkpoint.get("source_config", {})
     del checkpoint
     mismatches = []

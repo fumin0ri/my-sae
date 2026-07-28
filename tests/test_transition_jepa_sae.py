@@ -14,13 +14,13 @@ from shared_residual.transition_jepa_sae import (
 )
 
 
-def make_model() -> tuple[TransitionJEPASAE, torch.Tensor]:
-    x = torch.randn(8, 10, 12)
+def make_model(window_size: int = 6) -> tuple[TransitionJEPASAE, torch.Tensor]:
+    x = torch.randn(8, window_size, 12)
     standard_cfg = StandardSAEConfig(
         d_in=12,
         d_sae=24,
         k=3,
-        window_size=10,
+        window_size=window_size,
     )
     standard = StandardSparseAutoencoder(standard_cfg)
     standard.initialize_from_data(x)
@@ -33,7 +33,7 @@ def make_model() -> tuple[TransitionJEPASAE, torch.Tensor]:
             d_in=12,
             d_sae=24,
             k=3,
-            window_size=10,
+            window_size=window_size,
             predictor_width=8,
         )
     )
@@ -46,8 +46,8 @@ def test_transition_jepa_predicts_each_offset_without_target_averaging() -> None
     outputs = model(x)
     assert outputs["reconstruction"].shape == x.shape
     assert outputs["context_code"].shape == (8, 24)
-    assert outputs["target_codes"].shape == (8, 9, 24)
-    assert outputs["predicted_codes"].shape == (8, 9, 24)
+    assert outputs["target_codes"].shape == (8, 5, 24)
+    assert outputs["predicted_codes"].shape == (8, 5, 24)
     assert outputs["context_state"].shape == (8, 8)
     assert torch.all(outputs["predicted_codes"] >= 0)
     assert torch.all(
@@ -77,7 +77,10 @@ def test_joint_loss_backpropagates_online_but_not_ema_encoder() -> None:
     )
     loss.backward()
     assert torch.isfinite(loss)
-    assert all(f"offset_{offset}_cosine" in metrics for offset in range(1, 10))
+    assert all(
+        f"offset_{offset}_cosine" in metrics
+        for offset in range(1, model.cfg.window_size)
+    )
     assert model.encoder.linear.weight.grad is not None
     assert model.transition_predictor.output.weight.grad is not None
     assert all(
