@@ -245,6 +245,25 @@ Pileと独立なMMLU question-grouped locked testで次を出力します。
 Δhₖ = D(TopK(P(z₀_source,k)) - TopK(P(z₀_target,k)))
 ```
 
+sourceとtargetの両方が`WINDOW_SIZE`以上の実tokenを持つpairだけを使います。
+既定では必要な128 pairの16倍（2,048候補）を決定論的に生成し、適格な先頭128
+pairをpatch・ablation・random対照で共通利用します。候補数は`PAIR_POOL_SIZE`、
+実行pair数は`PAIRS`で変更できます。
+
+旧runのstage 10で`prefix is shorter than checkpoint window`が出た場合、学習や
+stage 9をやり直す必要はありません。stage 2でpair poolだけ再生成してからstage
+10へ進みます。
+
+```bash
+WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
+START_STAGE=2 END_STAGE=2 \
+bash scripts/transition_jepa_quickstart.sh
+
+WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
+START_STAGE=10 \
+bash scripts/transition_jepa_quickstart.sh
+```
+
 MMLUは`cais/mmlu` commit
 `c30699e8356da336a370243923dbaf21066bb9fe`へ固定しています。既定ではtest
 14,042問から、人工paddingを避けるため実token長が`WINDOW_SIZE`以上のquestionを

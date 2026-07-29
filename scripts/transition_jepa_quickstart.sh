@@ -74,6 +74,17 @@ MMLU_DATASET_CONFIG="${MMLU_DATASET_CONFIG:-all}"
 MMLU_DATASET_REVISION="${MMLU_DATASET_REVISION:-c30699e8356da336a370243923dbaf21066bb9fe}"
 MMLU_MAX_LENGTH="${MMLU_MAX_LENGTH:-1536}"
 PAIRS="${PAIRS:-128}"
+PAIR_POOL_SIZE="${PAIR_POOL_SIZE:-}"
+if [[ -z "$PAIR_POOL_SIZE" ]]; then
+  PAIR_POOL_SIZE=$((PAIRS * 16))
+  if (( MMLU_MAX_QUESTIONS > 0 && PAIR_POOL_SIZE > MMLU_MAX_QUESTIONS )); then
+    PAIR_POOL_SIZE="$MMLU_MAX_QUESTIONS"
+  fi
+fi
+if (( PAIR_POOL_SIZE < PAIRS )); then
+  echo "PAIR_POOL_SIZE must be at least PAIRS" >&2
+  exit 2
+fi
 SEED="${SEED:-0}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
@@ -164,7 +175,7 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --dataset-config "$MMLU_DATASET_CONFIG" \
     --dataset-revision "$MMLU_DATASET_REVISION" \
     --max-questions "$MMLU_MAX_QUESTIONS" \
-    --pairs "$PAIRS" \
+    --pairs "$PAIR_POOL_SIZE" \
     --seed "$SEED"
 fi
 
@@ -285,6 +296,8 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode patch \
+      --max-pairs "$PAIRS" \
+      --minimum-pairs "$PAIRS" \
       --seed "$SEED"
     sr-intervene-transition-jepa-sae \
       "${MODEL_LOAD_ARGS[@]}" \
@@ -294,6 +307,8 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode ablate \
+      --max-pairs "$PAIRS" \
+      --minimum-pairs "$PAIRS" \
       --seed "$SEED"
     sr-intervene-transition-jepa-sae \
       "${MODEL_LOAD_ARGS[@]}" \
@@ -303,6 +318,8 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode random_ablate \
+      --max-pairs "$PAIRS" \
+      --minimum-pairs "$PAIRS" \
       --seed "$SEED"
   else
     echo "[10/11] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"

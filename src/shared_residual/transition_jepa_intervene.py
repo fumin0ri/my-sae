@@ -57,6 +57,42 @@ def resolve_offsets(
     return offsets
 
 
+def select_eligible_pairs(
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+    window_size: int,
+    source_key: str,
+    target_key: str,
+    maximum: int,
+) -> tuple[
+    list[tuple[int, dict[str, Any], torch.Tensor, torch.Tensor]],
+    int,
+    int,
+]:
+    selected = []
+    skipped_short = 0
+    examined = 0
+    for row_index, row in enumerate(rows):
+        examined += 1
+        source_ids = tokenize_text(
+            tokenizer,
+            str(row[source_key]),
+            add_special_tokens=True,
+        )
+        target_ids = tokenize_text(
+            tokenizer,
+            str(row[target_key]),
+            add_special_tokens=True,
+        )
+        if min(len(source_ids), len(target_ids)) < window_size:
+            skipped_short += 1
+            continue
+        selected.append((row_index, row, source_ids, target_ids))
+        if maximum and len(selected) >= maximum:
+            break
+    return selected, skipped_short, examined
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Causally edit offset-conditioned forecastable SAE features"
@@ -88,6 +124,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--answer-key", default="answer")
     parser.add_argument("--contrast-answer-key", default="source_answer")
     parser.add_argument(
+        "--max-pairs",
+        type=int,
+        default=0,
+        help="Maximum eligible pairs to run; 0 uses every eligible pair.",
+    )
+    parser.add_argument(
+        "--minimum-pairs",
+        type=int,
+        default=1,
+        help="Fail before intervention unless at least this many pairs are eligible.",
+    )
+    parser.add_argument(
         "--dtype",
         choices=["float32", "float16", "bfloat16"],
         default="bfloat16",
@@ -108,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.max_pairs < 0:
+        raise ValueError("--max-pairs cannot be negative")
+    if args.minimum_pairs < 1:
+        raise ValueError("--minimum-pairs must be positive")
+    if args.max_pairs and args.minimum_pairs > args.max_pairs:
+        raise ValueError("--minimum-pairs cannot exceed --max-pairs")
     rows = read_jsonl(args.pairs)
     jepa, checkpoint = load_transition_model(args.checkpoint)
     if checkpoint["train_args"].get("objective") != "joint":
@@ -160,27 +214,39 @@ def main() -> None:
         )
     token_device = input_device(llm)
     sae_dtype = parse_dtype(args.sae_dtype)
+    eligible, skipped_short, examined = select_eligible_pairs(
+        rows,
+        tokenizer,
+        width,
+        args.source_key,
+        args.target_key,
+        args.max_pairs,
+    )
+    if len(eligible) < args.minimum_pairs:
+        raise ValueError(
+            f"only {len(eligible)} eligible causal pairs were found among "
+            f"{examined} candidates; {skipped_short} had a source or target "
+            f"shorter than checkpoint window {width}. Regenerate a larger "
+            "candidate pool, or deliberately reduce --minimum-pairs."
+        )
+    print(
+        f"selected {len(eligible)} eligible causal pairs from {examined} "
+        f"candidates (skipped_short={skipped_short}, window={width})"
+    )
     results: list[dict[str, Any]] = []
-    for row_index, row in enumerate(tqdm(rows, desc=f"transition {args.mode}")):
-        source_ids = tokenize_text(
-            tokenizer,
-            str(row[args.source_key]),
-            add_special_tokens=True,
-        ).to(token_device)
-        target_prefix_ids = tokenize_text(
-            tokenizer,
-            str(row[args.target_key]),
-            add_special_tokens=True,
-        ).to(token_device)
+    for eligible_index, (
+        row_index,
+        row,
+        source_ids,
+        target_prefix_ids,
+    ) in enumerate(tqdm(eligible, desc=f"transition {args.mode}")):
+        source_ids = source_ids.to(token_device)
+        target_prefix_ids = target_prefix_ids.to(token_device)
         answer_ids = tokenize_text(
             tokenizer,
             str(row[args.answer_key]),
             add_special_tokens=False,
         ).to(token_device)
-        if min(len(source_ids), len(target_prefix_ids)) < width:
-            raise ValueError(
-                f"row {row_index}: prefix is shorter than checkpoint window {width}"
-            )
         target_ids = torch.cat([target_prefix_ids, answer_ids])
         baseline_output, target_hidden = capture(
             llm,
@@ -338,6 +404,7 @@ def main() -> None:
         results.append(
             {
                 "row_index": row_index,
+                "eligible_index": eligible_index,
                 "mode": args.mode,
                 "alpha": args.alpha,
                 "offsets": list(args.offsets),

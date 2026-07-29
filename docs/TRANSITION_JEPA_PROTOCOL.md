@@ -172,6 +172,13 @@ delta_hk = D(
 Ablation removes `D(TopK(P(z0_target, k)))`. Every learned edit is compared
 with an independently sampled norm-matched random direction.
 
+Both source and target prompts must contain at least W real tokens. The
+pipeline deterministically generates an oversized candidate pool, filters it
+with the checkpoint tokenizer, and takes the first 128 eligible pairs. Patch,
+ablation, and random-control conditions therefore use identical pair IDs.
+The default pool contains 2,048 candidates; the run fails before intervention
+if it cannot supply all 128 prespecified eligible pairs.
+
 ## Falsification conditions
 
 The main claim is rejected or weakened if:
