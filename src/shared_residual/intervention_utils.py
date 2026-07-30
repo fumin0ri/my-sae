@@ -1,19 +1,6 @@
 from __future__ import annotations
 
-import argparse
-
 import torch
-
-
-def parse_offsets(value: str) -> tuple[int, ...]:
-    offsets = tuple(
-        dict.fromkeys(
-            int(part.strip()) for part in value.split(",") if part.strip()
-        )
-    )
-    if not offsets:
-        raise argparse.ArgumentTypeError("expected comma-separated offsets")
-    return offsets
 
 
 def parse_feature_ids(value: str) -> tuple[int, ...]:

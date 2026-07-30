@@ -1,3 +1,3 @@
-"""Offset-conditioned JEPA-SAE for frozen LLM residual trajectories."""
+"""Fixed-endpoint JEPA-SAE for frozen LLM residual trajectories."""
 
-__version__ = "0.7.5"
+__version__ = "0.8.0"

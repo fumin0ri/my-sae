@@ -1,24 +1,25 @@
-# Offset-conditioned Transition JEPA-SAE
+# All-context fixed-endpoint JEPA-SAE
 
-Frozen autoregressive LLMの可変長residual trajectoryから、現在位置で
-すでに予測可能な未来の内部状態を疎な辞書として抽出する研究コードです。
+Frozen autoregressive LLMのresidual trajectoryから、各context位置ですでに
+予測可能な固定endpointの内部状態を疎な辞書として抽出する研究コードです。
 SAEとpredictorの学習にはThe Pileの公式22-subcorpus mixtureを使い、
 MMLUは学習に混ぜずlocked評価だけに使います。
 
 ```text
-h₀ ─ online Top-K SAE ─ z₀ ─┐
-                              ├─ offset-conditioned MLP ─ softplus ─ ẑₖ
-offset embedding(k) ──────────┘
+hₖ ─ online Top-K SAE ─ zₖ ───────────┐
+                                      ├─ position-conditioned MLP ─ ẑT(k)
+position embedding(k) ────────────────┘
 
-hₖ ─ EMA target SAE ─ stopgrad(zₖ),  k = 1,...,W-1
+hT ─ EMA target SAE ─ stopgrad(zT),  T = W-1, k = 0,...,T-1
 ```
 
-`z₀`とoffset `k`だけから、`z₁...z_{W-1}`を個別に予測します。targetの平均化や
-Transformer predictorは使いません。主張する対象は完全な未来状態ではなく、
-データ分布の下で`z₀`から予測可能な成分です。
+windowの最後`hT`だけをtargetとし、それ以前のすべての`hₖ`を独立なcontextとして
+同じEMA target code `zT`を予測します。targetの平均化やTransformer predictorは
+使いません。主張する対象は完全なendpoint状態ではなく、データ分布の下で各
+`zₖ`から予測可能な成分です。
 
 ```text
-P(z₀, k) ≈ E[zₖ | z₀, k]
+P(zₖ, k) ≈ E[zT | zₖ, k]
 ```
 
 後続tokenを入力していないため、これは決定論的な状態遷移ではありません。
@@ -58,7 +59,7 @@ bash scripts/transition_jepa_quickstart.sh
 | residual width | 4,096 |
 | SAE dictionary | 32,768 features |
 | sparsity | Top-K 64 |
-| predictor | width 512, offset-conditioned MLP |
+| predictor | width 512, context-position-conditioned MLP |
 | residual window | 10 positions（`WINDOW_SIZE`で変更可能） |
 | Pile train sample | 5,242,880 token positions（W=10では524,288 windows） |
 | Pile validation | 163,840 token positions（W=10では16,384 windows） |
@@ -143,9 +144,19 @@ START_STAGE=9 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-stage 9はoffsetごとのdense codeを全件保持せず、batch内でscalar statisticsへ
-集約します。大きいwindowでも、最終offsetのfeature解析に必要なcodeだけを
-保持します。
+stage 9はcontext/horizonごとのdense codeを全件保持せず、batch内でscalar
+statisticsへ集約します。大きいwindowでも、最長horizonのfeature解析に必要な
+codeだけを保持します。
+
+この固定endpoint方式へ移行する前のcheckpointとは互換性がありません。同じ
+`WINDOW_SIZE`、model、layerのPile activationとstandard SAEは再利用できるため、
+既存runを更新する場合はstage 6以降を再実行してください。
+
+```bash
+WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
+START_STAGE=6 \
+bash scripts/transition_jepa_quickstart.sh
+```
 
 ## The Pile training data
 
@@ -204,21 +215,25 @@ The Pileにはsubcorpusごとに異なるライセンスと利用条件があり
 
 - `joint`: predictor warm-up後、predictor・online encoder・decoderを共同学習
 - `fixed`: standard SAEを固定し、同じpredictorだけ学習
-- `k_only`: `z₀`を遮断し、offsetだけから予測
-- shuffled context: locked testで別MMLU questionの`z₀`へ交換
+- `k_only`: `zₖ`を遮断し、位置埋め込み`k`だけから予測
+- shuffled context: locked testで各`zₖ`を別MMLU questionの同じ位置へ交換
 
-online SAEはwindow内の全位置を再構成します。EMA target encoderはjoint条件だけで
-更新されます。predictor出力は学習時にはdense non-negative softplusとし、
+online decoderはonline encoderのendpoint codeから`hT`を再構成します。さらに
+stop-gradient EMA target codeも同じdecoderで`hT`へ復元しますが、この互換性loss
+ではdecoderだけを更新します。これによりEMA codeを評価・介入に使えるdecoderへ
+接続しつつ、target encoderへの逆伝播を防ぎます。EMA target encoderはjoint条件
+だけで更新されます。predictor出力は学習時にはdense non-negative softplusとし、
 support評価・residual decoding・因果介入でだけTop-Kを適用します。
 
 主損失:
 
 ```text
 L = L_reconstruction
-  + λ_prediction mean_k[
-      1 - cosine(ẑₖ, zₖ)
-      + 0.25 normalized_MSE(ẑₖ, zₖ)
-      + λ_residual FVU(decode(TopK(ẑₖ)), hₖ)
+  + λ_target_compatibility L_decode(stopgrad(zT), hT)
+  + λ_prediction mean_{k<T}[
+      1 - cosine(ẑT(k), zT)
+      + 0.25 normalized_MSE(ẑT(k), zT)
+      + λ_residual FVU(decode(TopK(ẑT(k))), hT)
     ]
   + λ_variance L_variance
 ```
@@ -227,7 +242,8 @@ L = L_reconstruction
 
 Pileと独立なMMLU question-grouped locked testで次を出力します。
 
-- offset 1...`WINDOW_SIZE-1`のcode cosine、normalized MSE、support precision/recall/Jaccard
+- context `k=0...T-1`の予測code cosine、normalized MSE、support precision/recall/Jaccard
+- predictor前の`cosine(zₖ, zT)`による直接共有表現baseline
 - true-context minus shuffled-context
 - joint minus fixedのquestion-group bootstrap 95% CI
 - residual prediction FVUとinnovation energy
@@ -235,6 +251,7 @@ Pileと独立なMMLU question-grouped locked testで次を出力します。
 - context accuracy: 公式MMLU大分類（STEM/humanities/social sciences/other）
 - syntax accuracy: 内容と独立に均衡割付した4種類のprompt形式
 - base LLMのzero-shot MMLU accuracy、collapse診断
+- 同一endpointに対するonline/EMA encoderのcosine、probe、collapse、decoder FVU比較
 - top forecastable featureと活性化例
 - forecastable componentだけのpatch・ablation・norm-matched random対照
 - PNG、PDF、CSV、JSON、自己完結HTML
@@ -242,9 +259,11 @@ Pileと独立なMMLU question-grouped locked testで次を出力します。
 因果patchは実際の未来code全体を置換せず、予測可能成分だけを編集します。
 
 ```text
-Δhₖ = D(TopK(P(z₀_source,k)) - TopK(P(z₀_target,k)))
+ΔhT = D(TopK(P(zₖ_source,k)) - TopK(P(zₖ_target,k)))
 ```
 
+既定の因果評価は最長horizon `k=0`を事前指定し、window内ではendpoint `hT`だけを
+一度編集します。`INTERVENTION_HORIZON`で別のcontext位置を指定できます。
 sourceとtargetの両方が`WINDOW_SIZE`以上の実tokenを持つpairだけを使います。
 既定では必要な128 pairの16倍（2,048候補）を決定論的に生成し、適格な先頭128
 pairをpatch・ablation・random対照で共通利用します。候補数は`PAIR_POOL_SIZE`、
@@ -303,7 +322,7 @@ src/shared_residual/
   transition_jepa_visualize.py PNG/PDF/HTML生成
   training.py                  split・AMP・optimizer補助
   evaluation.py                bootstrap・probe・診断
-  intervention_utils.py        feature/offset選択
+  intervention_utils.py        feature選択
 
 scripts/
   transition_jepa_quickstart.sh

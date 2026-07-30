@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.7.5"
+version = "0.8.0"
 description = "Learn and causally test forecastable sparse states in LLM residual trajectories"
 requires-python = ">=3.10"
 dependencies = [

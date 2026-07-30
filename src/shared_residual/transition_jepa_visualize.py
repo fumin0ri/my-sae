@@ -44,7 +44,7 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     labels = {
         "joint": "Joint JEPA-SAE",
         "fixed": "Fixed SAE + predictor",
-        "k_only": "Offset only",
+        "k_only": "Position only",
     }
     for method, report in reports.items():
         history = report["history"]
@@ -82,26 +82,28 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     save_figure(fig, figures, "training-curves")
 
 
-def offset_plot(report: dict[str, Any], figures: Path) -> None:
-    curves = report["locked_test_offset_curve"]
-    all_offsets = [row["offset"] for row in curves["joint"]]
+def horizon_plot(report: dict[str, Any], figures: Path) -> None:
+    curves = report["locked_test_horizon_curve"]
+    all_positions = [
+        row["context_position"] for row in curves["joint"]
+    ]
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.5))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
         ("fixed", "Fixed SAE + predictor"),
-        ("k_only", "Offset only"),
+        ("k_only", "Position only"),
     ):
         rows = curves[method]
-        offsets = [row["offset"] for row in rows]
+        positions = [row["context_position"] for row in rows]
         axes[0].plot(
-            offsets,
+            positions,
             [row["code_cosine"] for row in rows],
             marker="o",
             color=COLORS[method],
             label=label,
         )
         axes[1].plot(
-            offsets,
+            positions,
             [row["context_gain"]["mean"] for row in rows],
             marker="o",
             color=COLORS[method],
@@ -109,54 +111,64 @@ def offset_plot(report: dict[str, Any], figures: Path) -> None:
         )
     joint = curves["joint"]
     axes[0].plot(
-        [row["offset"] for row in joint],
+        [row["context_position"] for row in joint],
         [row["shuffled_context_cosine"] for row in joint],
         marker="o",
         linestyle="--",
         color=COLORS["shuffled"],
-        label="Joint, shuffled z₀",
+        label="Joint, shuffled matching-position context",
     )
-    axes[0].set_title("Offset-conditioned future-code forecast")
-    axes[0].set_ylabel("Cosine with EMA target code")
+    axes[0].plot(
+        [row["context_position"] for row in joint],
+        [row["context_target_cosine"] for row in joint],
+        marker=".",
+        linestyle=":",
+        color="#0f766e",
+        label="Raw online z_k vs EMA z_T",
+    )
+    axes[0].set_title("Fixed-endpoint forecast across context positions")
+    axes[0].set_ylabel("Cosine with fixed EMA endpoint code")
     axes[1].axhline(0, color="#334155", linewidth=1)
-    axes[1].set_title("Does the matching z₀ matter?")
+    axes[1].set_title("Does the matching context residual matter?")
     axes[1].set_ylabel("True-context minus shuffled cosine")
     for axis in axes:
-        axis.set_xticks(all_offsets)
-        axis.set_xlabel("Future offset k")
+        axis.set_xticks(all_positions)
+        axis.set_xlabel("Context position k (endpoint is W-1)")
         axis.grid(alpha=0.2)
         axis.legend(frameon=False)
     fig.tight_layout()
-    save_figure(fig, figures, "offset-forecast")
+    save_figure(fig, figures, "horizon-forecast")
 
 
 def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
-    curves = report["locked_test_offset_curve"]
-    all_offsets = [row["offset"] for row in curves["joint"]]
+    curves = report["locked_test_horizon_curve"]
+    all_positions = [
+        row["context_position"] for row in curves["joint"]
+    ]
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.2))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
         ("fixed", "Fixed SAE + predictor"),
-        ("k_only", "Offset only"),
+        ("k_only", "Position only"),
     ):
         rows = curves[method]
-        offsets = [row["offset"] for row in rows]
+        positions = [row["context_position"] for row in rows]
         axes[0].plot(
-            offsets,
+            positions,
             [row["support_precision"] for row in rows],
             marker="o",
             color=COLORS[method],
             label=label,
         )
         axes[1].plot(
-            offsets,
+            positions,
             [row["support_recall"] for row in rows],
             marker="o",
             color=COLORS[method],
             label=label,
         )
         axes[2].plot(
-            offsets,
+            positions,
             [row["innovation_energy_fraction"] for row in rows],
             marker="o",
             color=COLORS[method],
@@ -169,8 +181,8 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
     axes[2].set_title("Unforecastable residual")
     axes[2].set_ylabel("Innovation / target energy")
     for axis in axes:
-        axis.set_xticks(all_offsets)
-        axis.set_xlabel("Future offset k")
+        axis.set_xticks(all_positions)
+        axis.set_xlabel("Context position k (endpoint is W-1)")
         axis.grid(alpha=0.2)
         axis.legend(frameon=False)
     fig.tight_layout()
@@ -179,14 +191,24 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
 
 def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
     probes = report["locked_test_mmlu_probes"]
-    final_offset = report["architecture"]["final_offset"]
+    target_position = report["architecture"]["target_position"]
     order = [
         ("Joint z0", "joint_z0", COLORS["joint"]),
         ("Standard SAE z0", "standard_sae_z0", COLORS["fixed"]),
         (
-            f"Joint predicted z{final_offset}",
-            "joint_predicted_final",
+            f"Predicted endpoint z{target_position} from h0",
+            "joint_predicted_endpoint_from_h0",
             "#0f766e",
+        ),
+        (
+            f"Online endpoint z{target_position}",
+            "joint_online_endpoint",
+            "#0891b2",
+        ),
+        (
+            f"EMA endpoint z{target_position}",
+            "joint_ema_endpoint",
+            "#7c3aed",
         ),
         ("Raw h0", "raw_h0", "#334155"),
     ]
@@ -284,7 +306,8 @@ def mmlu_model_plot(report: dict[str, Any], figures: Path) -> None:
 
 def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     bundle = torch_load(run_dir / "analysis" / "transition_visualization.pt")
-    final_offset = int(bundle["final_offset"])
+    target_position = int(bundle["target_position"])
+    longest_horizon = int(bundle["longest_horizon"])
     embedding = bundle["embedding"].float().numpy()
     labels = np.asarray(bundle["context_labels"])
     fig, ax = plt.subplots(figsize=(7.3, 5.2))
@@ -323,7 +346,10 @@ def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
     ax.set_yticks(range(len(bundle["feature_ids"])), bundle["feature_ids"])
     ax.set_ylabel("Forecastable SAE feature")
     ax.set_xlabel("Locked-test MMLU questions (sorted by correct answer)")
-    ax.set_title(f"Top offset-{final_offset} forecast features")
+    ax.set_title(
+        f"Top h0 → h{target_position} forecast features "
+        f"(horizon {longest_horizon})"
+    )
     boundaries = (
         np.flatnonzero(
             semantic_labels[order][1:] != semantic_labels[order][:-1]
@@ -427,15 +453,21 @@ def write_html(
     interventions: dict[str, Any] | None,
 ) -> None:
     comparison = report["primary_joint_minus_fixed_code_cosine"]
-    joint_last = report["locked_test_offset_curve"]["joint"][-1]
-    fixed_last = report["locked_test_offset_curve"]["fixed"][-1]
-    k_only_last = report["locked_test_offset_curve"]["k_only"][-1]
+    curves = report["locked_test_horizon_curve"]
+    joint_early = curves["joint"][0]
+    joint_late = curves["joint"][-1]
+    fixed_early = curves["fixed"][0]
+    horizon_only_early = curves["k_only"][0]
     mmlu = report["benchmark"]["base_model_accuracy"]
     probes = report["locked_test_mmlu_probes"]
-    final_offset = report["architecture"]["final_offset"]
+    endpoint_alignment = report["online_ema_endpoint_cosine"]["joint"]
+    online_reconstruction = report["reconstruction_fvu"]["joint"]
+    ema_reconstruction = report["target_compatibility_fvu"]["joint"]
+    target_position = report["architecture"]["target_position"]
+    longest_horizon = report["architecture"]["longest_horizon"]
     figures = [
         ("Training dynamics", "figures/training-curves.png"),
-        ("Offset forecast and context gain", "figures/offset-forecast.png"),
+        ("Endpoint forecast and context gain", "figures/horizon-forecast.png"),
         ("Support and innovation", "figures/support-and-innovation.png"),
         ("MMLU semantics, context, and syntax", "figures/mmlu-probes.png"),
         ("Base LLM MMLU accuracy", "figures/mmlu-base-model.png"),
@@ -462,7 +494,7 @@ def write_html(
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Offset-conditioned transition JEPA-SAE report</title>
+<title>Fixed-endpoint JEPA-SAE report</title>
 <style>
 :root {{ --bg:#f5f7fb; --card:#fff; --fg:#172033; --muted:#64748b; --line:#dbe2ea; }}
 * {{ box-sizing:border-box; }} body {{ margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--fg); }}
@@ -473,25 +505,29 @@ main {{ max-width:1120px; margin:auto; padding:36px 20px 70px; }}
 section {{ margin-top:34px; }} section img {{ width:100%; background:white; border:1px solid var(--line); border-radius:10px; }}
 code {{ color:inherit; }}
 </style></head><body><main>
-<h1>Offset-conditioned transition JEPA-SAE</h1>
-<p class="subtitle">A Top-K code at h₀ and offset k forecasts an EMA SAE code at hₖ. The target may change with k, while the predictor is restricted to one present state and one offset.</p>
+<h1>All-context to fixed-endpoint JEPA-SAE</h1>
+<p class="subtitle">Each online Top-K code at h<sub>k</sub>, together with context-position embedding k, forecasts the same EMA target code at the fixed endpoint h<sub>T</sub>. Curves also report horizon T-k.</p>
 <div class="metrics">
 <div class="metric"><span>Joint − fixed cosine</span><strong>{fmt(comparison['mean'])}</strong></div>
 <div class="metric"><span>Group-bootstrap 95% CI</span><strong>{fmt(comparison['ci95_low'])} to {fmt(comparison['ci95_high'])}</strong></div>
-<div class="metric"><span>Joint offset-{final_offset} cosine</span><strong>{fmt(joint_last['code_cosine'])}</strong></div>
-<div class="metric"><span>Fixed offset-{final_offset} cosine</span><strong>{fmt(fixed_last['code_cosine'])}</strong></div>
-<div class="metric"><span>k-only offset-{final_offset} cosine</span><strong>{fmt(k_only_last['code_cosine'])}</strong></div>
-<div class="metric"><span>Joint offset-{final_offset} context gain</span><strong>{fmt(joint_last['context_gain']['mean'])}</strong></div>
+<div class="metric"><span>Joint h0→h{target_position} cosine</span><strong>{fmt(joint_early['code_cosine'])}</strong></div>
+<div class="metric"><span>Joint h{target_position - 1}→h{target_position} cosine</span><strong>{fmt(joint_late['code_cosine'])}</strong></div>
+<div class="metric"><span>Fixed horizon-{longest_horizon} cosine</span><strong>{fmt(fixed_early['code_cosine'])}</strong></div>
+<div class="metric"><span>Horizon-only horizon-{longest_horizon} cosine</span><strong>{fmt(horizon_only_early['code_cosine'])}</strong></div>
+<div class="metric"><span>Joint horizon-{longest_horizon} context gain</span><strong>{fmt(joint_early['context_gain']['mean'])}</strong></div>
+<div class="metric"><span>Online ↔ EMA endpoint cosine</span><strong>{fmt(endpoint_alignment)}</strong></div>
+<div class="metric"><span>Online endpoint reconstruction FVU</span><strong>{fmt(online_reconstruction)}</strong></div>
+<div class="metric"><span>EMA-code decoder FVU</span><strong>{fmt(ema_reconstruction)}</strong></div>
 <div class="metric"><span>Base LLM MMLU answer accuracy</span><strong>{fmt(mmlu['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z{final_offset} semantics</span><strong>{fmt(probes['semantics']['joint_predicted_final']['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z{final_offset} context</span><strong>{fmt(probes['context']['joint_predicted_final']['accuracy'])}</strong></div>
-<div class="metric"><span>Joint predicted z{final_offset} syntax</span><strong>{fmt(probes['syntax']['joint_predicted_final']['accuracy'])}</strong></div>
+<div class="metric"><span>Predicted endpoint semantics</span><strong>{fmt(probes['semantics']['joint_predicted_endpoint_from_h0']['accuracy'])}</strong></div>
+<div class="metric"><span>Predicted endpoint context</span><strong>{fmt(probes['context']['joint_predicted_endpoint_from_h0']['accuracy'])}</strong></div>
+<div class="metric"><span>Predicted endpoint syntax</span><strong>{fmt(probes['syntax']['joint_predicted_endpoint_from_h0']['accuracy'])}</strong></div>
 </div>
 {figure_html}
 {causal_html}
 <section><h2>Interpretation boundary</h2>
-<p><code>P(z₀,k)</code> estimates what is forecastable before observing intervening tokens. It is not a deterministic transition operator. The innovation contains later token information, lexical realization, and unforecastable updates.</p></section>
-<p class="subtitle">Machine-readable results: <code>analysis/transition_jepa_report.json</code>, <code>analysis/mmlu_probe_accuracy.csv</code>, <code>analysis/transition_offset_metrics.csv</code>, and <code>analysis/transition_visualization.pt</code>.</p>
+<p><code>P(z<sub>k</sub>,k)</code> estimates the component of the fixed endpoint code that is forecastable at context position k. It is not a deterministic transition operator. The innovation contains later-token information and other unforecastable updates.</p></section>
+<p class="subtitle">Machine-readable results: <code>analysis/transition_jepa_report.json</code>, <code>analysis/mmlu_probe_accuracy.csv</code>, <code>analysis/transition_horizon_metrics.csv</code>, and <code>analysis/transition_visualization.pt</code>.</p>
 </main></body></html>"""
     (output_dir / "index.html").write_text(
         document,
@@ -502,7 +538,7 @@ code {{ color:inherit; }}
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build figures and HTML for transition JEPA-SAE"
+        description="Build figures and HTML for fixed-endpoint JEPA-SAE"
     )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--output-dir")
@@ -517,7 +553,7 @@ def main() -> None:
     figures.mkdir(parents=True, exist_ok=True)
     report = load_json(run_dir / "analysis" / "transition_jepa_report.json")
     training_plot(run_dir, figures)
-    offset_plot(report, figures)
+    horizon_plot(report, figures)
     support_innovation_plot(report, figures)
     mmlu_probe_plot(report, figures)
     mmlu_model_plot(report, figures)
@@ -530,7 +566,7 @@ def main() -> None:
             "primary_comparison": report[
                 "primary_joint_minus_fixed_code_cosine"
             ],
-            "offset_curve": report["locked_test_offset_curve"],
+            "horizon_curve": report["locked_test_horizon_curve"],
             "mmlu_probes": report["locked_test_mmlu_probes"],
             "base_mmlu_model": report["benchmark"]["base_model_accuracy"],
             "interventions": interventions,

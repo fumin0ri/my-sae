@@ -1,199 +1,195 @@
-# Offset-conditioned transition JEPA-SAE protocol
+# All-context fixed-endpoint JEPA-SAE protocol
 
 ## Confirmatory question
 
-Can joint latent forecasting reshape an SAE dictionary so that a sparse code
-at the present position exposes more of the future residual trajectory's
-forecastable state than a standard SAE dictionary?
+Can joint latent forecasting reshape an SAE dictionary so that every earlier
+position exposes a sparse component of one fixed future endpoint that is
+forecastable from that position?
 
-For a prespecified window of `W >= 2` token positions:
+For a prespecified window of `W >= 2` residual positions, define `T = W - 1`.
 
 ```text
-z0_x = TopK(ReLU(E_online(normalize(h0))))
-zk_y = stopgrad(TopK(ReLU(E_EMA(normalize(hk)))))
-z_hat_k = softplus(P(z0_x, embedding(k))), k = 1,...,W-1
+zk_online = TopK(ReLU(E_online(normalize(hk)))), k = 0,...,T
+zT_target = stopgrad(TopK(ReLU(E_EMA(normalize(hT))))
+z_hat_T_from_k = softplus(P(zk_online, embedding(k))), k = 0,...,T-1
 ```
 
-The online SAE reconstructs all W positions. The EMA target encoder is
-initialized from the online encoder and updated only during joint training.
-No target representations are averaged.
+Every earlier position is a separate context. All contexts predict the same
+EMA endpoint code. Target representations are neither averaged nor pooled,
+and the predictor is not autoregressive.
 
 ## Interpretation boundary
 
-`P(z0, k)` does not receive intervening tokens. It estimates the component of
-`zk` that is forecastable from the present state and offset under the training
+The predictor does not observe the tokens between `k` and `T`. It estimates
+the component of the fixed endpoint that is forecastable under the data
 distribution:
 
 ```text
-P(z0, k) approximately estimates E[zk | z0, k].
+P(zk, k) approximately estimates E[zT | zk, k].
 ```
 
-It is not claimed to be a deterministic transition operator. The innovation
-contains later token information, lexical realization, and other
-unforecastable updates.
+This is not a deterministic transition operator. The innovation contains
+intervening-token information, lexical realization, and other unpredictable
+updates. Comparing different `k` values measures how endpoint information
+becomes available as context approaches the endpoint.
 
 ## Training stages
 
-1. Stream the official 22-component Pile mixture and extract disjoint
-   document-level train/validation residual shards.
-2. Train one standard Top-K SAE on all W positions of the Pile windows.
-3. Copy its online encoder into the EMA target encoder.
-4. Initialize all forecasting conditions from this exact checkpoint and data
-   fingerprint.
-5. Warm up the predictor with the SAE frozen.
-6. For the joint condition only, unfreeze the online encoder and decoder,
-   ramp the forecasting weight, and update the target encoder by EMA.
+1. Stream the Pile mixture and extract document-disjoint train/validation
+   residual windows.
+2. Train one standard Top-K SAE on all positions as a shared initialization.
+3. Copy the online encoder and normalization bias into an EMA target encoder.
+4. Initialize joint, fixed-SAE, and position-only conditions from the exact
+   same checkpoint and activation fingerprint.
+5. Warm up each predictor with the SAE frozen.
+6. For the joint condition, unfreeze the online encoder and decoder, ramp the
+   forecasting loss, and update the target encoder and target normalization
+   bias by EMA.
 
-The fixed and offset-only controls receive the same number of predictor
-optimizer steps as the joint condition.
-
-MMLU is never used for SAE or predictor optimization. Its test questions are
-loaded from a pinned dataset revision and opened only for locked evaluation and
-causal intervention. For a window W, both residual extraction and frozen
-base-model scoring use exactly the questions whose rendered prompt contains at
-least W real tokens. Short prompts are excluded rather than creating artificial
-residual targets with padding. Stable MMLU question IDs are checked before the
-locked test is opened.
+MMLU is never used for SAE or predictor optimization. Its pinned test split is
+opened only after training for grouped locked evaluation and causal tests.
+Residual extraction and base-model scoring must cover identical stable
+question IDs and exclude prompts shorter than `W` real tokens.
 
 ## Training corpus
 
-The default corpus is the `default` configuration of
-`EleutherAI/the_pile_deduplicated`, pinned to an immutable dataset revision and
-streamed from Parquet. It inherits the upstream preweighted 22-component Pile
-mixture and receives an additional finite shuffle buffer. The confirmatory
-default fixes the budget at 5,242,880 train and 163,840 validation residual
-positions. At `W=10` these become 524,288 and 16,384 windows; at `W=128` they
-become 40,960 and 1,280 windows. Keeping the position budget fixed prevents
-activation storage and extraction compute from scaling linearly with W.
+The default is the pinned `default` configuration of
+`EleutherAI/the_pile_deduplicated`, streamed from Parquet with an additional
+finite shuffle buffer. The default budget is 5,242,880 training and 163,840
+validation residual positions. Thus activation storage remains approximately
+constant as `W` changes.
 
-Every source document is assigned wholly to train or validation by a
-deterministic hash. Activations are stored as BF16 shards with a fixed
-40,960-position default shard budget, so one Pythia-6.9B shard remains about
-320 MiB for every W. Writes use a same-filesystem partial file followed by an
-atomic rename. A capacity preflight includes serialization overhead and a
-5 GiB free-space reserve. The manifest records the observed counts for all 22
-Pile components, normalization statistics, model revision, layer, resolved
-budgets, storage estimate, and a data fingerprint. The public deduplicated
-Parquet schema contains text but not per-document component labels, so the
-manifest explicitly marks source metadata unavailable rather than reporting
-inferred component counts. Documents shorter than the model extraction
-sequence are right-padded and only their valid W-token windows are retained,
-avoiding a systematic loss of short-document components. The legacy labelled
-release remains an opt-in audit path. A run is invalid if any training
-condition uses a different fingerprint.
+Each document is assigned wholly to train or validation by deterministic hash.
+BF16 shards use atomic partial-file replacement and a fixed position budget.
+The manifest records source configuration, model revision, layer, counts,
+normalization statistics, capacity estimate, and a data fingerprint. All
+conditions must share that fingerprint. If component labels are absent from
+the public Parquet schema, the manifest reports that limitation rather than
+inferring labels.
 
-## Objective
+## Decoder anchoring and objective
+
+The online endpoint code reconstructs `hT`. A second compatibility path decodes
+the stop-gradient EMA endpoint code with the same decoder. The compatibility
+path detaches normalization parameters, so its gradient updates the decoder
+but cannot pull the online or EMA encoder. This makes EMA codes decodable
+without violating the stop-gradient target.
 
 ```text
-L = L_reconstruction
-  + lambda_prediction * (
-      mean_k[1 - cosine(z_hat_k, zk_y)
-             + 0.25 * MSE(z_hat_k, zk_y) / energy(zk_y)]
-      + lambda_residual * FVU(decode(TopK(z_hat_k)), hk)
-    )
+L = FVU(D(zT_online), hT)
+  + lambda_target_compatibility * FVU(D(stopgrad(zT_target)), hT)
+  + lambda_prediction * mean_{k<T}[
+      1 - cosine(z_hat_T_from_k, zT_target)
+      + 0.25 * normalized_MSE(z_hat_T_from_k, zT_target)
+      + lambda_residual * FVU(D(TopK(z_hat_T_from_k)), hT)
+    ]
   + lambda_variance * L_variance
 ```
 
-The predictor output stays dense and non-negative during training. Top-K is
-used for support metrics, residual decoding, and causal intervention.
+The predictor output remains dense and non-negative for the latent regression
+loss. Top-K is applied for sparse-support metrics, residual decoding, and
+causal interventions.
 
 ## Confirmatory comparison
 
-The primary comparison is:
+The primary statistic is the per-question mean endpoint-code cosine across all
+context positions:
 
 ```text
 joint JEPA-SAE minus fixed standard-SAE predictor
 ```
 
-The statistic is the per-window mean target-code cosine across offsets
-1...W-1,
-with a question-group bootstrap 95% confidence interval.
+A question-group bootstrap supplies the 95% confidence interval. Horizon-wise
+curves remain available and must not be replaced by only the average.
 
-The joint claim requires all of the following:
+The joint claim requires:
 
-- joint forecasting exceeds the fixed-SAE predictor;
-- the true context exceeds a different-group shuffled context;
-- the true context exceeds the offset-only predictor;
-- reconstruction remains close to the standard SAE;
-- the representation does not collapse;
-- any causal effect exceeds a norm-matched random control.
+- joint forecasting to exceed the fixed-SAE predictor;
+- matching contexts to exceed different-question, matching-position contexts;
+- matching contexts to exceed the position-only predictor;
+- direct `cosine(zk_online, zT_target)` to be reported separately from
+  predictor performance;
+- online and EMA-code endpoint reconstruction to remain acceptable;
+- representations not to collapse;
+- learned causal effects to exceed norm-matched random edits.
 
 ## Controls
 
-- standard SAE checkpoint shared by all conditions;
-- fixed standard SAE plus the same predictor;
-- offset-only predictor with z0 removed;
-- shuffled z0 at evaluation;
-
-Future extensions should add an intervening-token-conditioned transition model.
+- one standard SAE checkpoint shared by all conditions;
+- frozen standard SAE plus the same position-conditioned predictor;
+- position-only predictor with the context projection disabled;
+- different-question context trajectories at evaluation;
+- raw online-context versus EMA-endpoint cosine;
+- online versus EMA encoding of the exact same endpoint, with separate probe,
+  collapse, alignment, and reconstruction diagnostics;
+- norm-matched random causal edits.
 
 ## Locked-test outcomes
 
-For each offset 1...W-1:
+For each context `k = 0,...,T-1`, report:
 
-- target-code cosine and normalized MSE;
-- true-context minus shuffled-context cosine;
+- horizon `T-k`;
+- raw context-target cosine;
+- predicted target-code cosine and normalized MSE;
+- matching-context minus shuffled-context cosine;
 - Top-K support precision, recall, and Jaccard;
-- residual prediction FVU;
-- innovation-to-target energy ratio;
-- predictor and target norms.
+- endpoint residual-prediction FVU and innovation-energy ratio;
+- predictor and endpoint-target norms.
 
-Evaluation computes these quantities batch by batch and retains only scalar
-per-question, per-offset statistics. Dense target, prediction, and shuffled
-prediction tensors are not retained across the locked test. Dense codes are
-kept only at the final offset for feature analysis.
+Evaluation streams dense tensors batch by batch and retains per-question
+scalar horizon statistics. Dense codes are retained only for the prespecified
+longest-horizon feature analysis, preventing memory from scaling as
+`questions x W x d_sae`.
 
-Secondary outcomes:
+Secondary outcomes are:
 
-- semantics accuracy: linear decoding of the balanced correct option A/B/C/D;
-- context accuracy: linear decoding of the official four broad MMLU domains;
-- syntax accuracy: linear decoding of four independently balanced prompt forms;
-- zero-shot answer accuracy of the frozen base LLM;
-- dead-feature and variance-participation diagnostics;
-- top forecastable features and activating examples;
-- forecastable-component patching and ablation.
+- MMLU semantics accuracy: balanced correct-option decoding;
+- context accuracy: official broad MMLU domain decoding;
+- syntax accuracy: independently balanced prompt-form decoding;
+- frozen base-LLM zero-shot accuracy;
+- collapse diagnostics;
+- top longest-horizon forecast features and examples;
+- endpoint patching, ablation, and norm-matched random controls.
 
-The base-model answer score uses the same balanced zero-shot prompt forms as
-the representation analysis, applies the same minimum-W-token eligibility
-rule, and is not presented as the official five-shot MMLU leaderboard protocol.
+The base score uses the same balanced zero-shot prompts and minimum-token
+eligibility rule as representation analysis. It is not the official five-shot
+leaderboard protocol.
 
 ## Causal intervention
 
-The actual future code is not replaced. Only the forecastable component is
-edited:
+One horizon is prespecified; the default is the longest horizon, `k=0`.
+The learned forecast component is decoded and applied exactly once at the
+fixed endpoint residual:
 
 ```text
-delta_hk = D(
-    TopK(P(z0_source, k))
-    - TopK(P(z0_target, k))
+delta_hT = D(
+    TopK(P(z_source_k, k))
+    - TopK(P(z_target_k, k))
 )
 ```
 
-Ablation removes `D(TopK(P(z0_target, k)))`. Every learned edit is compared
-with an independently sampled norm-matched random direction.
-
-Both source and target prompts must contain at least W real tokens. The
-pipeline deterministically generates an oversized candidate pool, filters it
-with the checkpoint tokenizer, and takes the first 128 eligible pairs. Patch,
-ablation, and random-control conditions therefore use identical pair IDs.
-The default pool contains 2,048 candidates; the run fails before intervention
-if it cannot supply all 128 prespecified eligible pairs.
+Ablation removes `D(TopK(P(z_target_k, T-k)))`. The random control uses an
+independent direction with the exact learned-edit norm. Source and target
+prompts must each have at least `W` real tokens. Patch, ablation, and random
+conditions use identical eligible pair IDs.
 
 ## Falsification conditions
 
 The main claim is rejected or weakened if:
 
-- the group-bootstrap interval for joint minus fixed includes zero;
-- shuffled z0 performs as well as the corresponding true z0;
-- the offset-only model explains the apparent forecasting performance;
-- the joint dictionary gains prediction only by materially degrading
-  reconstruction;
-- forecasted features collapse to position/template shortcuts;
-- learned causal edits are indistinguishable from norm-matched random edits;
-- results fail across model, layer, MMLU split seed, or feature seed.
+- the joint-minus-fixed group-bootstrap interval includes zero;
+- shuffled or position-only contexts match the true-context result;
+- predictor performance is explained entirely by raw code similarity;
+- improvement requires materially worse online or EMA-code reconstruction;
+- codes collapse to horizon, position, or prompt-template shortcuts;
+- learned endpoint edits do not beat norm-matched random edits;
+- results fail to replicate across models, layers, split seeds, or feature
+  seeds.
 
 ## Replication
 
-The unit of replication is model x layer x MMLU split seed x feature seed. The
-recommended matrix uses Pythia 1.4B, 2.8B, and 6.9B; three prespecified layer
-fractions; and at least three seeds.
+The replication unit is model x layer x MMLU split seed x feature seed.
+Recommended scaling uses Pythia 1.4B, 2.8B, and 6.9B, three prespecified layer
+fractions, and at least three seeds. Changing the fixed-endpoint architecture
+invalidates old transition checkpoints, but matching Pile activations and the
+standard-SAE initialization can be reused by restarting at pipeline stage 6.

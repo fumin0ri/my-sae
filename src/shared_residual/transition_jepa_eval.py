@@ -27,6 +27,7 @@ from .training import (
     grouped_three_way_split,
 )
 from .transition_jepa_sae import (
+    ARCHITECTURE_ID,
     TransitionJEPAConfig,
     TransitionJEPASAE,
 )
@@ -36,7 +37,8 @@ PROBE_LABELS = {
     "context": "context_category",
     "syntax": "syntax_template",
 }
-OFFSET_STATISTIC_NAMES = (
+HORIZON_STATISTIC_NAMES = (
+    "context_target_cosine",
     "code_cosine",
     "shuffled_context_cosine",
     "code_nrmse",
@@ -55,6 +57,12 @@ def load_model(
     device: torch.device,
 ) -> tuple[TransitionJEPASAE, dict[str, Any]]:
     checkpoint = torch_load(path)
+    if checkpoint.get("architecture_id") != ARCHITECTURE_ID:
+        raise ValueError(
+            f"{path} is not a {ARCHITECTURE_ID} checkpoint. Reuse the "
+            "matching Pile activations and standard SAE, then rerun pipeline "
+            "stages 6 through 11."
+        )
     model = TransitionJEPASAE(TransitionJEPAConfig(**checkpoint["config"]))
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
@@ -62,7 +70,7 @@ def load_model(
 
 
 @torch.no_grad()
-def batch_offset_statistics(
+def batch_horizon_statistics(
     outputs: dict[str, torch.Tensor],
     shuffled_prediction: torch.Tensor,
     pre_bias: torch.Tensor,
@@ -70,19 +78,21 @@ def batch_offset_statistics(
     prediction = outputs["predicted_codes"]
     sparse_prediction = outputs["sparse_predicted_codes"]
     target = outputs["target_codes"]
-    batch_size, n_offsets, _ = prediction.shape
+    context_codes = outputs["context_codes"]
+    batch_size, n_contexts, _ = prediction.shape
     statistics = {
         name: torch.empty(
-            (batch_size, n_offsets),
+            (batch_size, n_contexts),
             device=prediction.device,
             dtype=torch.float32,
         )
-        for name in OFFSET_STATISTIC_NAMES
+        for name in HORIZON_STATISTIC_NAMES
     }
-    for offset in range(n_offsets):
-        predicted = prediction[:, offset].float()
-        shuffled = shuffled_prediction[:, offset].float()
-        target_code = target[:, offset].float()
+    for context_position in range(n_contexts):
+        predicted = prediction[:, context_position].float()
+        shuffled = shuffled_prediction[:, context_position].float()
+        target_code = target[:, context_position].float()
+        context_code = context_codes[:, context_position].float()
         cosine = F.cosine_similarity(predicted, target_code, dim=-1)
         shuffled_cosine = F.cosine_similarity(
             shuffled,
@@ -90,8 +100,8 @@ def batch_offset_statistics(
             dim=-1,
         )
         target_energy = target_code.square().mean(dim=-1).clamp_min(1e-8)
-        predicted_active = sparse_prediction[:, offset] > 0
-        target_active = target[:, offset] > 0
+        predicted_active = sparse_prediction[:, context_position] > 0
+        target_active = target[:, context_position] > 0
         intersection = (predicted_active & target_active).sum(dim=-1).float()
         predicted_count = predicted_active.sum(dim=-1).float().clamp_min(1)
         target_count = target_active.sum(dim=-1).float().clamp_min(1)
@@ -102,27 +112,40 @@ def batch_offset_statistics(
             .clamp_min(1)
         )
         residual_error = (
-            outputs["predictable_residual"][:, offset].float()
-            - outputs["target_residual"][:, offset].float()
+            outputs["predictable_residual"][:, context_position].float()
+            - outputs["target_residual"][:, context_position].float()
         ).square().mean(dim=-1)
         residual_energy = (
-            outputs["target_residual"][:, offset].float()
+            outputs["target_residual"][:, context_position].float()
             - pre_bias.float()
         ).square().mean(dim=-1)
-        statistics["code_cosine"][:, offset] = cosine
-        statistics["shuffled_context_cosine"][:, offset] = shuffled_cosine
-        statistics["code_nrmse"][:, offset] = (
+        statistics["context_target_cosine"][:, context_position] = (
+            F.cosine_similarity(context_code, target_code, dim=-1)
+        )
+        statistics["code_cosine"][:, context_position] = cosine
+        statistics["shuffled_context_cosine"][:, context_position] = (
+            shuffled_cosine
+        )
+        statistics["code_nrmse"][:, context_position] = (
             (predicted - target_code).square().mean(dim=-1) / target_energy
         )
-        statistics["support_precision"][:, offset] = (
+        statistics["support_precision"][:, context_position] = (
             intersection / predicted_count
         )
-        statistics["support_recall"][:, offset] = intersection / target_count
-        statistics["support_jaccard"][:, offset] = intersection / union
-        statistics["residual_error"][:, offset] = residual_error
-        statistics["residual_energy"][:, offset] = residual_energy
-        statistics["prediction_norm"][:, offset] = predicted.norm(dim=-1)
-        statistics["target_norm"][:, offset] = target_code.norm(dim=-1)
+        statistics["support_recall"][:, context_position] = (
+            intersection / target_count
+        )
+        statistics["support_jaccard"][:, context_position] = (
+            intersection / union
+        )
+        statistics["residual_error"][:, context_position] = residual_error
+        statistics["residual_energy"][:, context_position] = residual_energy
+        statistics["prediction_norm"][:, context_position] = predicted.norm(
+            dim=-1
+        )
+        statistics["target_norm"][:, context_position] = target_code.norm(
+            dim=-1
+        )
     return statistics
 
 
@@ -138,20 +161,19 @@ def collect_model_outputs(
     use_context: bool,
     seed: int,
     label: str,
-    retain_final_test_codes: bool,
+    retain_long_horizon_test_codes: bool,
 ) -> dict[str, Any]:
     context = torch.empty(
         (len(x), model.cfg.d_sae),
         dtype=torch.float16,
     )
-    final_prediction = torch.empty_like(context)
+    long_horizon_prediction = torch.empty_like(context)
+    online_endpoint = torch.empty_like(context)
+    endpoint_target = torch.empty_like(context)
     reconstruction_error = 0.0
+    compatibility_error = 0.0
     reconstruction_scale = 0.0
-    final_offset = torch.tensor(
-        [model.cfg.window_size - 1],
-        device=device,
-        dtype=torch.long,
-    )
+    endpoint_alignment_sum = 0.0
     for start in tqdm(
         range(0, len(x), batch_size),
         desc=f"{label}: encode/reconstruct",
@@ -163,58 +185,71 @@ def collect_model_outputs(
             non_blocking=True,
         )
         with autocast_context(device, amp_dtype):
-            codes = model.encode(batch)
-            reconstruction = model.decode(codes)
-            prediction, _ = model.predict_from_code(
-                codes[:, 0],
-                offsets=final_offset,
-                use_context=use_context,
-            )
-        context[start:end].copy_(codes[:, 0].to(torch.float16).cpu())
-        final_prediction[start:end].copy_(
-            prediction[:, 0].to(torch.float16).cpu()
+            outputs = model(batch, use_context=use_context)
+        context[start:end].copy_(
+            outputs["context_code"].to(torch.float16).cpu()
+        )
+        long_horizon_prediction[start:end].copy_(
+            outputs["predicted_codes"][:, 0].to(torch.float16).cpu()
+        )
+        online_endpoint[start:end].copy_(
+            outputs["online_target_code"].to(torch.float16).cpu()
+        )
+        endpoint_target[start:end].copy_(
+            outputs["target_code"].to(torch.float16).cpu()
+        )
+        endpoint_alignment_sum += float(
+            F.cosine_similarity(
+                outputs["online_target_code"].float(),
+                outputs["target_code"].float(),
+                dim=-1,
+            ).sum().item()
         )
         reconstruction_error += float(
-            (reconstruction - batch).float().square().sum().item()
+            (
+                outputs["online_target_reconstruction"] - batch[:, -1]
+            ).float().square().sum().item()
+        )
+        compatibility_error += float(
+            (
+                outputs["target_compatibility_reconstruction"] - batch[:, -1]
+            ).float().square().sum().item()
         )
         reconstruction_scale += float(
-            (batch - model.pre_bias).float().square().sum().item()
+            (batch[:, -1] - model.pre_bias).float().square().sum().item()
         )
 
     n_test = len(test_indices)
-    n_offsets = model.cfg.window_size - 1
+    n_contexts = model.cfg.window_size - 1
     avoided_dense_gib = (
-        3 * n_test * n_offsets * model.cfg.d_sae * 2 / 2**30
+        3 * n_test * n_contexts * model.cfg.d_sae * 2 / 2**30
     )
     print(
-        f"{label}: streaming offset statistics; avoiding approximately "
+        f"{label}: streaming horizon statistics; avoiding approximately "
         f"{avoided_dense_gib:.1f} GiB of retained dense test codes"
     )
-    offset_statistics = {
-        name: torch.empty((n_test, n_offsets), dtype=torch.float32)
-        for name in OFFSET_STATISTIC_NAMES
+    horizon_statistics = {
+        name: torch.empty((n_test, n_contexts), dtype=torch.float32)
+        for name in HORIZON_STATISTIC_NAMES
     }
-    final_test_prediction = (
+    long_horizon_test_prediction = (
         torch.empty((n_test, model.cfg.d_sae), dtype=torch.float16)
-        if retain_final_test_codes
+        if retain_long_horizon_test_codes
         else None
     )
-    final_test_target = (
-        torch.empty_like(final_test_prediction)
-        if final_test_prediction is not None
+    endpoint_test_target = (
+        torch.empty_like(long_horizon_test_prediction)
+        if long_horizon_test_prediction is not None
         else None
     )
     permutation = torch.as_tensor(
         different_group_permutation(groups, seed),
         dtype=torch.long,
     )
-    shuffled_context = context[test_indices].index_select(0, permutation)
-    offsets = torch.arange(
-        1,
-        model.cfg.window_size,
-        device=device,
-        dtype=torch.long,
-    )
+    shuffled_test_indices = [
+        test_indices[int(position)]
+        for position in permutation.tolist()
+    ]
     for start in tqdm(
         range(0, n_test, batch_size),
         desc=f"{label}: locked streaming metrics",
@@ -226,79 +261,98 @@ def collect_model_outputs(
             dtype=model.pre_bias.dtype,
             non_blocking=True,
         )
-        batch_context = shuffled_context[start:end].to(
-            device=device,
-            dtype=model.pre_bias.dtype,
-            non_blocking=True,
-        )
         with autocast_context(device, amp_dtype):
             outputs = model(batch, use_context=use_context)
             if use_context:
+                shuffled_batch = x[
+                    shuffled_test_indices[start:end]
+                ].to(
+                    device=device,
+                    dtype=model.pre_bias.dtype,
+                    non_blocking=True,
+                )
+                shuffled_context_codes = model.encode(
+                    shuffled_batch[:, :-1]
+                )
                 shuffled, _ = model.predict_from_code(
-                    batch_context,
-                    offsets=offsets,
+                    shuffled_context_codes,
                     use_context=True,
                 )
             else:
                 shuffled = outputs["predicted_codes"]
-        batch_statistics = batch_offset_statistics(
+        batch_statistics = batch_horizon_statistics(
             outputs,
             shuffled,
             model.pre_bias,
         )
         stacked_statistics = torch.stack(
-            [batch_statistics[name] for name in OFFSET_STATISTIC_NAMES]
+            [batch_statistics[name] for name in HORIZON_STATISTIC_NAMES]
         ).cpu()
-        for statistic_index, name in enumerate(OFFSET_STATISTIC_NAMES):
-            offset_statistics[name][start:end].copy_(
+        for statistic_index, name in enumerate(HORIZON_STATISTIC_NAMES):
+            horizon_statistics[name][start:end].copy_(
                 stacked_statistics[statistic_index]
             )
-        if final_test_prediction is not None:
-            assert final_test_target is not None
-            final_test_prediction[start:end].copy_(
-                outputs["predicted_codes"][:, -1]
+        if long_horizon_test_prediction is not None:
+            assert endpoint_test_target is not None
+            long_horizon_test_prediction[start:end].copy_(
+                outputs["predicted_codes"][:, 0]
                 .to(torch.float16)
                 .cpu()
             )
-            final_test_target[start:end].copy_(
-                outputs["target_codes"][:, -1]
+            endpoint_test_target[start:end].copy_(
+                outputs["target_code"]
                 .to(torch.float16)
                 .cpu()
             )
     return {
         "context": context,
-        "final_prediction": final_prediction,
-        "offset_statistics": offset_statistics,
-        "window_code_cosine": offset_statistics["code_cosine"].mean(dim=1),
-        "final_test_prediction": final_test_prediction,
-        "final_test_target": final_test_target,
+        "long_horizon_prediction": long_horizon_prediction,
+        "online_endpoint": online_endpoint,
+        "endpoint_target": endpoint_target,
+        "horizon_statistics": horizon_statistics,
+        "window_code_cosine": horizon_statistics["code_cosine"].mean(dim=1),
+        "long_horizon_test_prediction": long_horizon_test_prediction,
+        "endpoint_test_target": endpoint_test_target,
         "reconstruction_fvu": reconstruction_error
         / max(reconstruction_scale, 1e-12),
+        "target_compatibility_fvu": compatibility_error
+        / max(reconstruction_scale, 1e-12),
+        "online_ema_endpoint_cosine": endpoint_alignment_sum / max(len(x), 1),
     }
 
 
-def offset_curve(
+def horizon_curve(
     outputs: dict[str, Any],
     groups: np.ndarray,
     seed: int,
     label: str,
 ) -> list[dict[str, Any]]:
-    statistics = outputs["offset_statistics"]
+    statistics = outputs["horizon_statistics"]
     assert isinstance(statistics, dict)
-    n_offsets = statistics["code_cosine"].shape[1]
+    n_contexts = statistics["code_cosine"].shape[1]
+    target_position = n_contexts
     rows = []
-    for offset in tqdm(
-        range(n_offsets),
-        desc=f"{label}: offset metrics",
+    for context_position in tqdm(
+        range(n_contexts),
+        desc=f"{label}: horizon metrics",
     ):
-        cosine = statistics["code_cosine"][:, offset]
-        shuffled_cosine = statistics["shuffled_context_cosine"][:, offset]
-        residual_error = statistics["residual_error"][:, offset]
-        residual_energy = statistics["residual_energy"][:, offset]
+        horizon = target_position - context_position
+        cosine = statistics["code_cosine"][:, context_position]
+        shuffled_cosine = statistics[
+            "shuffled_context_cosine"
+        ][:, context_position]
+        residual_error = statistics["residual_error"][:, context_position]
+        residual_energy = statistics["residual_energy"][:, context_position]
         context_gain = cosine.numpy() - shuffled_cosine.numpy()
         rows.append(
             {
-                "offset": offset + 1,
+                "context_position": context_position,
+                "horizon": horizon,
+                "context_target_cosine": float(
+                    statistics["context_target_cosine"][
+                        :, context_position
+                    ].mean().item()
+                ),
                 "code_cosine": float(cosine.mean().item()),
                 "shuffled_context_cosine": float(
                     shuffled_cosine.mean().item()
@@ -306,19 +360,27 @@ def offset_curve(
                 "context_gain": clustered_mean_ci(
                     context_gain,
                     groups,
-                    seed + 101 * offset,
+                    seed + 101 * context_position,
                 ),
                 "code_nrmse": float(
-                    statistics["code_nrmse"][:, offset].mean().item()
+                    statistics["code_nrmse"][
+                        :, context_position
+                    ].mean().item()
                 ),
                 "support_precision": float(
-                    statistics["support_precision"][:, offset].mean().item()
+                    statistics["support_precision"][
+                        :, context_position
+                    ].mean().item()
                 ),
                 "support_recall": float(
-                    statistics["support_recall"][:, offset].mean().item()
+                    statistics["support_recall"][
+                        :, context_position
+                    ].mean().item()
                 ),
                 "support_jaccard": float(
-                    statistics["support_jaccard"][:, offset].mean().item()
+                    statistics["support_jaccard"][
+                        :, context_position
+                    ].mean().item()
                 ),
                 "residual_prediction_fvu": float(
                     residual_error.mean().div(
@@ -332,10 +394,14 @@ def offset_curve(
                     .item()
                 ),
                 "prediction_norm": float(
-                    statistics["prediction_norm"][:, offset].mean().item()
+                    statistics["prediction_norm"][
+                        :, context_position
+                    ].mean().item()
                 ),
                 "target_norm": float(
-                    statistics["target_norm"][:, offset].mean().item()
+                    statistics["target_norm"][
+                        :, context_position
+                    ].mean().item()
                 ),
             }
         )
@@ -404,7 +470,7 @@ def top_forecast_features(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Locked-test evaluation of offset-conditioned JEPA-SAE"
+        description="Locked-test evaluation of fixed-endpoint JEPA-SAE"
     )
     parser.add_argument("--activations", required=True)
     parser.add_argument("--joint-checkpoint", required=True)
@@ -513,12 +579,17 @@ def main() -> None:
     checkpoints: dict[str, dict[str, Any]] = {}
     curves: dict[str, list[dict[str, Any]]] = {}
     reconstruction_fvu: dict[str, float] = {}
+    target_compatibility_fvu: dict[str, float] = {}
+    online_ema_endpoint_cosine: dict[str, float] = {}
     probe_contexts: dict[str, torch.Tensor] = {}
     probe_predictions: dict[str, torch.Tensor] = {}
+    probe_online_endpoints: dict[str, torch.Tensor] = {}
+    probe_targets: dict[str, torch.Tensor] = {}
     test_contexts: dict[str, torch.Tensor] = {}
     window_cosines: dict[str, torch.Tensor] = {}
-    joint_final_prediction: torch.Tensor | None = None
-    joint_final_target: torch.Tensor | None = None
+    joint_long_prediction: torch.Tensor | None = None
+    joint_online_endpoint: torch.Tensor | None = None
+    joint_endpoint_target: torch.Tensor | None = None
     reference_fingerprint: str | None = None
     reference_cfg: TransitionJEPAConfig | None = None
     for method_index, (method, path) in enumerate(paths.items()):
@@ -549,22 +620,32 @@ def main() -> None:
             use_context=method != "k_only",
             seed=args.seed,
             label=method,
-            retain_final_test_codes=method == "joint",
+            retain_long_horizon_test_codes=method == "joint",
         )
-        curves[method] = offset_curve(
+        curves[method] = horizon_curve(
             collected,
             groups,
             args.seed + method_index,
             method,
         )
         reconstruction_fvu[method] = float(collected["reconstruction_fvu"])
+        target_compatibility_fvu[method] = float(
+            collected["target_compatibility_fvu"]
+        )
+        online_ema_endpoint_cosine[method] = float(
+            collected["online_ema_endpoint_cosine"]
+        )
         context = collected["context"]
-        final_prediction = collected["final_prediction"]
+        long_prediction = collected["long_horizon_prediction"]
+        online_endpoint = collected["online_endpoint"]
+        endpoint_target = collected["endpoint_target"]
         window_code_cosine = collected["window_code_cosine"]
-        final_test_prediction = collected["final_test_prediction"]
-        final_test_target = collected["final_test_target"]
+        long_test_prediction = collected["long_horizon_test_prediction"]
+        endpoint_test_target = collected["endpoint_test_target"]
         assert isinstance(context, torch.Tensor)
-        assert isinstance(final_prediction, torch.Tensor)
+        assert isinstance(long_prediction, torch.Tensor)
+        assert isinstance(online_endpoint, torch.Tensor)
+        assert isinstance(endpoint_target, torch.Tensor)
         assert isinstance(window_code_cosine, torch.Tensor)
         probe_contexts[method] = select_probe_dimensions(
             context,
@@ -572,7 +653,17 @@ def main() -> None:
             args.probe_max_dim,
         ).to(torch.float16)
         probe_predictions[method] = select_probe_dimensions(
-            final_prediction,
+            long_prediction,
+            development_indices,
+            args.probe_max_dim,
+        ).to(torch.float16)
+        probe_online_endpoints[method] = select_probe_dimensions(
+            online_endpoint,
+            development_indices,
+            args.probe_max_dim,
+        ).to(torch.float16)
+        probe_targets[method] = select_probe_dimensions(
+            endpoint_target,
             development_indices,
             args.probe_max_dim,
         ).to(torch.float16)
@@ -580,17 +671,19 @@ def main() -> None:
             test_contexts[method] = context[test_indices].clone()
         window_cosines[method] = window_code_cosine
         if method == "joint":
-            assert isinstance(final_test_prediction, torch.Tensor)
-            assert isinstance(final_test_target, torch.Tensor)
-            joint_final_prediction = final_test_prediction
-            joint_final_target = final_test_target
+            assert isinstance(long_test_prediction, torch.Tensor)
+            assert isinstance(endpoint_test_target, torch.Tensor)
+            joint_long_prediction = long_test_prediction
+            joint_online_endpoint = online_endpoint[test_indices].clone()
+            joint_endpoint_target = endpoint_test_target
         checkpoints[method] = {
             "train_args": checkpoint["train_args"],
             "config": checkpoint["config"],
         }
         model.to("cpu")
-        del model, checkpoint, collected, context, final_prediction
-        del final_test_prediction, final_test_target
+        del model, checkpoint, collected, context, long_prediction
+        del online_endpoint, endpoint_target, long_test_prediction
+        del endpoint_test_target
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -599,9 +692,17 @@ def main() -> None:
     representations: dict[str, torch.Tensor] = {
         "joint_z0": probe_contexts["joint"].float(),
         "standard_sae_z0": probe_contexts["fixed"].float(),
-        "joint_predicted_final": probe_predictions["joint"].float(),
-        "fixed_predicted_final": probe_predictions["fixed"].float(),
-        "k_only_predicted_final": probe_predictions["k_only"].float(),
+        "joint_predicted_endpoint_from_h0": (
+            probe_predictions["joint"].float()
+        ),
+        "fixed_predicted_endpoint_from_h0": (
+            probe_predictions["fixed"].float()
+        ),
+        "horizon_only_predicted_endpoint": (
+            probe_predictions["k_only"].float()
+        ),
+        "joint_online_endpoint": probe_online_endpoints["joint"].float(),
+        "joint_ema_endpoint": probe_targets["joint"].float(),
         "raw_h0": select_probe_dimensions(
             x[:, 0],
             development_indices,
@@ -625,16 +726,17 @@ def main() -> None:
                 desc=f"MMLU {axis} probes",
             )
         }
-    assert joint_final_prediction is not None
-    assert joint_final_target is not None
+    assert joint_long_prediction is not None
+    assert joint_online_endpoint is not None
+    assert joint_endpoint_target is not None
     comparison = clustered_mean_ci(
         (window_cosines["joint"] - window_cosines["fixed"]).numpy(),
         groups,
         args.seed + 909,
     )
     features = top_forecast_features(
-        joint_final_prediction,
-        joint_final_target,
+        joint_long_prediction,
+        joint_endpoint_target,
         metadata,
         test_indices,
         reference_cfg.k,
@@ -642,8 +744,8 @@ def main() -> None:
     feature_ids = [row["feature_id"] for row in features]
     report = {
         "claim": (
-            "P(z0, k) extracts the sparse component of future residual states "
-            "that is forecastable before observing intervening tokens."
+            "P(z_k, k) extracts the component of one fixed endpoint code "
+            "that is already forecastable at each earlier context position."
         ),
         "interpretation_boundary": (
             "This is a conditional forecast under the data distribution, not "
@@ -651,17 +753,26 @@ def main() -> None:
         ),
         "architecture": {
             "window_size": reference_cfg.window_size,
-            "final_offset": reference_cfg.window_size - 1,
-            "context": "online Top-K SAE code at h0",
-            "targets": (
-                "stop-gradient EMA SAE codes at h1..."
+            "target_position": reference_cfg.window_size - 1,
+            "longest_horizon": reference_cfg.window_size - 1,
+            "contexts": (
+                "online Top-K SAE codes at h0..."
+                f"h{reference_cfg.window_size - 2}"
+            ),
+            "target": (
+                "one stop-gradient EMA SAE code at "
                 f"h{reference_cfg.window_size - 1}"
             ),
-            "predictor": "offset-conditioned MLP",
-            "target_aggregation": "none",
+            "predictor": "context-position-conditioned MLP",
+            "predictor_position_input": "context_position k",
+            "reported_horizon": "target_position - context_position",
+            "decoder_training": (
+                "online endpoint reconstruction plus decoder-only EMA-code "
+                "compatibility reconstruction"
+            ),
             "evaluation_aggregation": (
-                "stream scalar offset statistics; retain dense codes only "
-                "for the final-offset feature analysis"
+                "stream scalar horizon statistics; retain dense codes only "
+                "for the longest-horizon feature analysis"
             ),
         },
         "benchmark": {
@@ -685,9 +796,11 @@ def main() -> None:
             "n_locked_test_windows": len(test_indices),
             "n_locked_test_groups": len(np.unique(groups)),
         },
-        "locked_test_offset_curve": curves,
+        "locked_test_horizon_curve": curves,
         "primary_joint_minus_fixed_code_cosine": comparison,
         "reconstruction_fvu": reconstruction_fvu,
+        "target_compatibility_fvu": target_compatibility_fvu,
+        "online_ema_endpoint_cosine": online_ema_endpoint_cosine,
         "locked_test_mmlu_probes": probes,
         "collapse_diagnostics": {
             "joint_z0": collapse_diagnostics(
@@ -696,15 +809,22 @@ def main() -> None:
             "standard_sae_z0": collapse_diagnostics(
                 test_contexts["fixed"].float()
             ),
-            "joint_predicted_final_topk": collapse_diagnostics(
+            "joint_predicted_endpoint_from_h0_topk": collapse_diagnostics(
                 topk_relu(
-                    joint_final_prediction.float(),
+                    joint_long_prediction.float(),
                     reference_cfg.k,
                 )
             ),
+            "joint_ema_endpoint": collapse_diagnostics(
+                joint_endpoint_target.float()
+            ),
+            "joint_online_endpoint": collapse_diagnostics(
+                joint_online_endpoint.float()
+            ),
         },
         "top_forecast_features": {
-            "offset": reference_cfg.window_size - 1,
+            "context_position": 0,
+            "horizon": reference_cfg.window_size - 1,
             "features": features,
         },
         "checkpoint_settings": checkpoints,
@@ -713,14 +833,16 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "transition_jepa_report.json", report)
-    with (output_dir / "transition_offset_metrics.csv").open(
+    with (output_dir / "transition_horizon_metrics.csv").open(
         "w",
         encoding="utf-8",
         newline="",
     ) as handle:
         fieldnames = [
             "method",
-            "offset",
+            "context_position",
+            "horizon",
+            "context_target_cosine",
             "code_cosine",
             "shuffled_context_cosine",
             "context_gain",
@@ -786,14 +908,15 @@ def main() -> None:
                         "n_locked_test": result["n_locked_test"],
                     }
                 )
-    sparse_final = topk_relu(
-        joint_final_prediction.float(),
+    sparse_endpoint_prediction = topk_relu(
+        joint_long_prediction.float(),
         reference_cfg.k,
     )
     torch.save(
         {
             "window_size": reference_cfg.window_size,
-            "final_offset": reference_cfg.window_size - 1,
+            "target_position": reference_cfg.window_size - 1,
+            "longest_horizon": reference_cfg.window_size - 1,
             "embedding": pca_embedding(
                 test_contexts["joint"].float()
             ),
@@ -809,7 +932,9 @@ def main() -> None:
                 str(metadata[index][args.syntax_key]) for index in test_indices
             ],
             "feature_ids": feature_ids,
-            "feature_activations": sparse_final[:, feature_ids],
+            "feature_activations": (
+                sparse_endpoint_prediction[:, feature_ids]
+            ),
             "metadata": [metadata[index] for index in test_indices],
         },
         output_dir / "transition_visualization.pt",

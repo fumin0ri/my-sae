@@ -19,16 +19,24 @@ from .modeling import (
 )
 from .intervention_utils import (
     parse_feature_ids,
-    parse_offsets,
     restrict_features,
 )
-from .transition_jepa_sae import TransitionJEPAConfig, TransitionJEPASAE
+from .transition_jepa_sae import (
+    ARCHITECTURE_ID,
+    TransitionJEPAConfig,
+    TransitionJEPASAE,
+)
 
 
 def load_transition_model(
     path: str,
 ) -> tuple[TransitionJEPASAE, dict[str, Any]]:
     checkpoint = torch_load(path)
+    if checkpoint.get("architecture_id") != ARCHITECTURE_ID:
+        raise ValueError(
+            f"{path} is not a {ARCHITECTURE_ID} checkpoint. Rerun pipeline "
+            "stages 6 through 11 before causal intervention."
+        )
     model = TransitionJEPASAE(
         TransitionJEPAConfig(**checkpoint["config"])
     )
@@ -37,24 +45,16 @@ def load_transition_model(
     return model, checkpoint
 
 
-def resolve_offsets(
-    requested: tuple[int, ...] | None,
+def resolve_horizon(
+    requested: int | None,
     window_size: int,
-) -> tuple[int, ...]:
-    offsets = (
-        tuple(range(1, window_size))
-        if requested is None
-        else tuple(requested)
-    )
-    if (
-        not offsets
-        or min(offsets) < 1
-        or max(offsets) >= window_size
-    ):
+) -> int:
+    horizon = window_size - 1 if requested is None else requested
+    if not 1 <= horizon < window_size:
         raise ValueError(
-            f"--offsets must lie in [1, {window_size - 1}]"
+            f"--horizon must lie in [1, {window_size - 1}]"
         )
-    return offsets
+    return horizon
 
 
 def select_eligible_pairs(
@@ -95,7 +95,7 @@ def select_eligible_pairs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Causally edit offset-conditioned forecastable SAE features"
+        description="Edit a fixed endpoint using one context-position forecast"
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--pairs", required=True)
@@ -109,12 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="patch",
     )
     parser.add_argument(
-        "--offsets",
-        type=parse_offsets,
+        "--horizon",
+        type=int,
         default=None,
         help=(
-            "Comma-separated offsets. By default, use every checkpoint "
-            "offset from 1 through window_size-1."
+            "Distance from context to the fixed endpoint. The default is the "
+            "longest horizon, using context position zero."
         ),
     )
     parser.add_argument("--feature-ids", type=parse_feature_ids, default=())
@@ -167,7 +167,9 @@ def main() -> None:
     if checkpoint["train_args"].get("objective") != "joint":
         raise ValueError("causal intervention requires the joint JEPA-SAE checkpoint")
     width = jepa.cfg.window_size
-    args.offsets = resolve_offsets(args.offsets, width)
+    horizon = resolve_horizon(args.horizon, width)
+    target_position = width - 1
+    context_position = target_position - horizon
     source_cfg = checkpoint.get("source_config", {})
     del checkpoint
     mismatches = []
@@ -267,22 +269,26 @@ def main() -> None:
             0, target_window_start : len(target_prefix_ids)
         ].to(dtype=sae_dtype)
         source_window = source_hidden[0, -width:].to(dtype=sae_dtype)
-        offsets = torch.as_tensor(
-            args.offsets,
+        context_positions = torch.as_tensor(
+            [context_position],
             device=hidden_device,
             dtype=torch.long,
         )
         with torch.inference_mode():
-            source_z0 = jepa.encode(source_window[0:1])
-            target_z0 = jepa.encode(target_window[0:1])
+            source_context = jepa.encode(
+                source_window[context_position : context_position + 1]
+            )
+            target_context = jepa.encode(
+                target_window[context_position : context_position + 1]
+            )
             source_prediction, _ = jepa.predict_from_code(
-                source_z0,
-                offsets=offsets,
+                source_context,
+                context_positions=context_positions,
                 use_context=True,
             )
             target_prediction, _ = jepa.predict_from_code(
-                target_z0,
-                offsets=offsets,
+                target_context,
+                context_positions=context_positions,
                 use_context=True,
             )
             source_prediction = restrict_features(
@@ -301,7 +307,7 @@ def main() -> None:
             learned_delta = jepa.decode(
                 code_delta,
                 add_bias=False,
-            )[0]
+            )[0, 0]
             delta = learned_delta
             if args.mode == "random_ablate":
                 generator = torch.Generator(device="cpu").manual_seed(
@@ -312,19 +318,14 @@ def main() -> None:
                     generator=generator,
                     dtype=torch.float32,
                 ).to(hidden_device)
-                random = random / random.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-                delta = random * learned_delta.float().norm(
-                    dim=-1,
-                    keepdim=True,
-                )
+                random = random / random.norm().clamp_min(1e-8)
+                delta = random * learned_delta.float().norm()
             delta = (args.alpha * delta).to(target_hidden.dtype)
-        edit_positions = [
-            target_window_start + offset for offset in args.offsets
-        ]
+        endpoint_position = target_window_start + target_position
 
         def apply_edit(hidden: torch.Tensor) -> torch.Tensor:
             edited = hidden.clone()
-            edited[:, edit_positions, :] += delta
+            edited[:, endpoint_position, :] += delta
             return edited
 
         with torch.inference_mode(), edit_residual(
@@ -407,16 +408,15 @@ def main() -> None:
                 "eligible_index": eligible_index,
                 "mode": args.mode,
                 "alpha": args.alpha,
-                "offsets": list(args.offsets),
+                "context_position": context_position,
+                "target_position": target_position,
+                "horizon": horizon,
                 "feature_ids": list(args.feature_ids),
                 "baseline_answer_logprob": baseline_lp,
                 "edited_answer_logprob": edited_lp,
                 "delta_answer_logprob": edited_lp - baseline_lp,
                 "first_token_kl_baseline_to_edited": float(kl.item()),
-                "intervention_l2_per_offset": [
-                    float(value)
-                    for value in delta.float().norm(dim=-1).tolist()
-                ],
+                "intervention_l2": float(delta.float().norm().item()),
                 **contrast_metrics,
                 "metadata": {
                     key: value

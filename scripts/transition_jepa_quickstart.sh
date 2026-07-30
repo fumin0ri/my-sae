@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Offset-conditioned JEPA-SAE on one RTX 4090 (24GB), CUDA 12.1 compatible.
+# Fixed-endpoint JEPA-SAE on one RTX 4090 (24GB), CUDA 12.1 compatible.
 MODEL="${MODEL:-EleutherAI/pythia-6.9b-deduped}"
 default_safetensors_revision() {
   case "$1" in
@@ -37,6 +37,12 @@ STANDARD_STEPS="${STANDARD_STEPS:-12000}"
 FORECAST_STEPS="${FORECAST_STEPS:-8000}"
 PREDICTOR_WARMUP_STEPS="${PREDICTOR_WARMUP_STEPS:-1000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
+TARGET_COMPATIBILITY_WEIGHT="${TARGET_COMPATIBILITY_WEIGHT:-0.25}"
+INTERVENTION_HORIZON="${INTERVENTION_HORIZON:-$((WINDOW_SIZE - 1))}"
+if (( INTERVENTION_HORIZON < 1 || INTERVENTION_HORIZON >= WINDOW_SIZE )); then
+  echo "INTERVENTION_HORIZON must lie in [1, WINDOW_SIZE-1]" >&2
+  exit 2
+fi
 DEFAULT_WINDOW_BATCH_SIZE=$((320 / WINDOW_SIZE))
 if (( DEFAULT_WINDOW_BATCH_SIZE < 1 )); then
   DEFAULT_WINDOW_BATCH_SIZE=1
@@ -234,6 +240,7 @@ COMMON_FORECAST_ARGS=(
   --steps "$FORECAST_STEPS"
   --predictor-warmup-steps "$PREDICTOR_WARMUP_STEPS"
   --prediction-ramp-steps "$PREDICTION_RAMP_STEPS"
+  --target-compatibility-weight "$TARGET_COMPATIBILITY_WEIGHT"
   --batch-size "$BATCH_SIZE"
   --gradient-accumulation-steps "$GRADIENT_ACCUMULATION"
   --amp-dtype bfloat16
@@ -246,7 +253,7 @@ COMMON_FORECAST_ARGS=(
 )
 
 if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
-  echo "[6/11] Jointly tune the SAE dictionary and predictor on The Pile"
+  echo "[6/11] Jointly tune the endpoint dictionary and predictor on The Pile"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/joint" \
@@ -254,7 +261,7 @@ if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
 fi
 
 if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
-  echo "[7/11] Train a predictor on the frozen standard-SAE dictionary"
+  echo "[7/11] Train the endpoint predictor on the frozen standard SAE"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/fixed" \
@@ -262,7 +269,7 @@ if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
 fi
 
 if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
-  echo "[8/11] Train the offset-only shortcut control with z0 removed"
+  echo "[8/11] Train the position-only shortcut control"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/k_only" \
@@ -287,7 +294,7 @@ fi
 
 if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
   if [[ "$RUN_CAUSAL" == "1" ]]; then
-    echo "[10/11] Patch, ablate, and norm-match MMLU forecastable features"
+    echo "[10/11] Edit the MMLU endpoint from one prespecified horizon"
     sr-intervene-transition-jepa-sae \
       "${MODEL_LOAD_ARGS[@]}" \
       --pairs data/transition-jepa/pairs.jsonl \
@@ -296,6 +303,7 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode patch \
+      --horizon "$INTERVENTION_HORIZON" \
       --max-pairs "$PAIRS" \
       --minimum-pairs "$PAIRS" \
       --seed "$SEED"
@@ -307,6 +315,7 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode ablate \
+      --horizon "$INTERVENTION_HORIZON" \
       --max-pairs "$PAIRS" \
       --minimum-pairs "$PAIRS" \
       --seed "$SEED"
@@ -318,6 +327,7 @@ if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
       --layer "$LAYER" \
       --hook-point post \
       --mode random_ablate \
+      --horizon "$INTERVENTION_HORIZON" \
       --max-pairs "$PAIRS" \
       --minimum-pairs "$PAIRS" \
       --seed "$SEED"

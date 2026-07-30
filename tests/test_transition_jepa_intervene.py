@@ -2,20 +2,20 @@ import pytest
 import torch
 
 from shared_residual.transition_jepa_intervene import (
-    resolve_offsets,
+    resolve_horizon,
     select_eligible_pairs,
 )
 
 
-def test_default_intervention_offsets_follow_checkpoint_window() -> None:
-    assert resolve_offsets(None, 4) == (1, 2, 3)
-    assert resolve_offsets(None, 16) == tuple(range(1, 16))
+def test_default_intervention_horizon_uses_position_zero() -> None:
+    assert resolve_horizon(None, 4) == 3
+    assert resolve_horizon(None, 16) == 15
 
 
-def test_explicit_intervention_offsets_are_validated() -> None:
-    assert resolve_offsets((1, 4), 5) == (1, 4)
+def test_explicit_intervention_horizon_is_validated() -> None:
+    assert resolve_horizon(4, 5) == 4
     with pytest.raises(ValueError):
-        resolve_offsets((1, 5), 5)
+        resolve_horizon(5, 5)
 
 
 def test_causal_pair_selection_skips_short_prefixes_before_limit() -> None:
