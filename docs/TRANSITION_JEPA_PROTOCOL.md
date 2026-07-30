@@ -40,8 +40,9 @@ becomes available as context approaches the endpoint.
 2. Train one standard Top-K SAE on all positions as a shared initialization.
 3. Copy the online encoder, decoder, and normalization bias into a full EMA
    target SAE.
-4. Initialize joint, fixed-SAE, and position-only conditions from the exact
-   same checkpoint and activation fingerprint.
+4. Initialize unsplit joint, hierarchical high/low, fixed-SAE, and
+   position-only conditions from the exact same checkpoint and activation
+   fingerprint.
 5. Warm up each predictor with the SAE frozen.
 6. For the joint condition, unfreeze the online encoder and decoder, ramp the
    forecasting loss, update the full target SAE by EMA, and row-normalize the
@@ -95,6 +96,56 @@ causal interventions. Input-dependent EMA targets, online reconstruction,
 latent prediction, and predicted-residual reconstruction provide the
 anti-collapse constraints. Collapse statistics remain monitored outcomes.
 
+## T-SAE-inspired hierarchical condition
+
+The proposed condition adapts the two-group Temporal Matryoshka SAE design in
+[AI4LIFE-GROUP/temporal-saes](https://github.com/AI4LIFE-GROUP/temporal-saes).
+As in the upstream T-SAE experiment configuration, group 0 is the high-level
+20% of the dictionary and group 1 is the low-level 80%. Unlike a temporal
+smoothness penalty, our group-0 supervision is fixed-endpoint JEPA
+forecastability.
+
+The total dictionary width and total Top-K budget equal the unsplit joint
+baseline. Each group has an independent Top-K budget:
+
+```text
+d_high + d_low = d_sae
+k_high + k_low = k
+
+z_high = TopK_high(ReLU(E_high(h)))
+z_low  = TopK_low(ReLU(E_low(h)))
+```
+
+This prevents global competition from starving the low group. The endpoint
+uses a cumulative (Matryoshka) reconstruction:
+
+```text
+h_hat_high = bias + D_high(zT_high)
+h_hat_full = bias + D_high(zT_high) + D_low(zT_low)
+
+L_rec_hierarchical =
+    alpha * FVU(h_hat_high, hT)
+  + (1 - alpha) * FVU(h_hat_full, hT)
+```
+
+Only the high group is exposed to the predictor and latent forecast loss:
+
+```text
+z_hat_T_high_from_k = P(z_k_high, k)
+zT_high_target = stopgrad(E_EMA_high(hT))
+h_hat_predictable = bias_EMA + D_EMA_high(TopK_high(z_hat_T_high_from_k))
+```
+
+The low group receives gradients only through full endpoint reconstruction.
+The entire online high/low encoder and decoder are EMA-updated, and both EMA
+decoder blocks are row-normalized. Thus low is not discarded from the final
+SAE, while the high block is explicitly the proposed forecastable state.
+
+Default `high_fraction = alpha = 0.2`. These are prespecified but exposed as
+ablation parameters. The high/low interpretation is supported only if high
+beats low on semantic/context probes or forecast outcomes without sacrificing
+full reconstruction, and is weakened if low carries equal abstract signal.
+
 ## Confirmatory comparison
 
 The primary statistic is the per-question mean endpoint-code cosine across all
@@ -106,6 +157,17 @@ joint JEPA-SAE minus fixed standard-SAE predictor
 
 A question-group bootstrap supplies the 95% confidence interval. Horizon-wise
 curves remain available and must not be replaced by only the average.
+
+The new primary architectural comparison is:
+
+```text
+hierarchical high-group forecast cosine minus unsplit joint forecast cosine
+```
+
+The high and low context/endpoint codes are separately probed for MMLU
+semantics, domain context, and syntax. High-only and full EMA reconstruction
+FVU are reported together so that apparent abstraction cannot be purchased by
+silently dropping endpoint information.
 
 The joint claim requires:
 
@@ -128,6 +190,8 @@ The joint claim requires:
 - online versus EMA encoding of the exact same endpoint, with separate probe,
   collapse, alignment, and reconstruction diagnostics;
 - norm-matched random causal edits.
+- capacity-matched unsplit joint JEPA-SAE for the hierarchical condition;
+- low-group probes and collapse diagnostics as a negative/control channel.
 
 ## Locked-test outcomes
 
@@ -159,6 +223,7 @@ Secondary outcomes are:
 - collapse diagnostics;
 - top longest-horizon forecast features and examples;
 - endpoint patching, ablation, and norm-matched random controls.
+- direct high-versus-low MMLU probe comparison and high-only causal edits.
 
 The base score uses the same balanced zero-shot prompts and minimum-token
 eligibility rule as representation analysis. It is not the official five-shot

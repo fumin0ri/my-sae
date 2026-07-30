@@ -12,6 +12,10 @@ from shared_residual.transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
 )
+from shared_residual.hierarchical_transition_jepa_sae import (
+    HierarchicalTransitionJEPAConfig,
+    HierarchicalTransitionJEPASAE,
+)
 
 
 def test_batch_horizon_statistics_reduce_dense_codes_to_scalars() -> None:
@@ -107,6 +111,38 @@ def test_window_32_collection_retains_only_long_horizon_dense_codes() -> None:
     assert "all_test_predictions" not in collected
     assert "all_test_targets" not in collected
     assert "all_test_shuffled_predictions" not in collected
+
+
+def test_hierarchical_collection_retains_high_and_low_probe_codes() -> None:
+    model = HierarchicalTransitionJEPASAE(
+        HierarchicalTransitionJEPAConfig(
+            d_in=4,
+            d_sae=10,
+            k=5,
+            window_size=4,
+            predictor_width=4,
+            high_fraction=0.2,
+        )
+    )
+    x = torch.randn(6, 4, 4).to(torch.bfloat16)
+    collected = collect_model_outputs(
+        model,
+        x,
+        test_indices=[0, 2, 4],
+        groups=np.asarray(["a", "b", "c"]),
+        batch_size=2,
+        device=torch.device("cpu"),
+        amp_dtype="none",
+        use_context=True,
+        seed=3,
+        label="hierarchical-test",
+        retain_long_horizon_test_codes=True,
+    )
+    assert collected["context"].shape == (6, 2)
+    assert collected["long_horizon_prediction"].shape == (6, 2)
+    assert collected["low_context"].shape == (6, 8)
+    assert collected["low_endpoint_target"].shape == (6, 8)
+    assert collected["ema_high_reconstruction_fvu"] >= 0
 
 
 def test_mmlu_alignment_uses_question_ids_not_only_row_count() -> None:

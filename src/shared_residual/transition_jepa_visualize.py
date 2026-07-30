@@ -17,6 +17,7 @@ from .io import read_jsonl, torch_load, write_json
 
 COLORS = {
     "joint": "#2563eb",
+    "hierarchical": "#059669",
     "fixed": "#d97706",
     "k_only": "#64748b",
     "shuffled": "#94a3b8",
@@ -38,11 +39,12 @@ def save_figure(fig: plt.Figure, output_dir: Path, name: str) -> None:
 def training_plot(run_dir: Path, figures: Path) -> None:
     reports = {
         method: load_json(run_dir / method / "training_report.json")
-        for method in ("joint", "fixed", "k_only")
+        for method in ("joint", "hierarchical", "fixed", "k_only")
     }
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.2))
     labels = {
         "joint": "Joint JEPA-SAE",
+        "hierarchical": "High/low JEPA-SAE",
         "fixed": "Fixed SAE + predictor",
         "k_only": "Position only",
     }
@@ -96,6 +98,70 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     save_figure(fig, figures, "training-curves")
 
 
+def hierarchical_training_plot(run_dir: Path, figures: Path) -> None:
+    report = load_json(
+        run_dir / "hierarchical" / "training_report.json"
+    )
+    history = report["history"]
+    steps = [row["step"] for row in history]
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.4))
+    for key, label, color, linestyle in (
+        (
+            "online_high_reconstruction_fvu",
+            "Online high only",
+            COLORS["hierarchical"],
+            "--",
+        ),
+        (
+            "online_reconstruction_fvu",
+            "Online high + low",
+            COLORS["hierarchical"],
+            "-",
+        ),
+        (
+            "ema_high_reconstruction_fvu",
+            "EMA high only",
+            "#84cc16",
+            "--",
+        ),
+        (
+            "ema_reconstruction_fvu",
+            "EMA high + low",
+            "#84cc16",
+            "-",
+        ),
+    ):
+        axes[0].plot(
+            steps,
+            [row["validation"][key] for row in history],
+            label=label,
+            color=color,
+            linestyle=linestyle,
+        )
+    axes[1].plot(
+        steps,
+        [row["validation"]["high_l0"] for row in history],
+        label="High-group L0",
+        color=COLORS["hierarchical"],
+    )
+    axes[1].plot(
+        steps,
+        [row["validation"]["low_l0"] for row in history],
+        label="Low-group L0",
+        color="#84cc16",
+    )
+    axes[0].set_title("Hierarchical cumulative reconstruction")
+    axes[0].set_ylabel("Validation FVU")
+    axes[1].set_title("Independent group sparsity budgets")
+    axes[1].set_ylabel("Active features per position")
+    for axis in axes:
+        axis.set_xlabel("Optimizer step")
+        axis.grid(alpha=0.2)
+        axis.legend(frameon=False)
+    fig.tight_layout()
+    save_figure(fig, figures, "hierarchical-training")
+
+
 def horizon_plot(report: dict[str, Any], figures: Path) -> None:
     curves = report["locked_test_horizon_curve"]
     all_positions = [
@@ -104,6 +170,7 @@ def horizon_plot(report: dict[str, Any], figures: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.5))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
+        ("hierarchical", "High/low JEPA-SAE (high)"),
         ("fixed", "Fixed SAE + predictor"),
         ("k_only", "Position only"),
     ):
@@ -162,6 +229,7 @@ def support_innovation_plot(report: dict[str, Any], figures: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.2))
     for method, label in (
         ("joint", "Joint JEPA-SAE"),
+        ("hierarchical", "High/low JEPA-SAE (high)"),
         ("fixed", "Fixed SAE + predictor"),
         ("k_only", "Position only"),
     ):
@@ -281,6 +349,84 @@ def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
     save_figure(fig, figures, "mmlu-probes")
 
 
+def hierarchical_probe_plot(
+    report: dict[str, Any],
+    figures: Path,
+) -> None:
+    """Directly test whether the learned high/low partition specializes."""
+    probes = report["locked_test_mmlu_probes"]
+    order = [
+        ("High context", "hierarchical_high_ema_z0", COLORS["hierarchical"]),
+        ("Low context", "hierarchical_low_ema_z0", "#84cc16"),
+        (
+            "Predicted high endpoint",
+            "hierarchical_high_predicted_endpoint_from_h0",
+            "#0f766e",
+        ),
+        (
+            "High endpoint",
+            "hierarchical_high_ema_endpoint",
+            "#14b8a6",
+        ),
+        (
+            "Low endpoint",
+            "hierarchical_low_ema_endpoint",
+            "#a3e635",
+        ),
+        ("Unsplit context", "joint_ema_z0", COLORS["joint"]),
+    ]
+    titles = {
+        "semantics": "Semantics",
+        "context": "Context/domain",
+        "syntax": "Syntax/template",
+    }
+    positions = np.arange(len(order))
+    fig, axes = plt.subplots(1, 3, figsize=(16.8, 4.9), sharey=True)
+    for axis, (probe_axis, title) in zip(axes, titles.items()):
+        values = [
+            probes[probe_axis][key]["accuracy"] for _, key, _ in order
+        ]
+        low = [
+            values[index]
+            - probes[probe_axis][key]["group_bootstrap"]["ci95_low"]
+            for index, (_, key, _) in enumerate(order)
+        ]
+        high = [
+            probes[probe_axis][key]["group_bootstrap"]["ci95_high"]
+            - values[index]
+            for index, (_, key, _) in enumerate(order)
+        ]
+        axis.bar(positions, values, color=[row[2] for row in order])
+        axis.errorbar(
+            positions,
+            values,
+            yerr=np.asarray([low, high]),
+            fmt="none",
+            color="black",
+            capsize=3,
+        )
+        axis.axhline(
+            probes[probe_axis]["joint_ema_z0"]["chance_accuracy"],
+            linestyle="--",
+            color="#111827",
+        )
+        axis.set_xticks(
+            positions,
+            [row[0] for row in order],
+            rotation=25,
+            ha="right",
+        )
+        axis.set_ylim(0, 1)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.2)
+    axes[0].set_ylabel("Locked-test linear-probe accuracy")
+    fig.suptitle(
+        "Does the high dictionary carry more abstract information than low?"
+    )
+    fig.tight_layout()
+    save_figure(fig, figures, "hierarchical-high-low-probes")
+
+
 def mmlu_model_plot(report: dict[str, Any], figures: Path) -> None:
     results = report["benchmark"]["base_model_accuracy"]
     context = results["by_context"]
@@ -382,9 +528,18 @@ def intervention_plot(
     figures: Path,
 ) -> dict[str, Any] | None:
     paths = {
-        "Contradictory forecast patch": analysis_dir / "intervention-patch.jsonl",
-        "Forecastable-feature ablation": analysis_dir / "intervention-ablate.jsonl",
-        "Norm-matched random": analysis_dir / "intervention-random.jsonl",
+        "Unsplit patch": analysis_dir / "intervention-joint-patch.jsonl",
+        "Unsplit ablation": analysis_dir / "intervention-joint-ablate.jsonl",
+        "Unsplit random": analysis_dir / "intervention-joint-random.jsonl",
+        "High-only patch": (
+            analysis_dir / "intervention-hierarchical-patch.jsonl"
+        ),
+        "High-only ablation": (
+            analysis_dir / "intervention-hierarchical-ablate.jsonl"
+        ),
+        "High-only random": (
+            analysis_dir / "intervention-hierarchical-random.jsonl"
+        ),
     }
     if not all(path.exists() for path in paths.values()):
         return None
@@ -403,43 +558,51 @@ def intervention_plot(
     )
     for body, color in zip(
         violin["bodies"],
-        [COLORS["patch"], COLORS["ablate"], COLORS["shuffled"]],
+        [
+            COLORS["patch"],
+            COLORS["ablate"],
+            COLORS["shuffled"],
+            "#0f766e",
+            COLORS["hierarchical"],
+            "#86efac",
+        ],
     ):
         body.set_facecolor(color)
         body.set_alpha(0.55)
     violin["cmeans"].set_color("black")
     ax.axhline(0, color="#334155", linewidth=1)
-    ax.set_xticks(range(1, 4), list(paths))
+    ax.set_xticks(range(1, len(paths) + 1), list(paths), rotation=18, ha="right")
     ax.set_ylabel("Change in target-answer log probability")
     ax.set_title("Causal edits restricted to the forecastable component")
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     save_figure(fig, figures, "causal-interventions")
 
-    paired = (
-        values["Forecastable-feature ablation"]
-        - values["Norm-matched random"]
-    )
-    rng = np.random.default_rng(991)
-    bootstrap = np.asarray(
-        [
-            rng.choice(paired, size=len(paired), replace=True).mean()
-            for _ in range(5000)
-        ]
-    )
-    low, high = np.quantile(bootstrap, [0.025, 0.975])
-    signs = rng.choice([-1.0, 1.0], size=(10000, len(paired)))
-    null = (signs * paired[None, :]).mean(axis=1)
-    observed = float(paired.mean())
-    return {
+    summary = {
         label: {
             "n": len(group),
             "mean": float(group.mean()),
             "median": float(np.median(group)),
         }
         for label, group in values.items()
-    } | {
-        "learned_minus_random": {
+    }
+    rng = np.random.default_rng(991)
+    for method, learned_key, random_key in (
+        ("joint", "Unsplit ablation", "Unsplit random"),
+        ("hierarchical", "High-only ablation", "High-only random"),
+    ):
+        paired = values[learned_key] - values[random_key]
+        bootstrap = np.asarray(
+            [
+                rng.choice(paired, size=len(paired), replace=True).mean()
+                for _ in range(5000)
+            ]
+        )
+        low, high = np.quantile(bootstrap, [0.025, 0.975])
+        signs = rng.choice([-1.0, 1.0], size=(10000, len(paired)))
+        null = (signs * paired[None, :]).mean(axis=1)
+        observed = float(paired.mean())
+        summary[f"{method}_learned_minus_random"] = {
             "mean": observed,
             "ci95_low": float(low),
             "ci95_high": float(high),
@@ -452,7 +615,7 @@ def intervention_plot(
                 else 0.0
             ),
         }
-    }
+    return summary
 
 
 def fmt(value: Any, digits: int = 3) -> str:
@@ -467,11 +630,15 @@ def write_html(
     interventions: dict[str, Any] | None,
 ) -> None:
     comparison = report["primary_joint_minus_fixed_code_cosine"]
+    hierarchical_comparison = report[
+        "primary_hierarchical_minus_joint_code_cosine"
+    ]
     curves = report["locked_test_horizon_curve"]
     joint_early = curves["joint"][0]
     joint_late = curves["joint"][-1]
     fixed_early = curves["fixed"][0]
     position_only_early = curves["k_only"][0]
+    hierarchical_early = curves["hierarchical"][0]
     mmlu = report["benchmark"]["base_model_accuracy"]
     probes = report["locked_test_mmlu_probes"]
     endpoint_alignment = report["online_ema_endpoint_cosine"]["joint"]
@@ -481,9 +648,17 @@ def write_html(
     longest_horizon = report["architecture"]["longest_horizon"]
     figures = [
         ("Training dynamics", "figures/training-curves.png"),
+        (
+            "High/low reconstruction and sparsity",
+            "figures/hierarchical-training.png",
+        ),
         ("Endpoint forecast and context gain", "figures/horizon-forecast.png"),
         ("Support and innovation", "figures/support-and-innovation.png"),
         ("MMLU semantics, context, and syntax", "figures/mmlu-probes.png"),
+        (
+            "Hierarchical high/low representation probes",
+            "figures/hierarchical-high-low-probes.png",
+        ),
         ("Base LLM MMLU accuracy", "figures/mmlu-base-model.png"),
         ("JEPA-SAE context embedding", "figures/context-embedding.png"),
         ("Forecast feature heatmap", "figures/forecast-feature-heatmap.png"),
@@ -497,13 +672,21 @@ def write_html(
     )
     causal_html = ""
     if interventions is not None:
-        learned = interventions["learned_minus_random"]
+        learned = interventions["joint_learned_minus_random"]
+        hierarchical_learned = interventions[
+            "hierarchical_learned_minus_random"
+        ]
         causal_html = (
             "<section><h2>Causal summary</h2>"
-            "<p>Forecastable-feature ablation minus norm-matched random: "
+            "<p>Unsplit ablation minus norm-matched random: "
             f"mean={fmt(learned['mean'])}, 95% CI "
             f"[{fmt(learned['ci95_low'])}, {fmt(learned['ci95_high'])}], "
-            f"sign-flip p={fmt(learned['sign_flip_p'])}.</p></section>"
+            f"sign-flip p={fmt(learned['sign_flip_p'])}. "
+            "High-only ablation minus norm-matched random: "
+            f"mean={fmt(hierarchical_learned['mean'])}, 95% CI "
+            f"[{fmt(hierarchical_learned['ci95_low'])}, "
+            f"{fmt(hierarchical_learned['ci95_high'])}], sign-flip "
+            f"p={fmt(hierarchical_learned['sign_flip_p'])}.</p></section>"
         )
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -519,11 +702,13 @@ main {{ max-width:1120px; margin:auto; padding:36px 20px 70px; }}
 section {{ margin-top:34px; }} section img {{ width:100%; background:white; border:1px solid var(--line); border-radius:10px; }}
 code {{ color:inherit; }}
 </style></head><body><main>
-<h1>All-context to fixed-endpoint JEPA-SAE</h1>
-<p class="subtitle">Training uses the online SAE as a gradient-trained student and the full EMA SAE as teacher. Locked evaluation uses the final EMA encoder-decoder pair for context codes, endpoint targets, and predicted-residual decoding.</p>
+<h1>High/low fixed-endpoint JEPA-SAE</h1>
+<p class="subtitle">The T-SAE-inspired condition partitions a capacity-matched dictionary into a JEPA-supervised high group and a reconstruction-detail low group. The original unsplit JEPA-SAE remains the primary baseline. Both use an online student and a full EMA teacher/final SAE.</p>
 <div class="metrics">
 <div class="metric"><span>Joint − fixed cosine</span><strong>{fmt(comparison['mean'])}</strong></div>
 <div class="metric"><span>Group-bootstrap 95% CI</span><strong>{fmt(comparison['ci95_low'])} to {fmt(comparison['ci95_high'])}</strong></div>
+<div class="metric"><span>High/low minus unsplit forecast cosine</span><strong>{fmt(hierarchical_comparison['mean'])}</strong></div>
+<div class="metric"><span>High/low h0 to endpoint cosine</span><strong>{fmt(hierarchical_early['code_cosine'])}</strong></div>
 <div class="metric"><span>Joint h0→h{target_position} cosine</span><strong>{fmt(joint_early['code_cosine'])}</strong></div>
 <div class="metric"><span>Joint h{target_position - 1}→h{target_position} cosine</span><strong>{fmt(joint_late['code_cosine'])}</strong></div>
 <div class="metric"><span>Fixed horizon-{longest_horizon} cosine</span><strong>{fmt(fixed_early['code_cosine'])}</strong></div>
@@ -567,9 +752,11 @@ def main() -> None:
     figures.mkdir(parents=True, exist_ok=True)
     report = load_json(run_dir / "analysis" / "transition_jepa_report.json")
     training_plot(run_dir, figures)
+    hierarchical_training_plot(run_dir, figures)
     horizon_plot(report, figures)
     support_innovation_plot(report, figures)
     mmlu_probe_plot(report, figures)
+    hierarchical_probe_plot(report, figures)
     mmlu_model_plot(report, figures)
     embedding_and_heatmap(run_dir, figures)
     interventions = intervention_plot(run_dir / "analysis", figures)
@@ -579,6 +766,9 @@ def main() -> None:
         {
             "primary_comparison": report[
                 "primary_joint_minus_fixed_code_cosine"
+            ],
+            "hierarchical_comparison": report[
+                "primary_hierarchical_minus_joint_code_cosine"
             ],
             "horizon_curve": report["locked_test_horizon_curve"],
             "mmlu_probes": report["locked_test_mmlu_probes"],

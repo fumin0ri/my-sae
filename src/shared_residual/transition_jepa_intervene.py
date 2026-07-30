@@ -26,20 +26,33 @@ from .transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
 )
+from .hierarchical_transition_jepa_sae import (
+    HIERARCHICAL_ARCHITECTURE_ID,
+    HierarchicalTransitionJEPAConfig,
+    HierarchicalTransitionJEPASAE,
+)
 
 
 def load_transition_model(
     path: str,
-) -> tuple[TransitionJEPASAE, dict[str, Any]]:
+) -> tuple[
+    TransitionJEPASAE | HierarchicalTransitionJEPASAE,
+    dict[str, Any],
+]:
     checkpoint = torch_load(path)
-    if checkpoint.get("architecture_id") != ARCHITECTURE_ID:
-        raise ValueError(
-            f"{path} is not a {ARCHITECTURE_ID} checkpoint. Rerun pipeline "
-            "stages 6 through 11 before causal intervention."
+    architecture_id = checkpoint.get("architecture_id")
+    if architecture_id == ARCHITECTURE_ID:
+        model = TransitionJEPASAE(
+            TransitionJEPAConfig(**checkpoint["config"])
         )
-    model = TransitionJEPASAE(
-        TransitionJEPAConfig(**checkpoint["config"])
-    )
+    elif architecture_id == HIERARCHICAL_ARCHITECTURE_ID:
+        model = HierarchicalTransitionJEPASAE(
+            HierarchicalTransitionJEPAConfig(**checkpoint["config"])
+        )
+    else:
+        raise ValueError(
+            f"{path} has unsupported architecture_id={architecture_id!r}"
+        )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model, checkpoint
@@ -275,10 +288,10 @@ def main() -> None:
             dtype=torch.long,
         )
         with torch.inference_mode():
-            source_context = jepa.encode_ema(
+            source_context = jepa.encode_forecast_ema(
                 source_window[context_position : context_position + 1]
             )
-            target_context = jepa.encode_ema(
+            target_context = jepa.encode_forecast_ema(
                 target_window[context_position : context_position + 1]
             )
             source_prediction = jepa.predict_from_code(
@@ -292,11 +305,11 @@ def main() -> None:
                 use_context=True,
             )
             source_prediction = restrict_features(
-                topk_relu(source_prediction, jepa.cfg.k),
+                topk_relu(source_prediction, jepa.forecast_k),
                 args.feature_ids,
             )
             target_prediction = restrict_features(
-                topk_relu(target_prediction, jepa.cfg.k),
+                topk_relu(target_prediction, jepa.forecast_k),
                 args.feature_ids,
             )
             code_delta = (
@@ -304,7 +317,7 @@ def main() -> None:
                 if args.mode == "patch"
                 else -target_prediction
             )
-            learned_delta = jepa.decode_ema(
+            learned_delta = jepa.decode_forecast_ema(
                 code_delta,
                 add_bias=False,
             )[0, 0]

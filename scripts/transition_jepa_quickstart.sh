@@ -32,6 +32,8 @@ if (( WINDOW_SIZE < 2 )); then
 fi
 D_SAE="${D_SAE:-32768}"
 K="${K:-64}"
+HIGH_FRACTION="${HIGH_FRACTION:-0.2}"
+HIGH_RECONSTRUCTION_WEIGHT="${HIGH_RECONSTRUCTION_WEIGHT:-0.2}"
 PREDICTOR_WIDTH="${PREDICTOR_WIDTH:-512}"
 STANDARD_STEPS="${STANDARD_STEPS:-12000}"
 FORECAST_STEPS="${FORECAST_STEPS:-8000}"
@@ -96,9 +98,9 @@ TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_DIR="${RUN_DIR:-runs/transition-jepa-pile}"
 START_STAGE="${START_STAGE:-1}"
-END_STAGE="${END_STAGE:-11}"
-if (( START_STAGE < 1 || START_STAGE > 11 || END_STAGE < 1 || END_STAGE > 11 )); then
-  echo "START_STAGE and END_STAGE must lie in [1, 11]" >&2
+END_STAGE="${END_STAGE:-12}"
+if (( START_STAGE < 1 || START_STAGE > 12 || END_STAGE < 1 || END_STAGE > 12 )); then
+  echo "START_STAGE and END_STAGE must lie in [1, 12]" >&2
   exit 2
 fi
 if (( START_STAGE > END_STAGE )); then
@@ -110,6 +112,7 @@ export USE_SAFETENSORS
 
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
 echo "Window config: W=$WINDOW_SIZE, train batch=$BATCH_SIZE windows, evaluation batch=$EVAL_BATCH_SIZE windows"
+echo "Hierarchical config: high fraction=$HIGH_FRACTION, high-only reconstruction weight=$HIGH_RECONSTRUCTION_WEIGHT (total D_SAE=$D_SAE, total K=$K)"
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then
   MODEL_LOAD_ARGS+=(--revision "$REVISION")
@@ -156,7 +159,7 @@ if [[ "$PILE_SKIP_DISK_SPACE_CHECK" == "1" ]]; then
   PILE_BUDGET_ARGS+=(--skip-disk-space-check)
 fi
 if (( START_STAGE <= 1 && END_STAGE >= 1 )); then
-  echo "[1/11] Stream the official Pile mixture and extract residual shards"
+  echo "[1/12] Stream the official Pile mixture and extract residual shards"
   sr-extract-pile \
     "${MODEL_LOAD_ARGS[@]}" \
     "${PILE_DATA_ARGS[@]}" \
@@ -172,7 +175,7 @@ if (( START_STAGE <= 1 && END_STAGE >= 1 )); then
 fi
 
 if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
-  echo "[2/11] Build the balanced MMLU locked-test benchmark"
+  echo "[2/12] Build the balanced MMLU locked-test benchmark"
   sr-make-mmlu \
     --prompts-output data/transition-jepa/prompts.jsonl \
     --pairs-output data/transition-jepa/pairs.jsonl \
@@ -185,7 +188,7 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
 fi
 
 if (( START_STAGE <= 3 && END_STAGE >= 3 )); then
-  echo "[3/11] Extract MMLU residual trajectories for evaluation only"
+  echo "[3/12] Extract MMLU residual trajectories for evaluation only"
   sr-extract-grid \
     "${MODEL_LOAD_ARGS[@]}" \
     --data data/transition-jepa/prompts.jsonl \
@@ -201,7 +204,7 @@ if (( START_STAGE <= 3 && END_STAGE >= 3 )); then
 fi
 
 if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
-  echo "[4/11] Measure zero-shot base-LLM MMLU answer accuracy"
+  echo "[4/12] Measure zero-shot base-LLM MMLU answer accuracy"
   sr-score-mmlu \
     "${MODEL_LOAD_ARGS[@]}" \
     --data data/transition-jepa/prompts.jsonl \
@@ -213,7 +216,7 @@ if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
 fi
 
 if (( START_STAGE <= 5 && END_STAGE >= 5 )); then
-  echo "[5/11] Pretrain the common all-position standard SAE on The Pile"
+  echo "[5/12] Pretrain the common all-position standard SAE on The Pile"
   sr-train-standard-sae \
     --activation-manifest "$ACTIVATION_MANIFEST" \
     --output-dir "$RUN_DIR/standard" \
@@ -251,7 +254,7 @@ COMMON_FORECAST_ARGS=(
 )
 
 if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
-  echo "[6/11] Train the online student, full EMA SAE, and endpoint predictor"
+  echo "[6/12] Train the existing unsplit JEPA-SAE baseline"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/joint" \
@@ -259,26 +262,38 @@ if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
 fi
 
 if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
-  echo "[7/11] Train the endpoint predictor on the frozen standard SAE"
+  echo "[7/12] Train the T-SAE-inspired high/low JEPA-SAE"
+  sr-train-transition-jepa-sae \
+    "${COMMON_FORECAST_ARGS[@]}" \
+    --output-dir "$RUN_DIR/hierarchical" \
+    --objective joint \
+    --architecture hierarchical \
+    --high-fraction "$HIGH_FRACTION" \
+    --high-reconstruction-weight "$HIGH_RECONSTRUCTION_WEIGHT"
+fi
+
+if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
+  echo "[8/12] Train the endpoint predictor on the frozen standard SAE"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/fixed" \
     --objective fixed
 fi
 
-if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
-  echo "[8/11] Train the position-only shortcut control"
+if (( START_STAGE <= 9 && END_STAGE >= 9 )); then
+  echo "[9/12] Train the position-only shortcut control"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/k_only" \
     --objective k_only
 fi
 
-if (( START_STAGE <= 9 && END_STAGE >= 9 )); then
-  echo "[9/11] Evaluate the final EMA SAE on question-grouped locked MMLU"
+if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
+  echo "[10/12] Compare unsplit, high/low, fixed, and position-only models"
   sr-evaluate-transition-jepa-sae \
     --activations "$EVAL_ACTIVATIONS" \
     --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
+    --hierarchical-checkpoint "$RUN_DIR/hierarchical/transition_jepa_sae.pt" \
     --fixed-checkpoint "$RUN_DIR/fixed/transition_jepa_sae.pt" \
     --k-only-checkpoint "$RUN_DIR/k_only/transition_jepa_sae.pt" \
     --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
@@ -290,57 +305,41 @@ if (( START_STAGE <= 9 && END_STAGE >= 9 )); then
     --split-seed "$SPLIT_SEED"
 fi
 
-if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
+if (( START_STAGE <= 11 && END_STAGE >= 11 )); then
   if [[ "$RUN_CAUSAL" == "1" ]]; then
-    echo "[10/11] Edit the MMLU endpoint through the final EMA decoder"
-    sr-intervene-transition-jepa-sae \
-      "${MODEL_LOAD_ARGS[@]}" \
-      --pairs data/transition-jepa/pairs.jsonl \
-      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-      --output "$RUN_DIR/analysis/intervention-patch.jsonl" \
-      --layer "$LAYER" \
-      --hook-point post \
-      --mode patch \
-      --horizon "$INTERVENTION_HORIZON" \
-      --max-pairs "$PAIRS" \
-      --minimum-pairs "$PAIRS" \
-      --seed "$SEED"
-    sr-intervene-transition-jepa-sae \
-      "${MODEL_LOAD_ARGS[@]}" \
-      --pairs data/transition-jepa/pairs.jsonl \
-      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-      --output "$RUN_DIR/analysis/intervention-ablate.jsonl" \
-      --layer "$LAYER" \
-      --hook-point post \
-      --mode ablate \
-      --horizon "$INTERVENTION_HORIZON" \
-      --max-pairs "$PAIRS" \
-      --minimum-pairs "$PAIRS" \
-      --seed "$SEED"
-    sr-intervene-transition-jepa-sae \
-      "${MODEL_LOAD_ARGS[@]}" \
-      --pairs data/transition-jepa/pairs.jsonl \
-      --checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
-      --output "$RUN_DIR/analysis/intervention-random.jsonl" \
-      --layer "$LAYER" \
-      --hook-point post \
-      --mode random_ablate \
-      --horizon "$INTERVENTION_HORIZON" \
-      --max-pairs "$PAIRS" \
-      --minimum-pairs "$PAIRS" \
-      --seed "$SEED"
+    echo "[11/12] Compare causal edits through unsplit and high-only EMA decoders"
+    for METHOD in joint hierarchical; do
+      for MODE in patch ablate random_ablate; do
+        OUTPUT_MODE="$MODE"
+        if [[ "$MODE" == "random_ablate" ]]; then
+          OUTPUT_MODE="random"
+        fi
+        sr-intervene-transition-jepa-sae \
+          "${MODEL_LOAD_ARGS[@]}" \
+          --pairs data/transition-jepa/pairs.jsonl \
+          --checkpoint "$RUN_DIR/$METHOD/transition_jepa_sae.pt" \
+          --output "$RUN_DIR/analysis/intervention-$METHOD-$OUTPUT_MODE.jsonl" \
+          --layer "$LAYER" \
+          --hook-point post \
+          --mode "$MODE" \
+          --horizon "$INTERVENTION_HORIZON" \
+          --max-pairs "$PAIRS" \
+          --minimum-pairs "$PAIRS" \
+          --seed "$SEED"
+      done
+    done
   else
-    echo "[10/11] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+    echo "[11/12] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
   fi
 fi
 
-if (( START_STAGE <= 11 && END_STAGE >= 11 )); then
-  echo "[11/11] Build PNG/PDF figures and a self-contained HTML report"
+if (( START_STAGE <= 12 && END_STAGE >= 12 )); then
+  echo "[12/12] Build PNG/PDF figures and a self-contained HTML report"
   sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 fi
 
 echo
-if (( END_STAGE == 11 )); then
+if (( END_STAGE == 12 )); then
   echo "Done. Open: $RUN_DIR/report/index.html"
 else
   echo "Done. Completed stages $START_STAGE through $END_STAGE."

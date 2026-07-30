@@ -1,4 +1,4 @@
-# All-context fixed-endpoint JEPA-SAE
+# High/low fixed-endpoint JEPA-SAE
 
 Frozen autoregressive LLMのresidual trajectoryから、各context位置ですでに
 予測可能な固定endpointの内部状態を疎な辞書として抽出する研究コードです。
@@ -122,18 +122,18 @@ windows、1 shard 320 windowsとなり、W=10とほぼ同じ約41 GiBに収ま�
 W=128では2 windowsになります。VRAMに余裕がある場合は明示的に上書きできます。
 
 完了済みstageがあるrunは`START_STAGE`で既存artifactから再開できます。たとえば
-stage 9の評価だけをやり直してreportまで生成する場合:
+stage 10の評価だけをやり直してreportまで生成する場合:
 
 ```bash
 WINDOW_SIZE=32 \
-START_STAGE=9 \
+START_STAGE=10 \
 RUN_CAUSAL=0 \
 RUN_DIR=runs/transition-jepa-pile \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
 `END_STAGE`を指定すると単一stageだけを安全に再実行できます。Wを変更した旧runで
-stage 9に`base-model MMLU results and activation rows`の不一致が出た場合は、
+stage 10に`base-model MMLU results and activation rows`の不一致が出た場合は、
 checkpointとactivationを作り直さずstage 4だけを再採点してから再開します。
 
 ```bash
@@ -142,11 +142,11 @@ START_STAGE=4 END_STAGE=4 \
 bash scripts/transition_jepa_quickstart.sh
 
 WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
-START_STAGE=9 \
+START_STAGE=10 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-stage 9はcontext/horizonごとのdense codeを全件保持せず、batch内でscalar
+stage 10はcontext/horizonごとのdense codeを全件保持せず、batch内でscalar
 statisticsへ集約します。大きいwindowでも、最長horizonのfeature解析に必要な
 codeだけを保持します。
 
@@ -159,6 +159,74 @@ WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
 START_STAGE=6 \
 bash scripts/transition_jepa_quickstart.sh
 ```
+
+## T-SAE型 high/low 条件
+
+既存のunsplit JEPA-SAEを比較対象として残したまま、T-SAEの
+Temporal Matryoshka設計を取り入れた`hierarchical`条件を追加しています。
+公式実装の既定設定に合わせ、全辞書の20%をhigh、80%をlowへ割り当てます。
+
+```text
+EMA endpoint code zT = [zT-high | zT-low]
+
+high:
+  20% of features, 20% of total Top-K
+  high-only endpoint reconstruction
+  P(z-high-k, k) -> stopgrad(zT-high)
+  predicted residual = DEMA-high(TopK(P(...)))
+
+low:
+  80% of features, 80% of total Top-K
+  no JEPA prediction supervision
+  adds detail to the cumulative full reconstruction
+```
+
+hierarchical条件の再構成損失は
+
+```text
+Lrec = alpha * FVU(Dhigh(zhigh), hT)
+     + (1-alpha) * FVU(Dhigh(zhigh) + Dlow(zlow), hT)
+
+L = Lrec + lambda-prediction * (Llatent + lambda-residual * Lpredicted-residual)
+```
+
+です。既定値は`HIGH_FRACTION=0.2`、
+`HIGH_RECONSTRUCTION_WEIGHT=0.2`です。総辞書幅`D_SAE`と総Top-K `K`は
+unsplit baselineと同じなので、表現容量とL0 budgetを揃えて比較できます。
+high/lowには独立Top-Kを適用し、low groupがglobal Top-Kで飢餓状態になる
+交絡を避けています。両groupを含むonline SAE全体を勾配更新し、その全体を
+EMA SAEへ更新します。最終成果物はhigh/low分割を保持した
+`hierarchical/ema_sae.pt`です。
+
+quickstartは次の4条件を同じPile artifactから学習・評価します。
+
+- `joint`: 既存のunsplit JEPA-SAE baseline
+- `hierarchical`: T-SAE型high/low JEPA-SAE（提案法）
+- `fixed`: frozen standard SAE + predictor
+- `k_only`: position-only shortcut control
+
+評価では、high/lowそれぞれのcontext・endpoint表現についてMMLUの
+semantics/context/syntax probeを表示し、high forecastとunsplit forecastの
+question-group bootstrap差、high-only/full reconstruction FVU、collapse統計、
+forecast curve、high-only causal editを出力します。
+
+既存のPile activation、standard SAE、joint/fixed/k-only checkpointを再利用して
+新しい条件だけ追加する場合は、次のように実行します。
+
+```bash
+# 新しいhigh/low条件
+START_STAGE=7 END_STAGE=7 \
+RUN_DIR=runs/transition-jepa-pile \
+bash scripts/transition_jepa_quickstart.sh
+
+# fixed/k-onlyを既に持っている場合は、比較評価・因果介入・可視化
+START_STAGE=10 \
+RUN_DIR=runs/transition-jepa-pile \
+bash scripts/transition_jepa_quickstart.sh
+```
+
+新しいstage番号は、6=unsplit、7=hierarchical、8=fixed、9=k-only、
+10=locked evaluation、11=causal intervention、12=visualizationです。
 
 ## The Pile training data
 
@@ -275,9 +343,9 @@ sourceとtargetの両方が`WINDOW_SIZE`以上の実tokenを持つpairだけを�
 pairをpatch・ablation・random対照で共通利用します。候補数は`PAIR_POOL_SIZE`、
 実行pair数は`PAIRS`で変更できます。
 
-旧runのstage 10で`prefix is shorter than checkpoint window`が出た場合、学習や
-stage 9をやり直す必要はありません。stage 2でpair poolだけ再生成してからstage
-10へ進みます。
+旧runの因果介入で`prefix is shorter than checkpoint window`が出た場合、学習や
+stage 10をやり直す必要はありません。stage 2でpair poolだけ再生成してからstage
+11へ進みます。
 
 ```bash
 WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
@@ -285,7 +353,7 @@ START_STAGE=2 END_STAGE=2 \
 bash scripts/transition_jepa_quickstart.sh
 
 WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
-START_STAGE=10 \
+START_STAGE=11 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 

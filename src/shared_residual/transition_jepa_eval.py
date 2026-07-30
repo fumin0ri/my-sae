@@ -31,6 +31,11 @@ from .transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
 )
+from .hierarchical_transition_jepa_sae import (
+    HIERARCHICAL_ARCHITECTURE_ID,
+    HierarchicalTransitionJEPAConfig,
+    HierarchicalTransitionJEPASAE,
+)
 
 PROBE_LABELS = {
     "semantics": "semantic_answer",
@@ -55,15 +60,26 @@ HORIZON_STATISTIC_NAMES = (
 def load_model(
     path: str | Path,
     device: torch.device,
-) -> tuple[TransitionJEPASAE, dict[str, Any]]:
+) -> tuple[
+    TransitionJEPASAE | HierarchicalTransitionJEPASAE,
+    dict[str, Any],
+]:
     checkpoint = torch_load(path)
-    if checkpoint.get("architecture_id") != ARCHITECTURE_ID:
-        raise ValueError(
-            f"{path} is not a {ARCHITECTURE_ID} checkpoint. Reuse the "
-            "matching Pile activations and standard SAE, then rerun pipeline "
-            "stages 6 through 11."
+    architecture_id = checkpoint.get("architecture_id")
+    if architecture_id == ARCHITECTURE_ID:
+        model = TransitionJEPASAE(
+            TransitionJEPAConfig(**checkpoint["config"])
         )
-    model = TransitionJEPASAE(TransitionJEPAConfig(**checkpoint["config"]))
+    elif architecture_id == HIERARCHICAL_ARCHITECTURE_ID:
+        model = HierarchicalTransitionJEPASAE(
+            HierarchicalTransitionJEPAConfig(**checkpoint["config"])
+        )
+    else:
+        raise ValueError(
+            f"{path} has unsupported architecture_id={architecture_id!r}; "
+            f"expected {ARCHITECTURE_ID!r} or "
+            f"{HIERARCHICAL_ARCHITECTURE_ID!r}."
+        )
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
     return model, checkpoint
@@ -151,7 +167,7 @@ def batch_horizon_statistics(
 
 @torch.no_grad()
 def collect_model_outputs(
-    model: TransitionJEPASAE,
+    model: TransitionJEPASAE | HierarchicalTransitionJEPASAE,
     x: torch.Tensor,
     test_indices: list[int],
     groups: np.ndarray,
@@ -163,15 +179,25 @@ def collect_model_outputs(
     label: str,
     retain_long_horizon_test_codes: bool,
 ) -> dict[str, Any]:
+    forecast_dim = model.forecast_dim
     context = torch.empty(
-        (len(x), model.cfg.d_sae),
+        (len(x), forecast_dim),
         dtype=torch.float16,
     )
     long_horizon_prediction = torch.empty_like(context)
     online_endpoint = torch.empty_like(context)
     endpoint_target = torch.empty_like(context)
+    low_context = (
+        torch.empty((len(x), model.low_dim), dtype=torch.float16)
+        if isinstance(model, HierarchicalTransitionJEPASAE)
+        else None
+    )
+    low_endpoint_target = (
+        torch.empty_like(low_context) if low_context is not None else None
+    )
     online_reconstruction_error = 0.0
     ema_reconstruction_error = 0.0
+    ema_high_reconstruction_error = 0.0
     online_reconstruction_scale = 0.0
     ema_reconstruction_scale = 0.0
     endpoint_alignment_sum = 0.0
@@ -203,6 +229,14 @@ def collect_model_outputs(
         endpoint_target[start:end].copy_(
             outputs["target_code"].to(torch.float16).cpu()
         )
+        if low_context is not None:
+            assert low_endpoint_target is not None
+            low_context[start:end].copy_(
+                outputs["low_context_code"].to(torch.float16).cpu()
+            )
+            low_endpoint_target[start:end].copy_(
+                outputs["target_low_code"].to(torch.float16).cpu()
+            )
         endpoint_alignment_sum += float(
             F.cosine_similarity(
                 outputs["online_target_code"].float(),
@@ -220,6 +254,12 @@ def collect_model_outputs(
                 outputs["target_reconstruction"] - batch[:, -1]
             ).float().square().sum().item()
         )
+        if "target_high_reconstruction" in outputs:
+            ema_high_reconstruction_error += float(
+                (
+                    outputs["target_high_reconstruction"] - batch[:, -1]
+                ).float().square().sum().item()
+            )
         online_reconstruction_scale += float(
             (batch[:, -1] - model.pre_bias).float().square().sum().item()
         )
@@ -232,7 +272,7 @@ def collect_model_outputs(
     n_test = len(test_indices)
     n_contexts = model.cfg.window_size - 1
     avoided_dense_gib = (
-        3 * n_test * n_contexts * model.cfg.d_sae * 2 / 2**30
+        3 * n_test * n_contexts * forecast_dim * 2 / 2**30
     )
     print(
         f"{label}: streaming horizon statistics; avoiding approximately "
@@ -243,7 +283,7 @@ def collect_model_outputs(
         for name in HORIZON_STATISTIC_NAMES
     }
     long_horizon_test_prediction = (
-        torch.empty((n_test, model.cfg.d_sae), dtype=torch.float16)
+        torch.empty((n_test, forecast_dim), dtype=torch.float16)
         if retain_long_horizon_test_codes
         else None
     )
@@ -285,7 +325,7 @@ def collect_model_outputs(
                     dtype=model.pre_bias.dtype,
                     non_blocking=True,
                 )
-                shuffled_context_codes = model.encode_ema(
+                shuffled_context_codes = model.encode_forecast_ema(
                     shuffled_batch[:, :-1]
                 )
                 shuffled = model.predict_from_code(
@@ -323,6 +363,8 @@ def collect_model_outputs(
         "long_horizon_prediction": long_horizon_prediction,
         "online_endpoint": online_endpoint,
         "endpoint_target": endpoint_target,
+        "low_context": low_context,
+        "low_endpoint_target": low_endpoint_target,
         "horizon_statistics": horizon_statistics,
         "window_code_cosine": horizon_statistics["code_cosine"].mean(dim=1),
         "long_horizon_test_prediction": long_horizon_test_prediction,
@@ -331,7 +373,16 @@ def collect_model_outputs(
         / max(online_reconstruction_scale, 1e-12),
         "ema_reconstruction_fvu": ema_reconstruction_error
         / max(ema_reconstruction_scale, 1e-12),
-        "online_ema_endpoint_cosine": endpoint_alignment_sum / max(len(x), 1),
+        "ema_high_reconstruction_fvu": (
+            ema_high_reconstruction_error
+            / max(ema_reconstruction_scale, 1e-12)
+            if low_context is not None
+            else None
+        ),
+        "online_ema_endpoint_cosine": max(
+            -1.0,
+            min(1.0, endpoint_alignment_sum / max(len(x), 1)),
+        ),
     }
 
 
@@ -488,6 +539,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--activations", required=True)
     parser.add_argument("--joint-checkpoint", required=True)
+    parser.add_argument(
+        "--hierarchical-checkpoint",
+        required=True,
+        help="T-SAE-inspired high/low model trained on the same artifacts",
+    )
     parser.add_argument("--fixed-checkpoint", required=True)
     parser.add_argument("--k-only-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -587,6 +643,7 @@ def main() -> None:
     )
     paths = {
         "joint": args.joint_checkpoint,
+        "hierarchical": args.hierarchical_checkpoint,
         "fixed": args.fixed_checkpoint,
         "k_only": args.k_only_checkpoint,
     }
@@ -594,11 +651,14 @@ def main() -> None:
     curves: dict[str, list[dict[str, Any]]] = {}
     online_reconstruction_fvu: dict[str, float] = {}
     ema_reconstruction_fvu: dict[str, float] = {}
+    ema_high_reconstruction_fvu: dict[str, float | None] = {}
     online_ema_endpoint_cosine: dict[str, float] = {}
     probe_contexts: dict[str, torch.Tensor] = {}
     probe_predictions: dict[str, torch.Tensor] = {}
     probe_online_endpoints: dict[str, torch.Tensor] = {}
     probe_targets: dict[str, torch.Tensor] = {}
+    probe_low_contexts: dict[str, torch.Tensor] = {}
+    probe_low_targets: dict[str, torch.Tensor] = {}
     test_contexts: dict[str, torch.Tensor] = {}
     window_cosines: dict[str, torch.Tensor] = {}
     joint_long_prediction: torch.Tensor | None = None
@@ -606,6 +666,9 @@ def main() -> None:
     joint_endpoint_target: torch.Tensor | None = None
     reference_fingerprint: str | None = None
     reference_cfg: TransitionJEPAConfig | None = None
+    hierarchical_cfg: HierarchicalTransitionJEPAConfig | None = None
+    hierarchical_long_prediction: torch.Tensor | None = None
+    hierarchical_endpoint_target: torch.Tensor | None = None
     for method_index, (method, path) in enumerate(paths.items()):
         model, checkpoint = load_model(path, device)
         if x.shape[1] != model.cfg.window_size:
@@ -634,7 +697,10 @@ def main() -> None:
             use_context=method != "k_only",
             seed=args.seed,
             label=method,
-            retain_long_horizon_test_codes=method == "joint",
+            retain_long_horizon_test_codes=method in {
+                "joint",
+                "hierarchical",
+            },
         )
         curves[method] = horizon_curve(
             collected,
@@ -648,6 +714,9 @@ def main() -> None:
         ema_reconstruction_fvu[method] = float(
             collected["ema_reconstruction_fvu"]
         )
+        ema_high_reconstruction_fvu[method] = collected[
+            "ema_high_reconstruction_fvu"
+        ]
         online_ema_endpoint_cosine[method] = float(
             collected["online_ema_endpoint_cosine"]
         )
@@ -658,6 +727,8 @@ def main() -> None:
         window_code_cosine = collected["window_code_cosine"]
         long_test_prediction = collected["long_horizon_test_prediction"]
         endpoint_test_target = collected["endpoint_test_target"]
+        low_context = collected["low_context"]
+        low_endpoint_target = collected["low_endpoint_target"]
         assert isinstance(context, torch.Tensor)
         assert isinstance(long_prediction, torch.Tensor)
         assert isinstance(online_endpoint, torch.Tensor)
@@ -683,6 +754,18 @@ def main() -> None:
             development_indices,
             args.probe_max_dim,
         ).to(torch.float16)
+        if isinstance(low_context, torch.Tensor):
+            assert isinstance(low_endpoint_target, torch.Tensor)
+            probe_low_contexts[method] = select_probe_dimensions(
+                low_context,
+                development_indices,
+                args.probe_max_dim,
+            ).to(torch.float16)
+            probe_low_targets[method] = select_probe_dimensions(
+                low_endpoint_target,
+                development_indices,
+                args.probe_max_dim,
+            ).to(torch.float16)
         if method in {"joint", "fixed"}:
             test_contexts[method] = context[test_indices].clone()
         window_cosines[method] = window_code_cosine
@@ -692,6 +775,13 @@ def main() -> None:
             joint_long_prediction = long_test_prediction
             joint_online_endpoint = online_endpoint[test_indices].clone()
             joint_endpoint_target = endpoint_test_target
+        if method == "hierarchical":
+            assert isinstance(model.cfg, HierarchicalTransitionJEPAConfig)
+            assert isinstance(long_test_prediction, torch.Tensor)
+            assert isinstance(endpoint_test_target, torch.Tensor)
+            hierarchical_cfg = model.cfg
+            hierarchical_long_prediction = long_test_prediction
+            hierarchical_endpoint_target = endpoint_test_target
         checkpoints[method] = {
             "train_args": checkpoint["train_args"],
             "config": checkpoint["config"],
@@ -699,7 +789,7 @@ def main() -> None:
         model.to("cpu")
         del model, checkpoint, collected, context, long_prediction
         del online_endpoint, endpoint_target, long_test_prediction
-        del endpoint_test_target
+        del endpoint_test_target, low_context, low_endpoint_target
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -708,17 +798,32 @@ def main() -> None:
     representations: dict[str, torch.Tensor] = {
         "joint_ema_z0": probe_contexts["joint"].float(),
         "fixed_ema_z0": probe_contexts["fixed"].float(),
+        "hierarchical_high_ema_z0": (
+            probe_contexts["hierarchical"].float()
+        ),
+        "hierarchical_low_ema_z0": (
+            probe_low_contexts["hierarchical"].float()
+        ),
         "joint_predicted_endpoint_from_h0": (
             probe_predictions["joint"].float()
         ),
         "fixed_predicted_endpoint_from_h0": (
             probe_predictions["fixed"].float()
         ),
+        "hierarchical_high_predicted_endpoint_from_h0": (
+            probe_predictions["hierarchical"].float()
+        ),
         "position_only_predicted_endpoint": (
             probe_predictions["k_only"].float()
         ),
         "joint_online_endpoint": probe_online_endpoints["joint"].float(),
         "joint_ema_endpoint": probe_targets["joint"].float(),
+        "hierarchical_high_ema_endpoint": (
+            probe_targets["hierarchical"].float()
+        ),
+        "hierarchical_low_ema_endpoint": (
+            probe_low_targets["hierarchical"].float()
+        ),
         "raw_h0": select_probe_dimensions(
             x[:, 0],
             development_indices,
@@ -745,10 +850,20 @@ def main() -> None:
     assert joint_long_prediction is not None
     assert joint_online_endpoint is not None
     assert joint_endpoint_target is not None
+    assert hierarchical_cfg is not None
+    assert hierarchical_long_prediction is not None
+    assert hierarchical_endpoint_target is not None
     comparison = clustered_mean_ci(
         (window_cosines["joint"] - window_cosines["fixed"]).numpy(),
         groups,
         args.seed + 909,
+    )
+    hierarchical_comparison = clustered_mean_ci(
+        (
+            window_cosines["hierarchical"] - window_cosines["joint"]
+        ).numpy(),
+        groups,
+        args.seed + 910,
     )
     features = top_forecast_features(
         joint_long_prediction,
@@ -758,10 +873,19 @@ def main() -> None:
         reference_cfg.k,
     )
     feature_ids = [row["feature_id"] for row in features]
+    hierarchical_features = top_forecast_features(
+        hierarchical_long_prediction,
+        hierarchical_endpoint_target,
+        metadata,
+        test_indices,
+        hierarchical_cfg.k_high,
+    )
     report = {
         "claim": (
-            "P(z_k, k) extracts the component of one fixed endpoint code "
-            "that is already forecastable at each earlier context position."
+            "The hierarchical model allocates a dedicated sparse high-level "
+            "dictionary to the component of one fixed endpoint code that is "
+            "forecastable from each earlier context; a separate low-level "
+            "dictionary adds non-forecast-supervised reconstruction detail."
         ),
         "interpretation_boundary": (
             "This is a conditional forecast under the data distribution, not "
@@ -794,6 +918,23 @@ def main() -> None:
                 "stream scalar horizon statistics; retain dense codes only "
                 "for the longest-horizon feature analysis"
             ),
+            "hierarchical_partition": {
+                "inspiration": (
+                    "T-SAE/Temporal Matryoshka SAE group-0 high-level and "
+                    "group-1 low-level cumulative reconstruction"
+                ),
+                "d_high": hierarchical_cfg.d_high,
+                "d_low": hierarchical_cfg.d_low,
+                "k_high": hierarchical_cfg.k_high,
+                "k_low": hierarchical_cfg.k_low,
+                "high_reconstruction_weight": (
+                    hierarchical_cfg.high_reconstruction_weight
+                ),
+                "full_reconstruction_weight": (
+                    1.0 - hierarchical_cfg.high_reconstruction_weight
+                ),
+                "prediction_supervision": "high group only",
+            },
         },
         "benchmark": {
             "name": "MMLU",
@@ -818,8 +959,12 @@ def main() -> None:
         },
         "locked_test_horizon_curve": curves,
         "primary_joint_minus_fixed_code_cosine": comparison,
+        "primary_hierarchical_minus_joint_code_cosine": (
+            hierarchical_comparison
+        ),
         "online_reconstruction_fvu": online_reconstruction_fvu,
         "ema_reconstruction_fvu": ema_reconstruction_fvu,
+        "ema_high_reconstruction_fvu": ema_high_reconstruction_fvu,
         "online_ema_endpoint_cosine": online_ema_endpoint_cosine,
         "locked_test_mmlu_probes": probes,
         "collapse_diagnostics": {
@@ -828,6 +973,12 @@ def main() -> None:
             ),
             "fixed_ema_z0": collapse_diagnostics(
                 test_contexts["fixed"].float()
+            ),
+            "hierarchical_high_ema_z0": collapse_diagnostics(
+                probe_contexts["hierarchical"][test_indices].float()
+            ),
+            "hierarchical_low_ema_z0": collapse_diagnostics(
+                probe_low_contexts["hierarchical"][test_indices].float()
             ),
             "joint_predicted_endpoint_from_h0_topk": collapse_diagnostics(
                 topk_relu(
@@ -846,6 +997,11 @@ def main() -> None:
             "context_position": 0,
             "horizon": reference_cfg.window_size - 1,
             "features": features,
+        },
+        "hierarchical_top_high_features": {
+            "context_position": 0,
+            "horizon": reference_cfg.window_size - 1,
+            "features": hierarchical_features,
         },
         "checkpoint_settings": checkpoints,
         "pile_training_data_fingerprint": reference_fingerprint,

@@ -4,7 +4,7 @@ import argparse
 import copy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -125,6 +125,14 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
         )
         self.transition_predictor = PositionConditionedPredictor(cfg)
 
+    @property
+    def forecast_dim(self) -> int:
+        return self.cfg.d_sae
+
+    @property
+    def forecast_k(self) -> int:
+        return self.cfg.k
+
     @torch.no_grad()
     def load_standard_sae(self, checkpoint: dict[str, Any]) -> None:
         source_cfg = checkpoint["config"]
@@ -202,6 +210,17 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
         """Decode through the frozen EMA decoder while preserving dz gradients."""
         decoded = self.pre_scale * (z @ self.ema_decoder)
         return decoded + self.ema_pre_bias if add_bias else decoded
+
+    @torch.no_grad()
+    def encode_forecast_ema(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encode_ema(x)
+
+    def decode_forecast_ema(
+        self,
+        z: torch.Tensor,
+        add_bias: bool = True,
+    ) -> torch.Tensor:
+        return self.decode_ema(z, add_bias=add_bias)
 
     @torch.no_grad()
     def final_ema_sae_state_dict(self) -> dict[str, torch.Tensor]:
@@ -534,6 +553,9 @@ def evaluate_losses(
     residual_prediction_weight: float,
     use_context: bool,
     amp_dtype: str,
+    loss_function: Callable[..., tuple[torch.Tensor, dict[str, float]]] = (
+        transition_jepa_loss
+    ),
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
@@ -546,7 +568,7 @@ def evaluate_losses(
     ):
         x = x.to(device, non_blocking=True)
         with autocast_context(device, amp_dtype):
-            _, metrics = transition_jepa_loss(
+            _, metrics = loss_function(
                 model,
                 x,
                 prediction_weight,
@@ -582,8 +604,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["joint", "fixed", "k_only"],
         default="joint",
     )
+    parser.add_argument(
+        "--architecture",
+        choices=["baseline", "hierarchical"],
+        default="baseline",
+        help=(
+            "baseline preserves the original JEPA-SAE; hierarchical partitions "
+            "the same dictionary and L0 budget into high/low T-SAE-style groups"
+        ),
+    )
     parser.add_argument("--d-sae", type=int, default=2048)
     parser.add_argument("--k", type=int, default=32)
+    parser.add_argument(
+        "--high-fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of dictionary features and Top-K budget in the high group",
+    )
+    parser.add_argument(
+        "--high-reconstruction-weight",
+        type=float,
+        default=0.2,
+        help=(
+            "Weight on high-only endpoint FVU; one minus this weights full FVU"
+        ),
+    )
     parser.add_argument("--predictor-width", type=int, default=256)
     parser.add_argument("--predictor-expansion", type=int, default=2)
     parser.add_argument("--prediction-weight", type=float, default=1.0)
@@ -646,16 +691,36 @@ def main() -> None:
             args.seed,
         )
     )
-    cfg = TransitionJEPAConfig(
-        d_in=int(manifest["d_in"]),
-        d_sae=args.d_sae,
-        k=args.k,
-        window_size=int(manifest["window_size"]),
-        predictor_width=args.predictor_width,
-        predictor_expansion=args.predictor_expansion,
-        ema_decay=args.ema_decay,
-    )
-    model = TransitionJEPASAE(cfg).to(device)
+    common_cfg = {
+        "d_in": int(manifest["d_in"]),
+        "d_sae": args.d_sae,
+        "k": args.k,
+        "window_size": int(manifest["window_size"]),
+        "predictor_width": args.predictor_width,
+        "predictor_expansion": args.predictor_expansion,
+        "ema_decay": args.ema_decay,
+    }
+    architecture_id = ARCHITECTURE_ID
+    loss_function = transition_jepa_loss
+    if args.architecture == "hierarchical":
+        from .hierarchical_transition_jepa_sae import (
+            HIERARCHICAL_ARCHITECTURE_ID,
+            HierarchicalTransitionJEPAConfig,
+            HierarchicalTransitionJEPASAE,
+            hierarchical_transition_jepa_loss,
+        )
+
+        cfg = HierarchicalTransitionJEPAConfig(
+            **common_cfg,
+            high_fraction=args.high_fraction,
+            high_reconstruction_weight=args.high_reconstruction_weight,
+        )
+        model = HierarchicalTransitionJEPASAE(cfg).to(device)
+        architecture_id = HIERARCHICAL_ARCHITECTURE_ID
+        loss_function = hierarchical_transition_jepa_loss
+    else:
+        cfg = TransitionJEPAConfig(**common_cfg)
+        model = TransitionJEPASAE(cfg).to(device)
     model.load_standard_sae(standard_checkpoint)
     source_config = standard_checkpoint.get("source_config", {})
     del standard_checkpoint
@@ -729,7 +794,7 @@ def main() -> None:
             batch = next(iterator)
             batch = batch.to(device, non_blocking=True)
             with autocast_context(device, args.amp_dtype):
-                loss, metrics = transition_jepa_loss(
+                loss, metrics = loss_function(
                     model,
                     batch,
                     active_prediction_weight,
@@ -772,6 +837,7 @@ def main() -> None:
                 args.residual_prediction_weight,
                 use_context,
                 args.amp_dtype if device.type == "cuda" else "none",
+                loss_function,
             )
             history.append(
                 {
@@ -785,7 +851,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "architecture_id": ARCHITECTURE_ID,
+        "architecture_id": architecture_id,
         "state_dict": {
             key: value.detach().cpu()
             for key, value in model.state_dict().items()
@@ -804,13 +870,28 @@ def main() -> None:
     }
     torch.save(
         {
-            "architecture_id": ARCHITECTURE_ID,
+            "architecture_id": architecture_id,
             "state_dict": ema_sae_state_dict,
             "config": {
                 "d_in": cfg.d_in,
                 "d_sae": cfg.d_sae,
                 "k": cfg.k,
                 "window_size": cfg.window_size,
+                "architecture": args.architecture,
+                **(
+                    {
+                        "high_fraction": cfg.high_fraction,
+                        "high_reconstruction_weight": (
+                            cfg.high_reconstruction_weight
+                        ),
+                        "d_high": cfg.d_high,
+                        "d_low": cfg.d_low,
+                        "k_high": cfg.k_high,
+                        "k_low": cfg.k_low,
+                    }
+                    if args.architecture == "hierarchical"
+                    else {}
+                ),
             },
             "source_transition_checkpoint": "transition_jepa_sae.pt",
             "data_fingerprint": fingerprint,
@@ -821,27 +902,42 @@ def main() -> None:
     write_json(
         output_dir / "training_report.json",
         {
-            "method": {
-                "joint": "joint fixed-endpoint JEPA-SAE",
-                "fixed": "fixed standard SAE plus position-conditioned predictor",
-                "k_only": "position-only predictor with no context code",
-            }[args.objective],
+            "method": (
+                "T-SAE-inspired high/low fixed-endpoint JEPA-SAE"
+                if args.architecture == "hierarchical"
+                else {
+                    "joint": "joint fixed-endpoint JEPA-SAE",
+                    "fixed": (
+                        "fixed standard SAE plus position-conditioned predictor"
+                    ),
+                    "k_only": "position-only predictor with no context code",
+                }[args.objective]
+            ),
             "objective": args.objective,
             "scientific_interpretation": (
                 "P(z_k, k) estimates the component of the fixed endpoint z_T "
                 "forecastable from context position k."
             ),
             "architecture": {
-                "id": ARCHITECTURE_ID,
+                "id": architecture_id,
+                "variant": args.architecture,
                 "window_size": cfg.window_size,
                 "target_position": cfg.window_size - 1,
                 "contexts": (
-                    "Top-K online SAE codes at h0..."
-                    f"h{cfg.window_size - 2}"
+                    (
+                        "high-group Top-K online SAE codes at h0..."
+                        if args.architecture == "hierarchical"
+                        else "Top-K online SAE codes at h0..."
+                    )
+                    + f"h{cfg.window_size - 2}"
                 ),
                 "target": (
-                    "one stop-gradient full-EMA SAE code at "
-                    f"h{cfg.window_size - 1}"
+                    (
+                        "one stop-gradient high-group EMA SAE code at "
+                        if args.architecture == "hierarchical"
+                        else "one stop-gradient full-EMA SAE code at "
+                    )
+                    + f"h{cfg.window_size - 1}"
                 ),
                 "predictor": (
                     "position-conditioned MLP with dense softplus output"
@@ -849,6 +945,34 @@ def main() -> None:
                 "predictor_position_input": "context_position k",
                 "reported_horizon": "target_position - context_position",
                 "sae_reconstruction_positions": "fixed endpoint only",
+                "dictionary_partition": (
+                    {
+                        "high": {
+                            "features": cfg.d_high,
+                            "topk": cfg.k_high,
+                            "role": (
+                                "endpoint-predictable state; high-only "
+                                "reconstruction and JEPA losses"
+                            ),
+                        },
+                        "low": {
+                            "features": cfg.d_low,
+                            "topk": cfg.k_low,
+                            "role": (
+                                "incremental endpoint detail; full "
+                                "reconstruction loss only"
+                            ),
+                        },
+                        "high_reconstruction_weight": (
+                            cfg.high_reconstruction_weight
+                        ),
+                        "full_reconstruction_weight": (
+                            1.0 - cfg.high_reconstruction_weight
+                        ),
+                    }
+                    if args.architecture == "hierarchical"
+                    else None
+                ),
                 "online_sae": "gradient-trained student encoder and decoder",
                 "ema_sae": (
                     "EMA teacher/final encoder, decoder, and normalization bias"
