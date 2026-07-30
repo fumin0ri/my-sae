@@ -52,9 +52,23 @@ def training_plot(run_dir: Path, figures: Path) -> None:
         color = COLORS[method]
         axes[0].plot(
             steps,
-            [row["validation"]["reconstruction_fvu"] for row in history],
+            [
+                row["validation"]["online_reconstruction_fvu"]
+                for row in history
+            ],
             color=color,
             label=labels[method],
+        )
+        axes[0].plot(
+            steps,
+            [
+                row["validation"]["ema_reconstruction_fvu"]
+                for row in history
+            ],
+            color=color,
+            linestyle="--",
+            alpha=0.75,
+            label=f"{labels[method]} EMA",
         )
         axes[1].plot(
             steps,
@@ -124,7 +138,7 @@ def horizon_plot(report: dict[str, Any], figures: Path) -> None:
         marker=".",
         linestyle=":",
         color="#0f766e",
-        label="Raw online z_k vs EMA z_T",
+        label="Raw EMA z_k vs EMA z_T",
     )
     axes[0].set_title("Fixed-endpoint forecast across context positions")
     axes[0].set_ylabel("Cosine with fixed EMA endpoint code")
@@ -193,8 +207,8 @@ def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
     probes = report["locked_test_mmlu_probes"]
     target_position = report["architecture"]["target_position"]
     order = [
-        ("Joint z0", "joint_z0", COLORS["joint"]),
-        ("Standard SAE z0", "standard_sae_z0", COLORS["fixed"]),
+        ("Joint EMA z0", "joint_ema_z0", COLORS["joint"]),
+        ("Fixed EMA z0", "fixed_ema_z0", COLORS["fixed"]),
         (
             f"Predicted endpoint z{target_position} from h0",
             "joint_predicted_endpoint_from_h0",
@@ -247,7 +261,7 @@ def mmlu_probe_plot(report: dict[str, Any], figures: Path) -> None:
             capsize=4,
         )
         axis.axhline(
-            probes[probe_axis]["joint_z0"]["chance_accuracy"],
+            probes[probe_axis]["joint_ema_z0"]["chance_accuracy"],
             linestyle="--",
             color="#111827",
             label="Majority chance",
@@ -322,9 +336,9 @@ def embedding_and_heatmap(run_dir: Path, figures: Path) -> None:
             color=cmap(index),
             label=label,
         )
-    ax.set_xlabel("Joint z₀ PC 1")
-    ax.set_ylabel("Joint z₀ PC 2")
-    ax.set_title("Locked-test JEPA-SAE context states")
+    ax.set_xlabel("Joint EMA z₀ PC 1")
+    ax.set_ylabel("Joint EMA z₀ PC 2")
+    ax.set_title("Locked-test final EMA-SAE context states")
     ax.grid(alpha=0.15)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -457,12 +471,12 @@ def write_html(
     joint_early = curves["joint"][0]
     joint_late = curves["joint"][-1]
     fixed_early = curves["fixed"][0]
-    horizon_only_early = curves["k_only"][0]
+    position_only_early = curves["k_only"][0]
     mmlu = report["benchmark"]["base_model_accuracy"]
     probes = report["locked_test_mmlu_probes"]
     endpoint_alignment = report["online_ema_endpoint_cosine"]["joint"]
-    online_reconstruction = report["reconstruction_fvu"]["joint"]
-    ema_reconstruction = report["target_compatibility_fvu"]["joint"]
+    online_reconstruction = report["online_reconstruction_fvu"]["joint"]
+    ema_reconstruction = report["ema_reconstruction_fvu"]["joint"]
     target_position = report["architecture"]["target_position"]
     longest_horizon = report["architecture"]["longest_horizon"]
     figures = [
@@ -506,18 +520,18 @@ section {{ margin-top:34px; }} section img {{ width:100%; background:white; bord
 code {{ color:inherit; }}
 </style></head><body><main>
 <h1>All-context to fixed-endpoint JEPA-SAE</h1>
-<p class="subtitle">Each online Top-K code at h<sub>k</sub>, together with context-position embedding k, forecasts the same EMA target code at the fixed endpoint h<sub>T</sub>. Curves also report horizon T-k.</p>
+<p class="subtitle">Training uses the online SAE as a gradient-trained student and the full EMA SAE as teacher. Locked evaluation uses the final EMA encoder-decoder pair for context codes, endpoint targets, and predicted-residual decoding.</p>
 <div class="metrics">
 <div class="metric"><span>Joint − fixed cosine</span><strong>{fmt(comparison['mean'])}</strong></div>
 <div class="metric"><span>Group-bootstrap 95% CI</span><strong>{fmt(comparison['ci95_low'])} to {fmt(comparison['ci95_high'])}</strong></div>
 <div class="metric"><span>Joint h0→h{target_position} cosine</span><strong>{fmt(joint_early['code_cosine'])}</strong></div>
 <div class="metric"><span>Joint h{target_position - 1}→h{target_position} cosine</span><strong>{fmt(joint_late['code_cosine'])}</strong></div>
 <div class="metric"><span>Fixed horizon-{longest_horizon} cosine</span><strong>{fmt(fixed_early['code_cosine'])}</strong></div>
-<div class="metric"><span>Horizon-only horizon-{longest_horizon} cosine</span><strong>{fmt(horizon_only_early['code_cosine'])}</strong></div>
+<div class="metric"><span>Position-only horizon-{longest_horizon} cosine</span><strong>{fmt(position_only_early['code_cosine'])}</strong></div>
 <div class="metric"><span>Joint horizon-{longest_horizon} context gain</span><strong>{fmt(joint_early['context_gain']['mean'])}</strong></div>
 <div class="metric"><span>Online ↔ EMA endpoint cosine</span><strong>{fmt(endpoint_alignment)}</strong></div>
 <div class="metric"><span>Online endpoint reconstruction FVU</span><strong>{fmt(online_reconstruction)}</strong></div>
-<div class="metric"><span>EMA-code decoder FVU</span><strong>{fmt(ema_reconstruction)}</strong></div>
+<div class="metric"><span>Final EMA SAE reconstruction FVU</span><strong>{fmt(ema_reconstruction)}</strong></div>
 <div class="metric"><span>Base LLM MMLU answer accuracy</span><strong>{fmt(mmlu['accuracy'])}</strong></div>
 <div class="metric"><span>Predicted endpoint semantics</span><strong>{fmt(probes['semantics']['joint_predicted_endpoint_from_h0']['accuracy'])}</strong></div>
 <div class="metric"><span>Predicted endpoint context</span><strong>{fmt(probes['context']['joint_predicted_endpoint_from_h0']['accuracy'])}</strong></div>

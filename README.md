@@ -11,6 +11,8 @@ hₖ ─ online Top-K SAE ─ zₖ ───────────┐
 position embedding(k) ────────────────┘
 
 hT ─ EMA target SAE ─ stopgrad(zT),  T = W-1, k = 0,...,T-1
+
+online (E,D) ── EMA update ── final (EEMA, DEMA)
 ```
 
 windowの最後`hT`だけをtargetとし、それ以前のすべての`hₖ`を独立なcontextとして
@@ -148,9 +150,9 @@ stage 9はcontext/horizonごとのdense codeを全件保持せず、batch内でs
 statisticsへ集約します。大きいwindowでも、最長horizonのfeature解析に必要な
 codeだけを保持します。
 
-この固定endpoint方式へ移行する前のcheckpointとは互換性がありません。同じ
+full-EMA SAE導入前のtransition checkpointとは互換性がありません。同じ
 `WINDOW_SIZE`、model、layerのPile activationとstandard SAEは再利用できるため、
-既存runを更新する場合はstage 6以降を再実行してください。
+version 0.9以降へ更新した既存runはstage 6以降を再実行してください。
 
 ```bash
 WINDOW_SIZE=128 LAYER=16 RUN_DIR=runs/l16_win128 \
@@ -218,25 +220,29 @@ The Pileにはsubcorpusごとに異なるライセンスと利用条件があり
 - `k_only`: `zₖ`を遮断し、位置埋め込み`k`だけから予測
 - shuffled context: locked testで各`zₖ`を別MMLU questionの同じ位置へ交換
 
-online decoderはonline encoderのendpoint codeから`hT`を再構成します。さらに
-stop-gradient EMA target codeも同じdecoderで`hT`へ復元しますが、この互換性loss
-ではdecoderだけを更新します。これによりEMA codeを評価・介入に使えるdecoderへ
-接続しつつ、target encoderへの逆伝播を防ぎます。EMA target encoderはjoint条件
-だけで更新されます。predictor出力は学習時にはdense non-negative softplusとし、
-support評価・residual decoding・因果介入でだけTop-Kを適用します。
+online encoderとonline decoderはendpoint再構成と予測lossから勾配更新されます。
+EMA teacherはencoder、decoder、normalization biasを対として更新し、EMA更新後に
+decoderの各feature directionを単位ノルムへ再正規化します。予測codeのresidual
+復元には勾配を停止したEMA decoderを使うため、lossはpredictorへ流れますが
+EMA SAEへは流れません。学習後の最終SAEは`(EEMA, DEMA)`です。
+
+predictor出力は学習時にはdense non-negative softplusとし、support評価・
+residual decoding・因果介入でだけTop-Kを適用します。EMA compatibility lossと
+variance regularizationは使わず、collapseは評価統計として監視します。
 
 主損失:
 
 ```text
-L = L_reconstruction
-  + λ_target_compatibility L_decode(stopgrad(zT), hT)
+L = L_online-reconstruction
   + λ_prediction mean_{k<T}[
       1 - cosine(ẑT(k), zT)
       + 0.25 normalized_MSE(ẑT(k), zT)
-      + λ_residual FVU(decode(TopK(ẑT(k))), hT)
+      + λ_residual FVU(DEMA(TopK(ẑT(k))), hT)
     ]
-  + λ_variance L_variance
 ```
+
+各学習条件は完全なmodel checkpointに加えて、最終EMA SAEだけを標準SAE形式で
+`joint/ema_sae.pt`、`fixed/ema_sae.pt`、`k_only/ema_sae.pt`へ保存します。
 
 ## 評価と可視化
 
@@ -259,7 +265,7 @@ Pileと独立なMMLU question-grouped locked testで次を出力します。
 因果patchは実際の未来code全体を置換せず、予測可能成分だけを編集します。
 
 ```text
-ΔhT = D(TopK(P(zₖ_source,k)) - TopK(P(zₖ_target,k)))
+ΔhT = DEMA(TopK(P(zₖ_source,k)) - TopK(P(zₖ_target,k)))
 ```
 
 既定の因果評価は最長horizon `k=0`を事前指定し、window内ではendpoint `hT`だけを

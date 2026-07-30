@@ -170,9 +170,10 @@ def collect_model_outputs(
     long_horizon_prediction = torch.empty_like(context)
     online_endpoint = torch.empty_like(context)
     endpoint_target = torch.empty_like(context)
-    reconstruction_error = 0.0
-    compatibility_error = 0.0
-    reconstruction_scale = 0.0
+    online_reconstruction_error = 0.0
+    ema_reconstruction_error = 0.0
+    online_reconstruction_scale = 0.0
+    ema_reconstruction_scale = 0.0
     endpoint_alignment_sum = 0.0
     for start in tqdm(
         range(0, len(x), batch_size),
@@ -185,7 +186,11 @@ def collect_model_outputs(
             non_blocking=True,
         )
         with autocast_context(device, amp_dtype):
-            outputs = model(batch, use_context=use_context)
+            outputs = model(
+                batch,
+                use_context=use_context,
+                use_ema_context=True,
+            )
         context[start:end].copy_(
             outputs["context_code"].to(torch.float16).cpu()
         )
@@ -205,18 +210,23 @@ def collect_model_outputs(
                 dim=-1,
             ).sum().item()
         )
-        reconstruction_error += float(
+        online_reconstruction_error += float(
             (
                 outputs["online_target_reconstruction"] - batch[:, -1]
             ).float().square().sum().item()
         )
-        compatibility_error += float(
+        ema_reconstruction_error += float(
             (
-                outputs["target_compatibility_reconstruction"] - batch[:, -1]
+                outputs["target_reconstruction"] - batch[:, -1]
             ).float().square().sum().item()
         )
-        reconstruction_scale += float(
+        online_reconstruction_scale += float(
             (batch[:, -1] - model.pre_bias).float().square().sum().item()
+        )
+        ema_reconstruction_scale += float(
+            (
+                batch[:, -1] - model.ema_pre_bias
+            ).float().square().sum().item()
         )
 
     n_test = len(test_indices)
@@ -262,7 +272,11 @@ def collect_model_outputs(
             non_blocking=True,
         )
         with autocast_context(device, amp_dtype):
-            outputs = model(batch, use_context=use_context)
+            outputs = model(
+                batch,
+                use_context=use_context,
+                use_ema_context=True,
+            )
             if use_context:
                 shuffled_batch = x[
                     shuffled_test_indices[start:end]
@@ -271,10 +285,10 @@ def collect_model_outputs(
                     dtype=model.pre_bias.dtype,
                     non_blocking=True,
                 )
-                shuffled_context_codes = model.encode(
+                shuffled_context_codes = model.encode_ema(
                     shuffled_batch[:, :-1]
                 )
-                shuffled, _ = model.predict_from_code(
+                shuffled = model.predict_from_code(
                     shuffled_context_codes,
                     use_context=True,
                 )
@@ -283,7 +297,7 @@ def collect_model_outputs(
         batch_statistics = batch_horizon_statistics(
             outputs,
             shuffled,
-            model.pre_bias,
+            model.ema_pre_bias,
         )
         stacked_statistics = torch.stack(
             [batch_statistics[name] for name in HORIZON_STATISTIC_NAMES]
@@ -313,10 +327,10 @@ def collect_model_outputs(
         "window_code_cosine": horizon_statistics["code_cosine"].mean(dim=1),
         "long_horizon_test_prediction": long_horizon_test_prediction,
         "endpoint_test_target": endpoint_test_target,
-        "reconstruction_fvu": reconstruction_error
-        / max(reconstruction_scale, 1e-12),
-        "target_compatibility_fvu": compatibility_error
-        / max(reconstruction_scale, 1e-12),
+        "online_reconstruction_fvu": online_reconstruction_error
+        / max(online_reconstruction_scale, 1e-12),
+        "ema_reconstruction_fvu": ema_reconstruction_error
+        / max(ema_reconstruction_scale, 1e-12),
         "online_ema_endpoint_cosine": endpoint_alignment_sum / max(len(x), 1),
     }
 
@@ -578,8 +592,8 @@ def main() -> None:
     }
     checkpoints: dict[str, dict[str, Any]] = {}
     curves: dict[str, list[dict[str, Any]]] = {}
-    reconstruction_fvu: dict[str, float] = {}
-    target_compatibility_fvu: dict[str, float] = {}
+    online_reconstruction_fvu: dict[str, float] = {}
+    ema_reconstruction_fvu: dict[str, float] = {}
     online_ema_endpoint_cosine: dict[str, float] = {}
     probe_contexts: dict[str, torch.Tensor] = {}
     probe_predictions: dict[str, torch.Tensor] = {}
@@ -628,9 +642,11 @@ def main() -> None:
             args.seed + method_index,
             method,
         )
-        reconstruction_fvu[method] = float(collected["reconstruction_fvu"])
-        target_compatibility_fvu[method] = float(
-            collected["target_compatibility_fvu"]
+        online_reconstruction_fvu[method] = float(
+            collected["online_reconstruction_fvu"]
+        )
+        ema_reconstruction_fvu[method] = float(
+            collected["ema_reconstruction_fvu"]
         )
         online_ema_endpoint_cosine[method] = float(
             collected["online_ema_endpoint_cosine"]
@@ -690,15 +706,15 @@ def main() -> None:
     assert reference_fingerprint is not None
     assert reference_cfg is not None
     representations: dict[str, torch.Tensor] = {
-        "joint_z0": probe_contexts["joint"].float(),
-        "standard_sae_z0": probe_contexts["fixed"].float(),
+        "joint_ema_z0": probe_contexts["joint"].float(),
+        "fixed_ema_z0": probe_contexts["fixed"].float(),
         "joint_predicted_endpoint_from_h0": (
             probe_predictions["joint"].float()
         ),
         "fixed_predicted_endpoint_from_h0": (
             probe_predictions["fixed"].float()
         ),
-        "horizon_only_predicted_endpoint": (
+        "position_only_predicted_endpoint": (
             probe_predictions["k_only"].float()
         ),
         "joint_online_endpoint": probe_online_endpoints["joint"].float(),
@@ -756,7 +772,7 @@ def main() -> None:
             "target_position": reference_cfg.window_size - 1,
             "longest_horizon": reference_cfg.window_size - 1,
             "contexts": (
-                "online Top-K SAE codes at h0..."
+                "final EMA Top-K SAE codes at h0..."
                 f"h{reference_cfg.window_size - 2}"
             ),
             "target": (
@@ -766,10 +782,14 @@ def main() -> None:
             "predictor": "context-position-conditioned MLP",
             "predictor_position_input": "context_position k",
             "reported_horizon": "target_position - context_position",
-            "decoder_training": (
-                "online endpoint reconstruction plus decoder-only EMA-code "
-                "compatibility reconstruction"
-            ),
+            "online_sae": "gradient-trained student encoder and decoder",
+            "ema_sae": "teacher and final encoder-decoder pair",
+            "predicted_residual_decoder": "frozen EMA decoder",
+            "ema_decoder_row_normalization": "after every EMA update",
+            "excluded_objectives": [
+                "EMA compatibility loss",
+                "variance regularization",
+            ],
             "evaluation_aggregation": (
                 "stream scalar horizon statistics; retain dense codes only "
                 "for the longest-horizon feature analysis"
@@ -798,15 +818,15 @@ def main() -> None:
         },
         "locked_test_horizon_curve": curves,
         "primary_joint_minus_fixed_code_cosine": comparison,
-        "reconstruction_fvu": reconstruction_fvu,
-        "target_compatibility_fvu": target_compatibility_fvu,
+        "online_reconstruction_fvu": online_reconstruction_fvu,
+        "ema_reconstruction_fvu": ema_reconstruction_fvu,
         "online_ema_endpoint_cosine": online_ema_endpoint_cosine,
         "locked_test_mmlu_probes": probes,
         "collapse_diagnostics": {
-            "joint_z0": collapse_diagnostics(
+            "joint_ema_z0": collapse_diagnostics(
                 test_contexts["joint"].float()
             ),
-            "standard_sae_z0": collapse_diagnostics(
+            "fixed_ema_z0": collapse_diagnostics(
                 test_contexts["fixed"].float()
             ),
             "joint_predicted_endpoint_from_h0_topk": collapse_diagnostics(

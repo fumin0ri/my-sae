@@ -38,13 +38,14 @@ becomes available as context approaches the endpoint.
 1. Stream the Pile mixture and extract document-disjoint train/validation
    residual windows.
 2. Train one standard Top-K SAE on all positions as a shared initialization.
-3. Copy the online encoder and normalization bias into an EMA target encoder.
+3. Copy the online encoder, decoder, and normalization bias into a full EMA
+   target SAE.
 4. Initialize joint, fixed-SAE, and position-only conditions from the exact
    same checkpoint and activation fingerprint.
 5. Warm up each predictor with the SAE frozen.
 6. For the joint condition, unfreeze the online encoder and decoder, ramp the
-   forecasting loss, and update the target encoder and target normalization
-   bias by EMA.
+   forecasting loss, update the full target SAE by EMA, and row-normalize the
+   EMA decoder after every update.
 
 MMLU is never used for SAE or predictor optimization. Its pinned test split is
 opened only after training for grouped locked evaluation and causal tests.
@@ -67,28 +68,32 @@ conditions must share that fingerprint. If component labels are absent from
 the public Parquet schema, the manifest reports that limitation rather than
 inferring labels.
 
-## Decoder anchoring and objective
+## Full EMA SAE and objective
 
-The online endpoint code reconstructs `hT`. A second compatibility path decodes
-the stop-gradient EMA endpoint code with the same decoder. The compatibility
-path detaches normalization parameters, so its gradient updates the decoder
-but cannot pull the online or EMA encoder. This makes EMA codes decodable
-without violating the stop-gradient target.
+The online endpoint code reconstructs `hT` through the online decoder. The
+online encoder-decoder pair is the gradient-trained student. The EMA encoder,
+decoder, and normalization bias form the teacher and final SAE. The EMA
+decoder is row-normalized after each EMA update.
+
+Predicted sparse codes are decoded through the frozen EMA decoder. Gradients
+therefore propagate from residual prediction to the predictor output, but
+never into the EMA SAE. No EMA-code/online-decoder compatibility objective and
+no variance regularizer are used.
 
 ```text
-L = FVU(D(zT_online), hT)
-  + lambda_target_compatibility * FVU(D(stopgrad(zT_target)), hT)
+L = FVU(D_online(zT_online), hT)
   + lambda_prediction * mean_{k<T}[
       1 - cosine(z_hat_T_from_k, zT_target)
       + 0.25 * normalized_MSE(z_hat_T_from_k, zT_target)
-      + lambda_residual * FVU(D(TopK(z_hat_T_from_k)), hT)
+      + lambda_residual * FVU(D_EMA(TopK(z_hat_T_from_k)), hT)
     ]
-  + lambda_variance * L_variance
 ```
 
 The predictor output remains dense and non-negative for the latent regression
 loss. Top-K is applied for sparse-support metrics, residual decoding, and
-causal interventions.
+causal interventions. Input-dependent EMA targets, online reconstruction,
+latent prediction, and predicted-residual reconstruction provide the
+anti-collapse constraints. Collapse statistics remain monitored outcomes.
 
 ## Confirmatory comparison
 
@@ -107,9 +112,9 @@ The joint claim requires:
 - joint forecasting to exceed the fixed-SAE predictor;
 - matching contexts to exceed different-question, matching-position contexts;
 - matching contexts to exceed the position-only predictor;
-- direct `cosine(zk_online, zT_target)` to be reported separately from
+- direct `cosine(zk_EMA, zT_EMA)` to be reported separately from
   predictor performance;
-- online and EMA-code endpoint reconstruction to remain acceptable;
+- online-student and final-EMA endpoint reconstruction to remain acceptable;
 - representations not to collapse;
 - learned causal effects to exceed norm-matched random edits.
 
@@ -119,12 +124,16 @@ The joint claim requires:
 - frozen standard SAE plus the same position-conditioned predictor;
 - position-only predictor with the context projection disabled;
 - different-question context trajectories at evaluation;
-- raw online-context versus EMA-endpoint cosine;
+- raw final-EMA context versus final-EMA endpoint cosine;
 - online versus EMA encoding of the exact same endpoint, with separate probe,
   collapse, alignment, and reconstruction diagnostics;
 - norm-matched random causal edits.
 
 ## Locked-test outcomes
+
+Locked evaluation uses `E_EMA` for every context and endpoint code and uses
+`D_EMA` for all predicted-residual metrics. The online SAE is retained only
+for the same-endpoint student-versus-final diagnostic.
 
 For each context `k = 0,...,T-1`, report:
 
@@ -158,17 +167,17 @@ leaderboard protocol.
 ## Causal intervention
 
 One horizon is prespecified; the default is the longest horizon, `k=0`.
-The learned forecast component is decoded and applied exactly once at the
-fixed endpoint residual:
+Contexts are encoded by `E_EMA`; the learned forecast component is decoded by
+`D_EMA` and applied exactly once at the fixed endpoint residual:
 
 ```text
-delta_hT = D(
+delta_hT = D_EMA(
     TopK(P(z_source_k, k))
     - TopK(P(z_target_k, k))
 )
 ```
 
-Ablation removes `D(TopK(P(z_target_k, T-k)))`. The random control uses an
+Ablation removes `D_EMA(TopK(P(z_target_k, k)))`. The random control uses an
 independent direction with the exact learned-edit norm. Source and target
 prompts must each have at least `W` real tokens. Patch, ablation, and random
 conditions use identical eligible pair IDs.

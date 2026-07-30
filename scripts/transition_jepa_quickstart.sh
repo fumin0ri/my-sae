@@ -37,7 +37,6 @@ STANDARD_STEPS="${STANDARD_STEPS:-12000}"
 FORECAST_STEPS="${FORECAST_STEPS:-8000}"
 PREDICTOR_WARMUP_STEPS="${PREDICTOR_WARMUP_STEPS:-1000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
-TARGET_COMPATIBILITY_WEIGHT="${TARGET_COMPATIBILITY_WEIGHT:-0.25}"
 INTERVENTION_HORIZON="${INTERVENTION_HORIZON:-$((WINDOW_SIZE - 1))}"
 if (( INTERVENTION_HORIZON < 1 || INTERVENTION_HORIZON >= WINDOW_SIZE )); then
   echo "INTERVENTION_HORIZON must lie in [1, WINDOW_SIZE-1]" >&2
@@ -240,7 +239,6 @@ COMMON_FORECAST_ARGS=(
   --steps "$FORECAST_STEPS"
   --predictor-warmup-steps "$PREDICTOR_WARMUP_STEPS"
   --prediction-ramp-steps "$PREDICTION_RAMP_STEPS"
-  --target-compatibility-weight "$TARGET_COMPATIBILITY_WEIGHT"
   --batch-size "$BATCH_SIZE"
   --gradient-accumulation-steps "$GRADIENT_ACCUMULATION"
   --amp-dtype bfloat16
@@ -253,7 +251,7 @@ COMMON_FORECAST_ARGS=(
 )
 
 if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
-  echo "[6/11] Jointly tune the endpoint dictionary and predictor on The Pile"
+  echo "[6/11] Train the online student, full EMA SAE, and endpoint predictor"
   sr-train-transition-jepa-sae \
     "${COMMON_FORECAST_ARGS[@]}" \
     --output-dir "$RUN_DIR/joint" \
@@ -277,7 +275,7 @@ if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
 fi
 
 if (( START_STAGE <= 9 && END_STAGE >= 9 )); then
-  echo "[9/11] Open the question-grouped MMLU locked test"
+  echo "[9/11] Evaluate the final EMA SAE on question-grouped locked MMLU"
   sr-evaluate-transition-jepa-sae \
     --activations "$EVAL_ACTIVATIONS" \
     --joint-checkpoint "$RUN_DIR/joint/transition_jepa_sae.pt" \
@@ -294,7 +292,7 @@ fi
 
 if (( START_STAGE <= 10 && END_STAGE >= 10 )); then
   if [[ "$RUN_CAUSAL" == "1" ]]; then
-    echo "[10/11] Edit the MMLU endpoint from one prespecified horizon"
+    echo "[10/11] Edit the MMLU endpoint through the final EMA decoder"
     sr-intervene-transition-jepa-sae \
       "${MODEL_LOAD_ARGS[@]}" \
       --pairs data/transition-jepa/pairs.jsonl \

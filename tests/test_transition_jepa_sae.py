@@ -45,14 +45,13 @@ def test_every_context_forecasts_the_same_fixed_endpoint() -> None:
     model, x = make_model()
     outputs = model(x)
     assert outputs["online_target_reconstruction"].shape == (8, 12)
-    assert outputs["target_compatibility_reconstruction"].shape == (8, 12)
+    assert outputs["target_reconstruction"].shape == (8, 12)
     assert outputs["context_code"].shape == (8, 24)
     assert outputs["context_codes"].shape == (8, 5, 24)
     assert outputs["online_target_code"].shape == (8, 24)
     assert outputs["target_code"].shape == (8, 24)
     assert outputs["target_codes"].shape == (8, 5, 24)
     assert outputs["predicted_codes"].shape == (8, 5, 24)
-    assert outputs["context_state"].shape == (8, 5, 8)
     assert torch.allclose(
         outputs["target_codes"],
         outputs["target_code"][:, None, :].expand(-1, 5, -1),
@@ -67,16 +66,16 @@ def test_k_only_prediction_is_independent_of_context_code() -> None:
     model, _ = make_model()
     left = torch.randn(5, 24)
     right = torch.randn(5, 24)
-    left_prediction, _ = model.predict_from_code(left, use_context=False)
-    right_prediction, _ = model.predict_from_code(right, use_context=False)
+    left_prediction = model.predict_from_code(left, use_context=False)
+    right_prediction = model.predict_from_code(right, use_context=False)
     assert torch.allclose(left_prediction, right_prediction)
 
 
 def test_default_position_embeddings_are_zero_through_endpoint_minus_one() -> None:
     model, _ = make_model()
     contexts = torch.randn(3, model.cfg.window_size - 1, 24)
-    default, _ = model.predict_from_code(contexts)
-    explicit, _ = model.predict_from_code(
+    default = model.predict_from_code(contexts)
+    explicit = model.predict_from_code(
         contexts,
         context_positions=torch.arange(model.cfg.window_size - 1),
     )
@@ -90,9 +89,6 @@ def test_joint_loss_backpropagates_online_but_not_ema_encoder() -> None:
         x,
         prediction_weight=1.0,
         residual_prediction_weight=0.1,
-        target_compatibility_weight=0.25,
-        variance_weight=0.01,
-        variance_target=1.0,
         use_context=True,
     )
     loss.backward()
@@ -103,32 +99,71 @@ def test_joint_loss_backpropagates_online_but_not_ema_encoder() -> None:
         for context in range(model.cfg.window_size - 1)
     )
     assert model.encoder.linear.weight.grad is not None
+    assert model.decoder.grad is not None
     assert model.transition_predictor.output.weight.grad is not None
     assert all(
-        parameter.grad is None for parameter in model.target_encoder.parameters()
+        parameter.grad is None for parameter in model.ema_encoder.parameters()
     )
+    assert model.ema_decoder.grad is None
 
 
-def test_ema_target_compatibility_updates_only_the_shared_decoder() -> None:
-    model, x = make_model()
-    model.zero_grad(set_to_none=True)
-    target = model.encode_target(x[:, -1])
-    reconstruction = model.decode_target_compatibility(target)
-    reconstruction.square().mean().backward()
-    assert model.decoder.grad is not None
-    assert model.pre_bias.grad is None
-    assert all(
-        parameter.grad is None for parameter in model.target_encoder.parameters()
-    )
-
-
-def test_ema_update_includes_target_normalization_bias() -> None:
+def test_ema_decoder_backpropagates_to_code_but_not_teacher() -> None:
     model, _ = make_model()
-    before = model.target_pre_bias.clone()
+    model.zero_grad(set_to_none=True)
+    target = torch.randn(4, 24, requires_grad=True)
+    reconstruction = model.decode_ema(target)
+    reconstruction.square().mean().backward()
+    assert target.grad is not None
+    assert model.ema_decoder.grad is None
+
+
+def test_ema_update_tracks_full_sae_and_normalizes_decoder_rows() -> None:
+    model, _ = make_model()
+    before_bias = model.ema_pre_bias.clone()
+    before_encoder = model.ema_encoder.linear.weight.clone()
+    before_decoder = model.ema_decoder.clone()
     with torch.no_grad():
         model.pre_bias.add_(2.0)
-    model.update_target_encoder(decay=0.5)
-    assert torch.allclose(model.target_pre_bias, before + 1.0)
+        model.encoder.linear.weight.add_(1.0)
+        model.decoder.add_(0.5)
+    model.update_ema_sae(decay=0.5)
+    assert torch.allclose(model.ema_pre_bias, before_bias + 1.0)
+    assert not torch.allclose(model.ema_encoder.linear.weight, before_encoder)
+    assert not torch.allclose(model.ema_decoder, before_decoder)
+    assert torch.allclose(
+        model.ema_decoder.norm(dim=1),
+        torch.ones(model.cfg.d_sae),
+        atol=1e-6,
+    )
+
+
+def test_evaluation_can_use_final_ema_context_encoder() -> None:
+    model, x = make_model()
+    with torch.no_grad():
+        model.ema_encoder.linear.bias.add_(1.0)
+    online = model(x, use_ema_context=False)
+    ema = model(x, use_ema_context=True)
+    assert not torch.allclose(online["context_codes"], ema["context_codes"])
+
+
+def test_final_ema_sae_exports_as_standard_sae() -> None:
+    model, x = make_model()
+    exported = StandardSparseAutoencoder(
+        StandardSAEConfig(
+            d_in=model.cfg.d_in,
+            d_sae=model.cfg.d_sae,
+            k=model.cfg.k,
+            window_size=model.cfg.window_size,
+        )
+    )
+    exported.load_state_dict(model.final_ema_sae_state_dict())
+    expected_code = model.encode_ema(x[:, -1])
+    actual_code = exported.encode(x[:, -1])
+    assert torch.allclose(actual_code, expected_code)
+    assert torch.allclose(
+        exported.decode(actual_code),
+        model.decode_ema(expected_code),
+    )
 
 
 def test_support_metrics_recover_exact_topk_target() -> None:

@@ -29,7 +29,7 @@ from .training import (
     cosine_learning_rate,
 )
 
-ARCHITECTURE_ID = "all_context_fixed_endpoint_v1"
+ARCHITECTURE_ID = "all_context_fixed_endpoint_ema_sae_v2"
 
 
 @dataclass
@@ -68,7 +68,7 @@ class PositionConditionedPredictor(nn.Module):
         context_code: torch.Tensor,
         context_positions: torch.Tensor,
         use_context: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if context_code.ndim == 2:
             context_code = context_code[:, None, :]
         if context_code.ndim != 3:
@@ -96,7 +96,7 @@ class PositionConditionedPredictor(nn.Module):
         hidden = self.mlp(queries)
         # A dense, non-negative prediction keeps gradients smooth at support
         # boundaries. Top-K is applied only for support metrics and interventions.
-        return F.softplus(self.output(hidden)), state
+        return F.softplus(self.output(hidden))
 
 
 class TransitionJEPASAE(StandardSparseAutoencoder):
@@ -112,11 +112,15 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
             )
         )
         self.cfg = cfg
-        self.target_encoder = copy.deepcopy(self.encoder)
-        for parameter in self.target_encoder.parameters():
+        self.ema_encoder = copy.deepcopy(self.encoder)
+        for parameter in self.ema_encoder.parameters():
             parameter.requires_grad_(False)
+        self.ema_decoder = nn.Parameter(
+            self.decoder.detach().clone(),
+            requires_grad=False,
+        )
         self.register_buffer(
-            "target_pre_bias",
+            "ema_pre_bias",
             self.pre_bias.detach().clone(),
         )
         self.transition_predictor = PositionConditionedPredictor(cfg)
@@ -144,50 +148,84 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
         allowed_missing = {
             name
             for name in self.state_dict()
-            if name == "target_pre_bias"
-            or name.startswith(("target_encoder.", "transition_predictor."))
+            if name in {"ema_decoder", "ema_pre_bias"}
+            or name.startswith(("ema_encoder.", "transition_predictor."))
         }
         if set(missing) != allowed_missing or unexpected:
             raise ValueError(
                 "could not initialize from standard SAE: "
                 f"missing={missing}, unexpected={unexpected}"
             )
-        self.target_encoder.load_state_dict(self.encoder.state_dict())
-        self.target_pre_bias.copy_(self.pre_bias.detach())
+        self.ema_encoder.load_state_dict(self.encoder.state_dict())
+        self.ema_decoder.copy_(self.decoder.detach())
+        self.ema_pre_bias.copy_(self.pre_bias.detach())
+        self.normalize_ema_decoder()
 
     @torch.no_grad()
-    def update_target_encoder(self, decay: float | None = None) -> None:
+    def update_ema_sae(self, decay: float | None = None) -> None:
         rate = self.cfg.ema_decay if decay is None else decay
         for target, online in zip(
-            self.target_encoder.parameters(),
+            self.ema_encoder.parameters(),
             self.encoder.parameters(),
         ):
             target.mul_(rate).add_(online.detach(), alpha=1.0 - rate)
-        self.target_pre_bias.mul_(rate).add_(
+        self.ema_pre_bias.mul_(rate).add_(
             self.pre_bias.detach(),
             alpha=1.0 - rate,
         )
+        self.ema_decoder.mul_(rate).add_(
+            self.decoder.detach(),
+            alpha=1.0 - rate,
+        )
+        self.normalize_ema_decoder()
 
     @torch.no_grad()
-    def encode_target(self, x: torch.Tensor) -> torch.Tensor:
-        return self.target_encoder(
-            (x - self.target_pre_bias) / self.pre_scale
+    def normalize_ema_decoder(self) -> None:
+        self.ema_decoder.div_(
+            self.ema_decoder.norm(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
         )
 
-    def decode_target_compatibility(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode EMA codes while updating only the shared decoder."""
-        return (
-            self.pre_scale.detach() * (z @ self.decoder)
-            + self.pre_bias.detach()
+    @torch.no_grad()
+    def encode_ema(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ema_encoder(
+            (x - self.ema_pre_bias) / self.pre_scale
         )
+
+    def decode_ema(
+        self,
+        z: torch.Tensor,
+        add_bias: bool = True,
+    ) -> torch.Tensor:
+        """Decode through the frozen EMA decoder while preserving dz gradients."""
+        decoded = self.pre_scale * (z @ self.ema_decoder)
+        return decoded + self.ema_pre_bias if add_bias else decoded
+
+    @torch.no_grad()
+    def final_ema_sae_state_dict(self) -> dict[str, torch.Tensor]:
+        """Export the teacher as a standalone StandardSparseAutoencoder."""
+        return {
+            "pre_bias": self.ema_pre_bias.detach(),
+            "pre_scale": self.pre_scale.detach(),
+            "encoder.linear.weight": (
+                self.ema_encoder.linear.weight.detach()
+            ),
+            "encoder.linear.bias": (
+                self.ema_encoder.linear.bias.detach()
+            ),
+            "decoder": self.ema_decoder.detach(),
+        }
 
     def set_sae_trainable(self, trainable: bool) -> None:
         self.pre_bias.requires_grad_(trainable)
         self.decoder.requires_grad_(trainable)
         for parameter in self.encoder.parameters():
             parameter.requires_grad_(trainable)
-        for parameter in self.target_encoder.parameters():
+        for parameter in self.ema_encoder.parameters():
             parameter.requires_grad_(False)
+        self.ema_decoder.requires_grad_(False)
 
     def predict_from_code(
         self,
@@ -195,7 +233,7 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
         context_positions: torch.Tensor | None = None,
         use_context: bool = True,
         sparse_output: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if context_code.ndim == 2:
             context_code = context_code[:, None, :]
         if context_positions is None:
@@ -215,20 +253,18 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
                 raise ValueError(
                     "explicit context_positions are required for this shape"
                 )
-        dense, state = self.transition_predictor(
+        dense = self.transition_predictor(
             context_code,
             context_positions,
             use_context=use_context,
         )
-        return (
-            topk_relu(dense, self.cfg.k) if sparse_output else dense,
-            state,
-        )
+        return topk_relu(dense, self.cfg.k) if sparse_output else dense
 
     def forward(
         self,
         x: torch.Tensor,
         use_context: bool = True,
+        use_ema_context: bool = False,
     ) -> dict[str, torch.Tensor]:
         if x.ndim != 3 or x.shape[1] != self.cfg.window_size:
             raise ValueError(
@@ -236,20 +272,22 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
                 f"{self.cfg.window_size}, {self.cfg.d_in}]"
             )
         codes = self.encode(x)
-        context_codes = codes[:, :-1]
+        if use_ema_context:
+            with torch.no_grad():
+                context_codes = self.encode_ema(x[:, :-1])
+        else:
+            context_codes = codes[:, :-1]
         online_target_code = codes[:, -1]
         online_target_reconstruction = self.decode(online_target_code)
         with torch.no_grad():
-            target_code = self.encode_target(x[:, -1])
-        target_compatibility_reconstruction = (
-            self.decode_target_compatibility(target_code)
-        )
-        predicted_codes, context_state = self.predict_from_code(
+            target_code = self.encode_ema(x[:, -1])
+            target_reconstruction = self.decode_ema(target_code)
+        predicted_codes = self.predict_from_code(
             context_codes,
             use_context=use_context,
         )
         sparse_prediction = topk_relu(predicted_codes, self.cfg.k)
-        predictable_residual = self.decode(sparse_prediction)
+        predictable_residual = self.decode_ema(sparse_prediction)
         target_codes = target_code[:, None, :].expand_as(predicted_codes)
         target_residual = x[:, -1][:, None, :].expand_as(
             predictable_residual
@@ -260,9 +298,7 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
             "context_code": context_codes[:, 0],
             "online_target_code": online_target_code,
             "online_target_reconstruction": online_target_reconstruction,
-            "target_compatibility_reconstruction": (
-                target_compatibility_reconstruction
-            ),
+            "target_reconstruction": target_reconstruction,
             "target_code": target_code,
             "target_codes": target_codes,
             "predicted_codes": predicted_codes,
@@ -270,7 +306,6 @@ class TransitionJEPASAE(StandardSparseAutoencoder):
             "target_residual": target_residual,
             "predictable_residual": predictable_residual,
             "innovation_residual": target_residual - predictable_residual,
-            "context_state": context_state,
         }
 
 
@@ -293,9 +328,6 @@ def transition_jepa_loss(
     x: torch.Tensor,
     prediction_weight: float,
     residual_prediction_weight: float,
-    target_compatibility_weight: float,
-    variance_weight: float,
-    variance_target: float,
     use_context: bool,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -307,9 +339,12 @@ def transition_jepa_loss(
     reconstruction = (
         outputs["online_target_reconstruction"] - target_residual
     ).float().square().mean() / residual_scale
-    target_compatibility = (
-        outputs["target_compatibility_reconstruction"] - target_residual
-    ).float().square().mean() / residual_scale
+    ema_residual_scale = (
+        target_residual - model.ema_pre_bias.detach()
+    ).float().square().mean().clamp_min(1e-8)
+    ema_reconstruction = (
+        outputs["target_reconstruction"] - target_residual
+    ).float().square().mean() / ema_residual_scale
 
     prediction = outputs["predicted_codes"]
     target = outputs["target_codes"].detach()
@@ -322,22 +357,11 @@ def transition_jepa_loss(
     prediction_loss = prediction_by_example.mean()
     residual_prediction = (
         outputs["predictable_residual"] - outputs["target_residual"]
-    ).square().mean() / residual_scale
-
-    if use_context and variance_weight > 0 and len(x) > 1:
-        state_std = outputs["context_state"].float().flatten(0, 1).std(
-            dim=0,
-            unbiased=False,
-        )
-        variance_loss = F.relu(variance_target - state_std).mean()
-    else:
-        variance_loss = prediction.sum() * 0.0
+    ).square().mean() / ema_residual_scale
     loss = (
         reconstruction
-        + target_compatibility_weight * target_compatibility
         + prediction_weight
         * (prediction_loss + residual_prediction_weight * residual_prediction)
-        + variance_weight * variance_loss
     )
 
     metrics: dict[str, float] = {}
@@ -350,9 +374,11 @@ def transition_jepa_loss(
         sparse_prediction = outputs["sparse_predicted_codes"]
         metrics = {
             "loss": float(loss.detach().item()),
-            "reconstruction_fvu": float(reconstruction.detach().item()),
-            "target_compatibility_fvu": float(
-                target_compatibility.detach().item()
+            "online_reconstruction_fvu": float(
+                reconstruction.detach().item()
+            ),
+            "ema_reconstruction_fvu": float(
+                ema_reconstruction.detach().item()
             ),
             "prediction_loss": float(prediction_loss.detach().item()),
             "code_cosine": float(cosine_by_example.mean().detach().item()),
@@ -361,7 +387,6 @@ def transition_jepa_loss(
             "support_recall": float(recall.mean().item()),
             "support_jaccard": float(jaccard.mean().item()),
             "residual_prediction_fvu": float(residual_prediction.detach().item()),
-            "variance_loss": float(variance_loss.detach().item()),
             "sae_l0": float(
                 (outputs["codes"] > 0).sum(dim=-1).float().mean().item()
             ),
@@ -381,7 +406,10 @@ def transition_jepa_loss(
                 .sum(dim=-1)
                 .mean()
                 .div(
-                    (outputs["target_residual"] - model.pre_bias)
+                    (
+                        outputs["target_residual"]
+                        - model.ema_pre_bias
+                    )
                     .float()
                     .square()
                     .sum(dim=-1)
@@ -432,7 +460,7 @@ def build_optimizer(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
         and not name.startswith("transition_predictor.")
-        and not name.startswith("target_encoder.")
+        and not name.startswith("ema_")
     ]
     if sae_parameters:
         groups.append(
@@ -463,7 +491,7 @@ def add_sae_parameter_group(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
         and not name.startswith("transition_predictor.")
-        and not name.startswith("target_encoder.")
+        and not name.startswith("ema_")
     ]
     if not sae_parameters:
         raise ValueError("no trainable SAE parameters to add")
@@ -504,9 +532,6 @@ def evaluate_losses(
     device: torch.device,
     prediction_weight: float,
     residual_prediction_weight: float,
-    target_compatibility_weight: float,
-    variance_weight: float,
-    variance_target: float,
     use_context: bool,
     amp_dtype: str,
 ) -> dict[str, float]:
@@ -526,9 +551,6 @@ def evaluate_losses(
                 x,
                 prediction_weight,
                 residual_prediction_weight,
-                target_compatibility_weight,
-                variance_weight,
-                variance_target,
                 use_context,
             )
         count += len(x)
@@ -566,17 +588,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor-expansion", type=int, default=2)
     parser.add_argument("--prediction-weight", type=float, default=1.0)
     parser.add_argument("--residual-prediction-weight", type=float, default=0.1)
-    parser.add_argument(
-        "--target-compatibility-weight",
-        type=float,
-        default=0.25,
-        help=(
-            "Decoder-only reconstruction weight for stop-gradient EMA target "
-            "codes at the endpoint."
-        ),
-    )
-    parser.add_argument("--variance-weight", type=float, default=0.01)
-    parser.add_argument("--variance-target", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.996)
     parser.add_argument("--steps", type=int, default=6000)
     parser.add_argument("--predictor-warmup-steps", type=int, default=800)
@@ -609,8 +620,6 @@ def main() -> None:
         raise ValueError("--predictor-warmup-steps must lie in [0, steps)")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient-accumulation-steps must be positive")
-    if args.target_compatibility_weight < 0:
-        raise ValueError("--target-compatibility-weight cannot be negative")
     torch.manual_seed(args.seed)
     device = torch.device(
         args.device
@@ -725,9 +734,6 @@ def main() -> None:
                     batch,
                     active_prediction_weight,
                     args.residual_prediction_weight,
-                    args.target_compatibility_weight,
-                    args.variance_weight if use_context else 0.0,
-                    args.variance_target,
                     use_context,
                     collect_metrics=should_log,
                 )
@@ -749,7 +755,7 @@ def main() -> None:
         optimizer.step()
         if phase == "joint":
             model.normalize_decoder()
-            model.update_target_encoder()
+            model.update_ema_sae()
         if should_log:
             metrics["prediction_weight"] = active_prediction_weight
             metrics["predictor_learning_rate"] = float(
@@ -764,9 +770,6 @@ def main() -> None:
                 device,
                 args.prediction_weight,
                 args.residual_prediction_weight,
-                args.target_compatibility_weight,
-                args.variance_weight if use_context else 0.0,
-                args.variance_target,
                 use_context,
                 args.amp_dtype if device.type == "cuda" else "none",
             )
@@ -795,6 +798,26 @@ def main() -> None:
         "standard_checkpoint": str(Path(args.init_checkpoint)),
     }
     torch.save(checkpoint, output_dir / "transition_jepa_sae.pt")
+    ema_sae_state_dict = {
+        key: value.cpu()
+        for key, value in model.final_ema_sae_state_dict().items()
+    }
+    torch.save(
+        {
+            "architecture_id": ARCHITECTURE_ID,
+            "state_dict": ema_sae_state_dict,
+            "config": {
+                "d_in": cfg.d_in,
+                "d_sae": cfg.d_sae,
+                "k": cfg.k,
+                "window_size": cfg.window_size,
+            },
+            "source_transition_checkpoint": "transition_jepa_sae.pt",
+            "data_fingerprint": fingerprint,
+            "source_config": source_config,
+        },
+        output_dir / "ema_sae.pt",
+    )
     write_json(
         output_dir / "training_report.json",
         {
@@ -817,7 +840,7 @@ def main() -> None:
                     f"h{cfg.window_size - 2}"
                 ),
                 "target": (
-                    "one stop-gradient EMA SAE code at "
+                    "one stop-gradient full-EMA SAE code at "
                     f"h{cfg.window_size - 1}"
                 ),
                 "predictor": (
@@ -826,9 +849,17 @@ def main() -> None:
                 "predictor_position_input": "context_position k",
                 "reported_horizon": "target_position - context_position",
                 "sae_reconstruction_positions": "fixed endpoint only",
-                "decoder_target_compatibility_weight": (
-                    args.target_compatibility_weight
+                "online_sae": "gradient-trained student encoder and decoder",
+                "ema_sae": (
+                    "EMA teacher/final encoder, decoder, and normalization bias"
                 ),
+                "predicted_residual_decoder": "frozen EMA decoder",
+                "ema_decoder_row_normalization": "after every EMA update",
+                "excluded_objectives": [
+                    "EMA compatibility loss",
+                    "variance regularization",
+                ],
+                "final_sae_artifact": "ema_sae.pt",
                 "normalization": "dataset mean and scalar RMS",
             },
             "optimizer_budget": {

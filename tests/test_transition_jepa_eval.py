@@ -98,6 +98,8 @@ def test_window_32_collection_retains_only_long_horizon_dense_codes() -> None:
     assert collected["long_horizon_test_prediction"].shape == (3, 8)
     assert collected["endpoint_test_target"].shape == (3, 8)
     assert -1 <= collected["online_ema_endpoint_cosine"] <= 1
+    assert collected["online_reconstruction_fvu"] >= 0
+    assert collected["ema_reconstruction_fvu"] >= 0
     assert all(
         value.shape == (3, 31)
         for value in collected["horizon_statistics"].values()

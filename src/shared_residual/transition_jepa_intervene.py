@@ -275,18 +275,18 @@ def main() -> None:
             dtype=torch.long,
         )
         with torch.inference_mode():
-            source_context = jepa.encode(
+            source_context = jepa.encode_ema(
                 source_window[context_position : context_position + 1]
             )
-            target_context = jepa.encode(
+            target_context = jepa.encode_ema(
                 target_window[context_position : context_position + 1]
             )
-            source_prediction, _ = jepa.predict_from_code(
+            source_prediction = jepa.predict_from_code(
                 source_context,
                 context_positions=context_positions,
                 use_context=True,
             )
-            target_prediction, _ = jepa.predict_from_code(
+            target_prediction = jepa.predict_from_code(
                 target_context,
                 context_positions=context_positions,
                 use_context=True,
@@ -304,7 +304,7 @@ def main() -> None:
                 if args.mode == "patch"
                 else -target_prediction
             )
-            learned_delta = jepa.decode(
+            learned_delta = jepa.decode_ema(
                 code_delta,
                 add_bias=False,
             )[0, 0]
