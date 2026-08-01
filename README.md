@@ -55,7 +55,7 @@ bash scripts/transition_jepa_quickstart.sh
 | high / low | 20% / 80% |
 | training | 12,000 steps |
 | SAE-only warm-up | 4,000 steps |
-| MMLU | 4,096 questions、question-locked split |
+| MMLU | full 14,042-question test split、question-locked split |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
 
 `WINDOW_SIZE`は任意に変更できます。
