@@ -15,6 +15,9 @@ residual h_k
 h_T ≈ bias + D_high(z_T^high) + D_low(z_T^low)
 ```
 
+predictorはlatent endpoint codeだけで学習します。予測codeをdecoderへ通した
+residual reconstructionは学習損失に含めず、評価・因果介入だけに使います。
+
 学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、position-only学習
 モデルはありません。position-onlyとshuffled-contextは、同じ学習済みpredictorへ
 入力を変えて作る評価時null controlです。

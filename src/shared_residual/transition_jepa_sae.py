@@ -307,10 +307,7 @@ class TransitionJEPASAE(nn.Module):
         prediction = self.predict_from_code(
             context_high, use_context=use_context
         )
-        sparse_prediction = topk_relu(prediction, self.cfg.k_high)
-        predictable_residual = self.decode_high(sparse_prediction, ema=True)
         target_codes = ema_target_high[:, None].expand_as(prediction)
-        target_residual = x[:, -1, None, :].expand_as(predictable_residual)
         return {
             "codes": codes,
             "high_codes": high,
@@ -329,10 +326,6 @@ class TransitionJEPASAE(nn.Module):
             "target_high_reconstruction": ema_high_reconstruction,
             "target_reconstruction": ema_full_reconstruction,
             "predicted_codes": prediction,
-            "sparse_predicted_codes": sparse_prediction,
-            "predictable_residual": predictable_residual,
-            "target_residual": target_residual,
-            "innovation_residual": target_residual - predictable_residual,
         }
 
     @torch.no_grad()
@@ -362,7 +355,6 @@ def transition_jepa_loss(
     model: TransitionJEPASAE,
     x: torch.Tensor,
     prediction_weight: float,
-    residual_prediction_weight: float,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     outputs = model(x)
@@ -397,16 +389,7 @@ def transition_jepa_loss(
     target_energy = target_codes.square().mean(dim=-1).clamp_min(1e-8)
     nrmse = (prediction - target_codes).square().mean(dim=-1) / target_energy
     prediction_loss = (1.0 - cosine + 0.25 * nrmse).mean()
-    residual_prediction = (
-        (outputs["predictable_residual"] - outputs["target_residual"])
-        .float()
-        .square()
-        .mean()
-        / ema_scale
-    )
-    loss = reconstruction + prediction_weight * (
-        prediction_loss + residual_prediction_weight * residual_prediction
-    )
+    loss = reconstruction + prediction_weight * prediction_loss
     if not collect_metrics:
         return loss, {}
     precision, recall, jaccard = support_metrics(
@@ -424,7 +407,6 @@ def transition_jepa_loss(
         "support_precision": float(precision.mean()),
         "support_recall": float(recall.mean()),
         "support_jaccard": float(jaccard.mean()),
-        "residual_prediction_fvu": float(residual_prediction.detach()),
         "high_l0": float((outputs["high_codes"] > 0).sum(dim=-1).float().mean()),
         "low_l0": float((outputs["low_codes"] > 0).sum(dim=-1).float().mean()),
     }
@@ -439,7 +421,6 @@ def evaluate_losses(
     maximum_batches: int,
     device: torch.device,
     prediction_weight: float,
-    residual_prediction_weight: float,
     amp_dtype: str,
 ) -> dict[str, float]:
     model.eval()
@@ -449,7 +430,7 @@ def evaluate_losses(
         x = x.to(device, non_blocking=True)
         with autocast_context(device, amp_dtype):
             _, metrics = transition_jepa_loss(
-                model, x, prediction_weight, residual_prediction_weight
+                model, x, prediction_weight
             )
         count += len(x)
         for key, value in metrics.items():
@@ -475,7 +456,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor-width", type=int, default=256)
     parser.add_argument("--predictor-expansion", type=int, default=2)
     parser.add_argument("--prediction-weight", type=float, default=1.0)
-    parser.add_argument("--residual-prediction-weight", type=float, default=0.1)
     parser.add_argument("--ema-decay", type=float, default=0.996)
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--sae-warmup-steps", type=int, default=4000)
@@ -573,7 +553,6 @@ def main() -> None:
                     model,
                     batch,
                     active_prediction_weight,
-                    args.residual_prediction_weight,
                     collect_metrics=should_log,
                 )
                 scaled_loss = loss / args.gradient_accumulation_steps
@@ -603,7 +582,6 @@ def main() -> None:
                 args.validation_batches,
                 device,
                 args.prediction_weight,
-                args.residual_prediction_weight,
                 args.amp_dtype if device.type == "cuda" else "none",
             )
             history.append(

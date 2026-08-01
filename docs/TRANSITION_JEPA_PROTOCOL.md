@@ -26,11 +26,11 @@ The loss is:
 L_rec = alpha * FVU(D_high(z_T_high), h_T)
       + (1-alpha) * FVU(D_high(z_T_high)+D_low(z_T_low), h_T)
 
-L = L_rec + lambda_pred * (
-      latent endpoint prediction loss
-      + lambda_res * predicted-high-residual FVU
-    )
+L = L_rec + lambda_pred * latent endpoint prediction loss
 ```
+
+Predicted-residual reconstruction is not a training loss. Decoding the predicted
+code is reserved for evaluation diagnostics and causal interventions.
 
 There is no unsplit architecture, standard-SAE pretraining condition, fixed-SAE
 condition, or separately trained position-only model.

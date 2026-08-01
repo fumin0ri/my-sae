@@ -75,7 +75,6 @@ def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
         model,
         torch.randn(4, 6, 8),
         prediction_weight=1.0,
-        residual_prediction_weight=0.1,
     )
     loss.backward()
     assert model.encoder.linear.weight.grad is not None
@@ -85,6 +84,7 @@ def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
     assert model.ema_decoder.grad is None
     assert metrics["high_l0"] <= model.cfg.k_high
     assert metrics["low_l0"] <= model.cfg.k_low
+    assert "residual_prediction_fvu" not in metrics
 
 
 def test_initialization_and_ema_cover_full_high_low_sae() -> None:
