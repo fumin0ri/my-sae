@@ -214,6 +214,10 @@ class TransitionJEPASAE(nn.Module):
     def encode_ema(self, x: torch.Tensor) -> torch.Tensor:
         return self.ema_encoder((x - self.ema_pre_bias) / self.pre_scale)
 
+    def encode_forecast_online(self, x: torch.Tensor) -> torch.Tensor:
+        high, _ = self.split_code(self.encode(x))
+        return high
+
     @torch.no_grad()
     def encode_forecast_ema(self, x: torch.Tensor) -> torch.Tensor:
         high, _ = self.split_code(self.encode_ema(x))

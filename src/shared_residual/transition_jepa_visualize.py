@@ -93,25 +93,54 @@ def training_plot(run_dir: Path, figures: Path) -> None:
 
 def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
     quality = report["standard_sae_quality"]
+    online = quality["online"]
+    ema = quality["ema"]
     recovered = report.get("loss_recovered")
     fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5))
+    positions = np.arange(3)
+    width = 0.36
     axes[0].bar(
-        ["High", "Low", "Full"],
+        positions - width / 2,
         [
-            quality["high_only_fraction_variance_explained"],
-            quality["low_only_fraction_variance_explained"],
-            quality["fraction_variance_explained"],
+            online["high_only_fraction_variance_explained"],
+            online["low_only_fraction_variance_explained"],
+            online["fraction_variance_explained"],
         ],
-        color=[HIGH, LOW, TOTAL],
+        width,
+        color="#0ea5e9",
+        label="Online SAE",
     )
+    axes[0].bar(
+        positions + width / 2,
+        [
+            ema["high_only_fraction_variance_explained"],
+            ema["low_only_fraction_variance_explained"],
+            ema["fraction_variance_explained"],
+        ],
+        width,
+        color=HIGH,
+        label="EMA SAE",
+    )
+    axes[0].set_xticks(positions, ["High", "Low", "Full"])
     axes[0].axhline(0, color="#334155", linewidth=1)
-    axes[0].set_title("Variance explained")
+    axes[0].set_title("Online vs EMA variance explained")
     axes[0].set_ylabel("FVE (higher is better)")
+    positions2 = np.arange(2)
     axes[1].bar(
-        ["Cosine", "Alive"],
-        [quality["reconstruction_cosine"], quality["alive_feature_fraction"]],
-        color=[TOTAL, HIGH],
+        positions2 - width / 2,
+        [online["reconstruction_cosine"], online["alive_feature_fraction"]],
+        width,
+        color="#0ea5e9",
+        label="Online SAE",
     )
+    axes[1].bar(
+        positions2 + width / 2,
+        [ema["reconstruction_cosine"], ema["alive_feature_fraction"]],
+        width,
+        color=HIGH,
+        label="EMA SAE",
+    )
+    axes[1].set_xticks(positions2, ["Cosine", "Alive"])
     axes[1].set_ylim(0, 1)
     axes[1].set_title("Reconstruction and dictionary use")
     if recovered is None:
@@ -119,20 +148,25 @@ def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
         axes[2].set_axis_off()
     else:
         axes[2].bar(
-            ["Original", "SAE recon", "Zero"],
+            ["Original", "Online recon", "EMA recon", "Zero"],
             [
                 recovered["loss_original"],
-                recovered["loss_reconstructed"],
+                recovered["loss_reconstructed_online"],
+                recovered["loss_reconstructed_ema"],
                 recovered["loss_zero"],
             ],
-            color=[TOTAL, HIGH, "#dc2626"],
+            color=[TOTAL, "#0ea5e9", HIGH, "#dc2626"],
         )
         axes[2].set_title(
-            f"Loss recovered = {recovered['fraction_loss_recovered']:.3f}"
+            "Loss recovered: "
+            f"online={recovered['fraction_loss_recovered_online']:.3f}, "
+            f"EMA={recovered['fraction_loss_recovered_ema']:.3f}"
         )
         axes[2].set_ylabel("Next-token cross entropy")
     for axis in axes:
         axis.grid(axis="y", alpha=0.2)
+    axes[0].legend(frameon=False)
+    axes[1].legend(frameon=False)
     fig.tight_layout()
     save_figure(fig, figures, "standard-sae-quality")
 
@@ -145,17 +179,17 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.6))
     axes[0].plot(
         horizon,
-        [row["code_cosine"] for row in rows],
+        [row["online_code_cosine"] for row in rows],
         marker="o",
         color=HIGH,
-        label="Learned context predictor",
+        label="Online context (primary)",
     )
     axes[0].plot(
         horizon,
-        [row["shuffled_context_cosine"] for row in rows],
+        [row["online_shuffled_context_cosine"] for row in rows],
         color=NULL,
         linestyle="--",
-        label="Shuffled context",
+        label="Online shuffled",
     )
     axes[0].plot(
         horizon,
@@ -166,23 +200,70 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
     )
     axes[0].plot(
         horizon,
-        [row["context_target_cosine"] for row in rows],
-        color=TOTAL,
-        alpha=0.7,
-        label="Raw context code",
+        [row["ema_code_cosine"] for row in rows],
+        color="#7c3aed",
+        linestyle="-.",
+        label="EMA context (compatibility)",
     )
-    gain_shuffled = [row["context_gain_over_shuffled"]["mean"] for row in rows]
+    axes[0].plot(
+        horizon,
+        [row["ema_shuffled_context_cosine"] for row in rows],
+        color="#a78bfa",
+        linestyle=":",
+        label="EMA shuffled",
+    )
+    gain_shuffled = [row["online_gain_over_shuffled"]["mean"] for row in rows]
     gain_position = [
-        row["context_gain_over_position_only"]["mean"] for row in rows
+        row["online_gain_over_position_only"]["mean"] for row in rows
+    ]
+    ema_gain_shuffled = [row["ema_gain_over_shuffled"]["mean"] for row in rows]
+    ema_gain_position = [
+        row["ema_gain_over_position_only"]["mean"] for row in rows
     ]
     axes[1].plot(horizon, gain_shuffled, marker="o", color=HIGH, label="vs shuffled")
     axes[1].plot(horizon, gain_position, marker="o", color=POSITION, label="vs position")
+    axes[1].fill_between(
+        horizon,
+        [row["online_gain_over_shuffled"]["ci95_low"] for row in rows],
+        [row["online_gain_over_shuffled"]["ci95_high"] for row in rows],
+        color=HIGH,
+        alpha=0.12,
+    )
+    axes[1].fill_between(
+        horizon,
+        [row["online_gain_over_position_only"]["ci95_low"] for row in rows],
+        [row["online_gain_over_position_only"]["ci95_high"] for row in rows],
+        color=POSITION,
+        alpha=0.1,
+    )
+    axes[1].plot(
+        horizon,
+        ema_gain_shuffled,
+        color="#7c3aed",
+        linestyle="--",
+        label="EMA vs shuffled",
+    )
+    axes[1].plot(
+        horizon,
+        ema_gain_position,
+        color="#a78bfa",
+        linestyle=":",
+        label="EMA vs position",
+    )
     axes[1].axhline(0, color="#334155", linewidth=1)
     axes[2].plot(
         horizon,
-        [row["residual_prediction_fvu"] for row in rows],
+        [row["online_residual_prediction_fvu"] for row in rows],
         marker="o",
+        color=HIGH,
+        label="Online context",
+    )
+    axes[2].plot(
+        horizon,
+        [row["ema_residual_prediction_fvu"] for row in rows],
         color="#7c3aed",
+        linestyle="--",
+        label="EMA context",
     )
     axes[0].set_title("Endpoint-code forecast controls")
     axes[0].set_ylabel("Cosine with EMA endpoint high code")
@@ -195,6 +276,7 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
         axis.grid(alpha=0.2)
     axes[0].legend(frameon=False, fontsize=8)
     axes[1].legend(frameon=False)
+    axes[2].legend(frameon=False)
     fig.tight_layout()
     save_figure(fig, figures, "forecast-validity")
 
@@ -202,22 +284,26 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
 def probe_plot(report: dict[str, Any], figures: Path) -> None:
     probes = report["mmlu_probe_accuracy"]
     preferred = [
-        "context_high",
-        "predicted_endpoint_high",
-        "endpoint_high",
-        "context_low",
-        "endpoint_low",
-        "endpoint_full",
+        "context_high_online",
+        "predicted_endpoint_high_online",
+        "context_high_ema",
+        "predicted_endpoint_high_ema",
+        "endpoint_high_ema",
+        "context_low_online",
+        "endpoint_low_ema",
+        "endpoint_full_ema",
     ]
     labels = {
-        "context_high": "Context high",
-        "predicted_endpoint_high": "Predicted high",
-        "endpoint_high": "Endpoint high",
-        "context_low": "Context low",
-        "endpoint_low": "Endpoint low",
-        "endpoint_full": "Endpoint full",
+        "context_high_online": "Context high (online)",
+        "predicted_endpoint_high_online": "Predicted high (online)",
+        "context_high_ema": "Context high (EMA)",
+        "predicted_endpoint_high_ema": "Predicted high (EMA)",
+        "endpoint_high_ema": "Endpoint high (EMA)",
+        "context_low_online": "Context low (online)",
+        "endpoint_low_ema": "Endpoint low (EMA)",
+        "endpoint_full_ema": "Endpoint full (EMA)",
     }
-    colors = [HIGH, "#0d9488", "#047857", LOW, "#65a30d", TOTAL]
+    colors = ["#0ea5e9", "#0284c7", HIGH, "#047857", "#065f46", LOW, "#65a30d", TOTAL]
     fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.0), sharey=False)
     for axis, (probe_axis, results) in zip(axes, probes.items()):
         names = [name for name in preferred if name in results]
@@ -301,6 +387,8 @@ def write_html(
     causal_summary: dict[str, Any] | None,
 ) -> None:
     quality = report["standard_sae_quality"]
+    online_quality = quality["online"]
+    ema_quality = quality["ema"]
     recovered = report.get("loss_recovered")
     forecast = report["forecast_validity"]
     longest = forecast["longest_horizon"]
@@ -317,8 +405,15 @@ def write_html(
         f'<section><h2>{html.escape(title)}</h2><img src="{path}" alt="{html.escape(title)}"></section>'
         for title, path in figures
     )
-    recovered_value = (
-        "skipped" if recovered is None else fmt(recovered["fraction_loss_recovered"])
+    online_recovered = (
+        "skipped"
+        if recovered is None
+        else fmt(recovered["fraction_loss_recovered_online"])
+    )
+    ema_recovered = (
+        "skipped"
+        if recovered is None
+        else fmt(recovered["fraction_loss_recovered_ema"])
     )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -333,14 +428,15 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
 <h1>High/low endpoint JEPA-SAE</h1>
-<p class="subtitle">Conventional SAE quality plus locked-test evidence that endpoint prediction uses context rather than a position-only or shuffled-context shortcut.</p>
+<p class="subtitle">The primary forecast exactly matches training: P(E_online(h_k), k) to E_EMA(h_T). EMA-context forecasting is retained as a secondary compatibility test. Conventional SAE metrics compare online and EMA pairs on identical residuals.</p>
 <div class="metrics">
-<div class="metric"><span>Full FVE</span><strong>{fmt(quality['fraction_variance_explained'])}</strong></div>
-<div class="metric"><span>Reconstruction cosine</span><strong>{fmt(quality['reconstruction_cosine'])}</strong></div>
-<div class="metric"><span>Alive features</span><strong>{fmt(quality['alive_feature_fraction'])}</strong></div>
-<div class="metric"><span>Loss recovered</span><strong>{recovered_value}</strong></div>
-<div class="metric"><span>Longest-horizon gain vs shuffled</span><strong>{fmt(longest['context_gain_over_shuffled']['mean'])}</strong></div>
-<div class="metric"><span>Longest-horizon gain vs position</span><strong>{fmt(longest['context_gain_over_position_only']['mean'])}</strong></div>
+<div class="metric"><span>Online / EMA full FVE</span><strong>{fmt(online_quality['fraction_variance_explained'])} / {fmt(ema_quality['fraction_variance_explained'])}</strong></div>
+<div class="metric"><span>Online / EMA cosine</span><strong>{fmt(online_quality['reconstruction_cosine'])} / {fmt(ema_quality['reconstruction_cosine'])}</strong></div>
+<div class="metric"><span>Online / EMA alive</span><strong>{fmt(online_quality['alive_feature_fraction'])} / {fmt(ema_quality['alive_feature_fraction'])}</strong></div>
+<div class="metric"><span>Online / EMA loss recovered</span><strong>{online_recovered} / {ema_recovered}</strong></div>
+<div class="metric"><span>Online gain vs shuffled</span><strong>{fmt(longest['online_gain_over_shuffled']['mean'])}</strong></div>
+<div class="metric"><span>Online gain vs position</span><strong>{fmt(longest['online_gain_over_position_only']['mean'])}</strong></div>
+<div class="metric"><span>EMA compatibility gain vs shuffled</span><strong>{fmt(longest['ema_gain_over_shuffled']['mean'])}</strong></div>
 <div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>
 </div>{figure_html}
 <section><h2>Machine-readable artifacts</h2><p><code>analysis/transition_jepa_report.json</code>, <code>transition_horizon_metrics.csv</code>, and <code>mmlu_probe_accuracy.csv</code>.</p></section>

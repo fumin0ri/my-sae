@@ -72,15 +72,15 @@ bash scripts/transition_jepa_quickstart.sh
 3. balanced MMLU probeと因果pairを生成
 4. MMLU residual trajectoryを抽出
 5. frozen LLMのzero-shot MMLU accuracyを測定
-6. 通常のSAE品質、forecast null、semantics/context/syntax probeを評価
+6. online/EMA SAE品質、Online-matched forecast null、semantics/context/syntax probeを評価
 7. forecastable high featuresをpatch、ablate、norm-matched random ablate
 8. PNG、PDF、CSV、JSON、HTMLレポートを生成
 
-既存のhigh/low checkpointとPile activationはそのまま再利用できます。評価だけ
-やり直す場合はstage 3から実行してください。
+既存のhigh/low checkpoint、Pile activation、MMLU activationはそのまま再利用できます。
+今回のOnline-matched評価だけやり直す場合はstage 6から実行してください。
 
 ```bash
-START_STAGE=3 RUN_DIR=runs/high-low-jepa-pile \
+START_STAGE=6 RUN_DIR=runs/high-low-jepa-pile \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
@@ -105,41 +105,45 @@ bash scripts/transition_jepa_quickstart.sh
 
 ## 評価1: 通常のSAE性能
 
-document-disjoint Pile validation residualについて、最終EMA SAEを評価します。
+document-disjoint Pile validation residualの同一サンプルについて、online
+encoder/decoderと最終EMA encoder/decoderを並べて評価します。
 
 - reconstruction FVU / fraction of variance explained
 - reconstruction cosine、平均L2誤差
 - L1、per-position L0、high/low L0
 - alive/dead feature fraction
 - high-only、low-only、full reconstruction FVE
-- original、SAE reconstructed、zero-ablated LLM loss
-- fraction of loss recovered
+- original、online-reconstructed、EMA-reconstructed、zero-ablated LLM loss
+- online/EMAそれぞれのfraction of loss recovered
+- online/EMA code cosine、support Jaccard、FVE差
 
 これにより、予測しやすさのためにSAEがresidual情報を捨てていないかを確認します。
 
 ## 評価2: 提案手法は本当にcontextを使うか
 
-各context位置 `k<T` からEMA endpoint high codeを予測し、距離別に以下を比較します。
+主要評価は、学習時と同じOnline-matched経路
+`P(E_online(h_k), k) -> E_EMA(h_T)`です。距離別に以下を比較します。
 
-- learned context predictor
-- 別MMLU問題からcontext codeを入れるshuffled-context null
+- online contextを使うlearned predictor
+- 別MMLU問題のonline context codeを入れるshuffled-context null
 - context projectionをゼロにするposition-only null
-- predictorなしのraw context-to-endpoint cosine
+- predictorなしのonline context-to-EMA endpoint cosine
 
 `learned - shuffled`と`learned - position-only`にはquestion-group bootstrap 95% CIを
 付けます。最長horizonで両方のCI下限が0より大きいことを主要な有効性判定とします。
+`P(E_EMA(h_k), k) -> E_EMA(h_T)`も、学習時に使っていないEMA-context互換性の
+副次評価として同じグラフに表示します。
 
 ## 評価3: MMLU semantics / context / syntax
 
 MMLU option順とprompt templateを決定論的に均衡化し、問題単位でdevelopmentとlocked
 testを分離します。linear probeのaccuracyとbalanced accuracyを次の表現で表示します。
 
-- context high
-- predicted endpoint high
-- actual endpoint high
-- context low
-- endpoint low
-- endpoint full
+- online context high / online-matched predicted endpoint high
+- EMA context high / EMA-context predicted endpoint high
+- actual EMA endpoint high
+- online context low
+- EMA endpoint low / full
 
 軸は以下です。
 
@@ -153,7 +157,7 @@ high表現がcontext/semanticsを保持し、low表現との役割差が生じ�
 
 同じcontext category・syntaxで正解だけが異なるMMLU pairを使います。
 
-- `patch`: sourceから予測したhigh codeとtarget予測codeの差をendpointへ追加
+- `patch`: online contextから予測したsource high codeとtarget予測codeの差をendpointへ追加
 - `ablate`: targetの予測可能high componentを除去
 - `random_ablate`:同じL2 normのランダム方向を除去
 

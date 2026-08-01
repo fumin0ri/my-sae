@@ -62,6 +62,13 @@ def test_position_only_control_is_independent_of_context_code() -> None:
     assert torch.allclose(first_prediction, second_prediction)
 
 
+def test_online_forecast_encoder_matches_online_high_partition() -> None:
+    model = make_model()
+    x = torch.randn(2, 8)
+    expected, _ = model.split_code(model.encode(x))
+    assert torch.allclose(model.encode_forecast_online(x), expected)
+
+
 def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
     model = make_model()
     loss, metrics = transition_jepa_loss(

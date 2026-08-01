@@ -42,15 +42,23 @@ PROBE_LABELS = {
     "syntax": "syntax_template",
 }
 HORIZON_METRICS = (
-    "context_target_cosine",
-    "code_cosine",
-    "shuffled_context_cosine",
+    "online_context_target_cosine",
+    "online_code_cosine",
+    "online_shuffled_context_cosine",
+    "ema_context_target_cosine",
+    "ema_code_cosine",
+    "ema_shuffled_context_cosine",
     "position_only_cosine",
-    "code_nrmse",
-    "support_precision",
-    "support_recall",
-    "support_jaccard",
-    "residual_error",
+    "online_code_nrmse",
+    "ema_code_nrmse",
+    "online_support_precision",
+    "online_support_recall",
+    "online_support_jaccard",
+    "ema_support_precision",
+    "ema_support_recall",
+    "ema_support_jaccard",
+    "online_residual_error",
+    "ema_residual_error",
     "residual_energy",
 )
 
@@ -79,10 +87,17 @@ def evaluate_sae_quality(
     maximum_batches: int,
     device: torch.device,
     amp_dtype: str,
-) -> dict[str, float | int]:
-    """Conventional reconstruction, sparsity, and dictionary-usage metrics."""
-    totals: dict[str, float] = defaultdict(float)
-    active_features = torch.zeros(model.cfg.d_sae, dtype=torch.float32)
+) -> dict[str, Any]:
+    """Compare online and EMA SAE quality on exactly the same residuals."""
+    totals: dict[str, dict[str, float]] = {
+        "online": defaultdict(float),
+        "ema": defaultdict(float),
+    }
+    active_features = {
+        "online": torch.zeros(model.cfg.d_sae, dtype=torch.float32),
+        "ema": torch.zeros(model.cfg.d_sae, dtype=torch.float32),
+    }
+    alignment: dict[str, float] = defaultdict(float)
     positions = 0
     windows = 0
     batches = 0
@@ -92,65 +107,113 @@ def evaluate_sae_quality(
     ):
         x = x.to(device, dtype=model.pre_bias.dtype, non_blocking=True)
         with autocast_context(device, amp_dtype):
-            code = model.encode_ema(x)
-            high, low = model.split_code(code)
-            reconstruction = model.decode_ema(code)
-            high_reconstruction = model.decode_high(high, ema=True)
-            low_reconstruction = model.ema_pre_bias + model.decode_low(
-                low, ema=True, add_bias=False
-            )
+            online_code = model.encode(x)
+            ema_code = model.encode_ema(x)
+            variants = {
+                "online": (
+                    online_code,
+                    model.decode(online_code),
+                    model.pre_bias,
+                    False,
+                ),
+                "ema": (
+                    ema_code,
+                    model.decode_ema(ema_code),
+                    model.ema_pre_bias,
+                    True,
+                ),
+            }
         x32 = x.float()
-        reconstruction32 = reconstruction.float()
-        high32 = high_reconstruction.float()
-        low32 = low_reconstruction.float()
-        centered_energy = (
-            x32 - model.ema_pre_bias.float()
-        ).square().sum()
-        totals["centered_energy"] += float(centered_energy)
-        totals["full_squared_error"] += float(
-            (x32 - reconstruction32).square().sum()
+        for name, (code, reconstruction, bias, use_ema) in variants.items():
+            high, low = model.split_code(code)
+            with autocast_context(device, amp_dtype):
+                high_reconstruction = model.decode_high(high, ema=use_ema)
+                low_reconstruction = bias + model.decode_low(
+                    low, ema=use_ema, add_bias=False
+                )
+            reconstruction32 = reconstruction.float()
+            local = totals[name]
+            local["centered_energy"] += float(
+                (x32 - bias.float()).square().sum()
+            )
+            local["full_squared_error"] += float(
+                (x32 - reconstruction32).square().sum()
+            )
+            local["high_squared_error"] += float(
+                (x32 - high_reconstruction.float()).square().sum()
+            )
+            local["low_squared_error"] += float(
+                (x32 - low_reconstruction.float()).square().sum()
+            )
+            local["l2_loss_sum"] += float(
+                torch.linalg.vector_norm(x32 - reconstruction32, dim=-1).sum()
+            )
+            local["cosine_sum"] += float(
+                F.cosine_similarity(x32, reconstruction32, dim=-1).sum()
+            )
+            local["l1_sum"] += float(code.float().abs().sum())
+            local["l0_sum"] += float((code != 0).float().sum())
+            local["high_l0_sum"] += float((high != 0).float().sum())
+            local["low_l0_sum"] += float((low != 0).float().sum())
+            active_features[name] += (
+                code.reshape(-1, model.cfg.d_sae).float().sum(dim=0).cpu()
+            )
+        online_active = online_code > 0
+        ema_active = ema_code > 0
+        intersection = (online_active & ema_active).sum(dim=-1).float()
+        union = (online_active | ema_active).sum(dim=-1).float().clamp_min(1)
+        alignment["code_cosine_sum"] += float(
+            F.cosine_similarity(online_code.float(), ema_code.float(), dim=-1).sum()
         )
-        totals["high_squared_error"] += float((x32 - high32).square().sum())
-        totals["low_squared_error"] += float((x32 - low32).square().sum())
-        totals["l2_loss_sum"] += float(
-            torch.linalg.vector_norm(x32 - reconstruction32, dim=-1).sum()
-        )
-        totals["cosine_sum"] += float(
-            F.cosine_similarity(x32, reconstruction32, dim=-1).sum()
-        )
-        totals["l1_sum"] += float(code.float().abs().sum())
-        totals["l0_sum"] += float((code != 0).float().sum())
-        totals["high_l0_sum"] += float((high != 0).float().sum())
-        totals["low_l0_sum"] += float((low != 0).float().sum())
-        active_features += code.reshape(-1, model.cfg.d_sae).float().sum(dim=0).cpu()
+        alignment["support_jaccard_sum"] += float((intersection / union).sum())
         positions += x.shape[0] * x.shape[1]
         windows += x.shape[0]
         batches += 1
     if positions == 0:
         raise ValueError("no Pile validation activations were evaluated")
-    scale = max(totals["centered_energy"], 1e-12)
-    full_fvu = totals["full_squared_error"] / scale
-    high_fvu = totals["high_squared_error"] / scale
-    low_fvu = totals["low_squared_error"] / scale
-    alive = active_features != 0
+    def finalize(name: str) -> dict[str, float | int]:
+        local = totals[name]
+        scale = max(local["centered_energy"], 1e-12)
+        full_fvu = local["full_squared_error"] / scale
+        high_fvu = local["high_squared_error"] / scale
+        low_fvu = local["low_squared_error"] / scale
+        alive = active_features[name] != 0
+        return {
+            "l2_loss": local["l2_loss_sum"] / positions,
+            "l1": local["l1_sum"] / positions,
+            "l0": local["l0_sum"] / positions,
+            "high_l0": local["high_l0_sum"] / positions,
+            "low_l0": local["low_l0_sum"] / positions,
+            "reconstruction_cosine": local["cosine_sum"] / positions,
+            "reconstruction_fvu": full_fvu,
+            "fraction_variance_explained": 1.0 - full_fvu,
+            "high_only_fvu": high_fvu,
+            "high_only_fraction_variance_explained": 1.0 - high_fvu,
+            "low_only_fvu": low_fvu,
+            "low_only_fraction_variance_explained": 1.0 - low_fvu,
+            "alive_feature_fraction": float(alive.float().mean()),
+            "dead_feature_fraction": float((~alive).float().mean()),
+            "n_positions": positions,
+            "n_windows": windows,
+            "n_batches": batches,
+        }
+
+    online = finalize("online")
+    ema = finalize("ema")
     return {
-        "l2_loss": totals["l2_loss_sum"] / positions,
-        "l1": totals["l1_sum"] / positions,
-        "l0": totals["l0_sum"] / positions,
-        "high_l0": totals["high_l0_sum"] / positions,
-        "low_l0": totals["low_l0_sum"] / positions,
-        "reconstruction_cosine": totals["cosine_sum"] / positions,
-        "reconstruction_fvu": full_fvu,
-        "fraction_variance_explained": 1.0 - full_fvu,
-        "high_only_fvu": high_fvu,
-        "high_only_fraction_variance_explained": 1.0 - high_fvu,
-        "low_only_fvu": low_fvu,
-        "low_only_fraction_variance_explained": 1.0 - low_fvu,
-        "alive_feature_fraction": float(alive.float().mean()),
-        "dead_feature_fraction": float((~alive).float().mean()),
-        "n_positions": positions,
-        "n_windows": windows,
-        "n_batches": batches,
+        "online": online,
+        "ema": ema,
+        "online_ema_alignment": {
+            "code_cosine": alignment["code_cosine_sum"] / positions,
+            "support_jaccard": alignment["support_jaccard_sum"] / positions,
+            "fve_online_minus_ema": (
+                online["fraction_variance_explained"]
+                - ema["fraction_variance_explained"]
+            ),
+            "reconstruction_cosine_online_minus_ema": (
+                online["reconstruction_cosine"] - ema["reconstruction_cosine"]
+            ),
+        },
     }
 
 
@@ -245,28 +308,44 @@ def evaluate_loss_recovered(
         )
         original = llm(**encoded, use_cache=False).logits
 
-        def reconstruct(hidden: torch.Tensor) -> torch.Tensor:
+        def reconstruct_online(hidden: torch.Tensor) -> torch.Tensor:
+            value = hidden.to(sae.pre_bias.dtype)
+            return sae.decode(sae.encode(value)).to(hidden.dtype)
+
+        def reconstruct_ema(hidden: torch.Tensor) -> torch.Tensor:
             return sae.decode_ema(
                 sae.encode_ema(hidden.to(sae.pre_bias.dtype))
             ).to(hidden.dtype)
 
-        with edit_residual(layer, hook_point, reconstruct):
-            reconstructed = llm(**encoded, use_cache=False).logits
+        with edit_residual(layer, hook_point, reconstruct_online):
+            reconstructed_online = llm(**encoded, use_cache=False).logits
+        with edit_residual(layer, hook_point, reconstruct_ema):
+            reconstructed_ema = llm(**encoded, use_cache=False).logits
         with edit_residual(layer, hook_point, torch.zeros_like):
             zero = llm(**encoded, use_cache=False).logits
         original_loss = causal_lm_loss(
             original, encoded["input_ids"], attention_mask
         )
-        reconstructed_loss = causal_lm_loss(
-            reconstructed, encoded["input_ids"], attention_mask
+        reconstructed_online_loss = causal_lm_loss(
+            reconstructed_online, encoded["input_ids"], attention_mask
+        )
+        reconstructed_ema_loss = causal_lm_loss(
+            reconstructed_ema, encoded["input_ids"], attention_mask
         )
         zero_loss = causal_lm_loss(zero, encoded["input_ids"], attention_mask)
         denominator = original_loss - zero_loss
-        recovered = (reconstructed_loss - zero_loss) / denominator.clamp_max(-1e-8)
+        recovered_online = (
+            reconstructed_online_loss - zero_loss
+        ) / denominator.clamp_max(-1e-8)
+        recovered_ema = (
+            reconstructed_ema_loss - zero_loss
+        ) / denominator.clamp_max(-1e-8)
         totals["loss_original"] += float(original_loss)
-        totals["loss_reconstructed"] += float(reconstructed_loss)
+        totals["loss_reconstructed_online"] += float(reconstructed_online_loss)
+        totals["loss_reconstructed_ema"] += float(reconstructed_ema_loss)
         totals["loss_zero"] += float(zero_loss)
-        totals["fraction_loss_recovered"] += float(recovered)
+        totals["fraction_loss_recovered_online"] += float(recovered_online)
+        totals["fraction_loss_recovered_ema"] += float(recovered_ema)
         used += 1
     del llm
     if torch.cuda.is_available():
@@ -283,14 +362,30 @@ def _allocate_representations(
     n: int, model: TransitionJEPASAE
 ) -> dict[str, torch.Tensor]:
     return {
-        "context_high": torch.empty((n, model.cfg.d_high), dtype=torch.float16),
-        "predicted_endpoint_high": torch.empty(
+        "context_high_online": torch.empty(
             (n, model.cfg.d_high), dtype=torch.float16
         ),
-        "endpoint_high": torch.empty((n, model.cfg.d_high), dtype=torch.float16),
-        "context_low": torch.empty((n, model.cfg.d_low), dtype=torch.float16),
-        "endpoint_low": torch.empty((n, model.cfg.d_low), dtype=torch.float16),
-        "endpoint_full": torch.empty((n, model.cfg.d_sae), dtype=torch.float16),
+        "predicted_endpoint_high_online": torch.empty(
+            (n, model.cfg.d_high), dtype=torch.float16
+        ),
+        "context_high_ema": torch.empty(
+            (n, model.cfg.d_high), dtype=torch.float16
+        ),
+        "predicted_endpoint_high_ema": torch.empty(
+            (n, model.cfg.d_high), dtype=torch.float16
+        ),
+        "endpoint_high_ema": torch.empty(
+            (n, model.cfg.d_high), dtype=torch.float16
+        ),
+        "context_low_online": torch.empty(
+            (n, model.cfg.d_low), dtype=torch.float16
+        ),
+        "endpoint_low_ema": torch.empty(
+            (n, model.cfg.d_low), dtype=torch.float16
+        ),
+        "endpoint_full_ema": torch.empty(
+            (n, model.cfg.d_sae), dtype=torch.float16
+        ),
     }
 
 
@@ -310,23 +405,37 @@ def encode_mmlu_representations(
             device=device, dtype=model.pre_bias.dtype, non_blocking=True
         )
         with autocast_context(device, amp_dtype):
-            context_full = model.encode_ema(batch[:, 0])
-            endpoint_full = model.encode_ema(batch[:, -1])
-            context_high, context_low = model.split_code(context_full)
-            endpoint_high, endpoint_low = model.split_code(endpoint_full)
-            predicted = model.predict_from_code(
-                context_high,
+            context_online_full = model.encode(batch[:, 0])
+            context_ema_full = model.encode_ema(batch[:, 0])
+            endpoint_ema_full = model.encode_ema(batch[:, -1])
+            context_online_high, context_online_low = model.split_code(
+                context_online_full
+            )
+            context_ema_high, _ = model.split_code(context_ema_full)
+            endpoint_ema_high, endpoint_ema_low = model.split_code(
+                endpoint_ema_full
+            )
+            predicted_online = model.predict_from_code(
+                context_online_high,
+                context_positions=position_zero,
+                use_context=True,
+                sparse_output=True,
+            )[:, 0]
+            predicted_ema = model.predict_from_code(
+                context_ema_high,
                 context_positions=position_zero,
                 use_context=True,
                 sparse_output=True,
             )[:, 0]
         values = {
-            "context_high": context_high,
-            "predicted_endpoint_high": predicted,
-            "endpoint_high": endpoint_high,
-            "context_low": context_low,
-            "endpoint_low": endpoint_low,
-            "endpoint_full": endpoint_full,
+            "context_high_online": context_online_high,
+            "predicted_endpoint_high_online": predicted_online,
+            "context_high_ema": context_ema_high,
+            "predicted_endpoint_high_ema": predicted_ema,
+            "endpoint_high_ema": endpoint_ema_high,
+            "context_low_online": context_online_low,
+            "endpoint_low_ema": endpoint_ema_low,
+            "endpoint_full_ema": endpoint_ema_full,
         }
         for key, value in values.items():
             representations[key][start:end].copy_(value.float().cpu())
@@ -363,54 +472,106 @@ def collect_horizon_statistics(
             device=device, dtype=model.pre_bias.dtype, non_blocking=True
         )
         with autocast_context(device, amp_dtype):
-            context_full = model.encode_ema(batch[:, :-1])
-            context_high, _ = model.split_code(context_full)
+            online_context_full = model.encode(batch[:, :-1])
+            online_context_high, _ = model.split_code(online_context_full)
+            ema_context_full = model.encode_ema(batch[:, :-1])
+            ema_context_high, _ = model.split_code(ema_context_full)
             target_high, _ = model.split_code(model.encode_ema(batch[:, -1]))
             target = target_high[:, None].expand(-1, n_contexts, -1)
-            prediction = model.predict_from_code(
-                context_high, positions, use_context=True
+            online_prediction = model.predict_from_code(
+                online_context_high, positions, use_context=True
             )
-            sparse_prediction = topk_relu(prediction, model.cfg.k_high)
+            ema_prediction = model.predict_from_code(
+                ema_context_high, positions, use_context=True
+            )
+            sparse_online_prediction = topk_relu(
+                online_prediction, model.cfg.k_high
+            )
+            sparse_ema_prediction = topk_relu(
+                ema_prediction, model.cfg.k_high
+            )
             position_only = model.predict_from_code(
-                context_high, positions, use_context=False
+                online_context_high, positions, use_context=False
             )
-            shuffled_high, _ = model.split_code(
+            shuffled_online_high, _ = model.split_code(
+                model.encode(shuffled_batch[:, :-1])
+            )
+            shuffled_ema_high, _ = model.split_code(
                 model.encode_ema(shuffled_batch[:, :-1])
             )
-            shuffled_prediction = model.predict_from_code(
-                shuffled_high, positions, use_context=True
+            shuffled_online_prediction = model.predict_from_code(
+                shuffled_online_high, positions, use_context=True
             )
-            predicted_residual = model.decode_high(
-                sparse_prediction, ema=True, add_bias=True
+            shuffled_ema_prediction = model.predict_from_code(
+                shuffled_ema_high, positions, use_context=True
             )
-        prediction32 = prediction.float()
+            online_predicted_residual = model.decode_high(
+                sparse_online_prediction, ema=True, add_bias=True
+            )
+            ema_predicted_residual = model.decode_high(
+                sparse_ema_prediction, ema=True, add_bias=True
+            )
         target32 = target.float()
-        sparse32 = sparse_prediction.float()
-        predicted_active = sparse32 > 0
         target_active = target32 > 0
-        intersection = (predicted_active & target_active).sum(dim=-1).float()
-        union = (predicted_active | target_active).sum(dim=-1).float().clamp_min(1)
         target_residual = batch[:, -1, None, :].float()
+        support: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for name, sparse_prediction in {
+            "online": sparse_online_prediction,
+            "ema": sparse_ema_prediction,
+        }.items():
+            predicted_active = sparse_prediction.float() > 0
+            intersection = (predicted_active & target_active).sum(dim=-1).float()
+            support[name] = (
+                intersection
+                / predicted_active.sum(dim=-1).float().clamp_min(1),
+                intersection / target_active.sum(dim=-1).float().clamp_min(1),
+                intersection
+                / (predicted_active | target_active)
+                .sum(dim=-1)
+                .float()
+                .clamp_min(1),
+            )
         values = {
-            "context_target_cosine": F.cosine_similarity(
-                context_high.float(), target32, dim=-1
+            "online_context_target_cosine": F.cosine_similarity(
+                online_context_high.float(), target32, dim=-1
             ),
-            "code_cosine": F.cosine_similarity(prediction32, target32, dim=-1),
-            "shuffled_context_cosine": F.cosine_similarity(
-                shuffled_prediction.float(), target32, dim=-1
+            "online_code_cosine": F.cosine_similarity(
+                online_prediction.float(), target32, dim=-1
+            ),
+            "online_shuffled_context_cosine": F.cosine_similarity(
+                shuffled_online_prediction.float(), target32, dim=-1
+            ),
+            "ema_context_target_cosine": F.cosine_similarity(
+                ema_context_high.float(), target32, dim=-1
+            ),
+            "ema_code_cosine": F.cosine_similarity(
+                ema_prediction.float(), target32, dim=-1
+            ),
+            "ema_shuffled_context_cosine": F.cosine_similarity(
+                shuffled_ema_prediction.float(), target32, dim=-1
             ),
             "position_only_cosine": F.cosine_similarity(
                 position_only.float(), target32, dim=-1
             ),
-            "code_nrmse": (prediction32 - target32).square().mean(dim=-1)
+            "online_code_nrmse": (
+                online_prediction.float() - target32
+            ).square().mean(dim=-1)
             / target32.square().mean(dim=-1).clamp_min(1e-8),
-            "support_precision": intersection
-            / predicted_active.sum(dim=-1).float().clamp_min(1),
-            "support_recall": intersection
-            / target_active.sum(dim=-1).float().clamp_min(1),
-            "support_jaccard": intersection / union,
-            "residual_error": (
-                predicted_residual.float() - target_residual
+            "ema_code_nrmse": (
+                ema_prediction.float() - target32
+            ).square().mean(dim=-1)
+            / target32.square().mean(dim=-1).clamp_min(1e-8),
+            "online_support_precision": support["online"][0],
+            "online_support_recall": support["online"][1],
+            "online_support_jaccard": support["online"][2],
+            "ema_support_precision": support["ema"][0],
+            "ema_support_recall": support["ema"][1],
+            "ema_support_jaccard": support["ema"][2],
+            "online_residual_error": (
+                online_predicted_residual.float() - target_residual
+            ).square().mean(dim=-1),
+            "ema_residual_error": (
+                ema_predicted_residual.float() - target_residual
             ).square().mean(dim=-1),
             "residual_energy": (
                 target_residual - model.ema_pre_bias.float()
@@ -426,46 +587,96 @@ def build_horizon_curve(
     groups: np.ndarray,
     seed: int,
 ) -> list[dict[str, Any]]:
-    n_contexts = statistics["code_cosine"].shape[1]
+    n_contexts = statistics["online_code_cosine"].shape[1]
     rows: list[dict[str, Any]] = []
     for context_position in range(n_contexts):
-        learned = statistics["code_cosine"][:, context_position].numpy()
-        shuffled = statistics["shuffled_context_cosine"][:, context_position].numpy()
+        learned = statistics["online_code_cosine"][:, context_position].numpy()
+        shuffled = statistics[
+            "online_shuffled_context_cosine"
+        ][:, context_position].numpy()
+        ema_learned = statistics["ema_code_cosine"][:, context_position].numpy()
+        ema_shuffled = statistics[
+            "ema_shuffled_context_cosine"
+        ][:, context_position].numpy()
         position_only = statistics["position_only_cosine"][:, context_position].numpy()
-        residual_error = statistics["residual_error"][:, context_position]
+        online_residual_error = statistics[
+            "online_residual_error"
+        ][:, context_position]
+        ema_residual_error = statistics["ema_residual_error"][:, context_position]
         residual_energy = statistics["residual_energy"][:, context_position]
         rows.append(
             {
                 "context_position": context_position,
                 "horizon": n_contexts - context_position,
-                "context_target_cosine": float(
-                    statistics["context_target_cosine"][:, context_position].mean()
+                "online_context_target_cosine": float(
+                    statistics["online_context_target_cosine"][
+                        :, context_position
+                    ].mean()
                 ),
-                "code_cosine": float(learned.mean()),
-                "shuffled_context_cosine": float(shuffled.mean()),
+                "online_code_cosine": float(learned.mean()),
+                "online_shuffled_context_cosine": float(shuffled.mean()),
+                "ema_context_target_cosine": float(
+                    statistics["ema_context_target_cosine"][
+                        :, context_position
+                    ].mean()
+                ),
+                "ema_code_cosine": float(ema_learned.mean()),
+                "ema_shuffled_context_cosine": float(ema_shuffled.mean()),
                 "position_only_cosine": float(position_only.mean()),
-                "context_gain_over_shuffled": clustered_mean_ci(
+                "online_gain_over_shuffled": clustered_mean_ci(
                     learned - shuffled, groups, seed + 101 * context_position
                 ),
-                "context_gain_over_position_only": clustered_mean_ci(
+                "online_gain_over_position_only": clustered_mean_ci(
                     learned - position_only,
                     groups,
                     seed + 10007 + 101 * context_position,
                 ),
-                "code_nrmse": float(
-                    statistics["code_nrmse"][:, context_position].mean()
+                "ema_gain_over_shuffled": clustered_mean_ci(
+                    ema_learned - ema_shuffled,
+                    groups,
+                    seed + 20011 + 101 * context_position,
                 ),
-                "support_precision": float(
-                    statistics["support_precision"][:, context_position].mean()
+                "ema_gain_over_position_only": clustered_mean_ci(
+                    ema_learned - position_only,
+                    groups,
+                    seed + 30011 + 101 * context_position,
                 ),
-                "support_recall": float(
-                    statistics["support_recall"][:, context_position].mean()
+                "online_minus_ema_cosine": clustered_mean_ci(
+                    learned - ema_learned,
+                    groups,
+                    seed + 40009 + 101 * context_position,
                 ),
-                "support_jaccard": float(
-                    statistics["support_jaccard"][:, context_position].mean()
+                "online_code_nrmse": float(
+                    statistics["online_code_nrmse"][:, context_position].mean()
                 ),
-                "residual_prediction_fvu": float(
-                    residual_error.mean() / residual_energy.mean().clamp_min(1e-8)
+                "ema_code_nrmse": float(
+                    statistics["ema_code_nrmse"][:, context_position].mean()
+                ),
+                "online_support_precision": float(
+                    statistics["online_support_precision"][:, context_position].mean()
+                ),
+                "online_support_recall": float(
+                    statistics["online_support_recall"][:, context_position].mean()
+                ),
+                "online_support_jaccard": float(
+                    statistics["online_support_jaccard"][:, context_position].mean()
+                ),
+                "ema_support_precision": float(
+                    statistics["ema_support_precision"][:, context_position].mean()
+                ),
+                "ema_support_recall": float(
+                    statistics["ema_support_recall"][:, context_position].mean()
+                ),
+                "ema_support_jaccard": float(
+                    statistics["ema_support_jaccard"][:, context_position].mean()
+                ),
+                "online_residual_prediction_fvu": float(
+                    online_residual_error.mean()
+                    / residual_energy.mean().clamp_min(1e-8)
+                ),
+                "ema_residual_prediction_fvu": float(
+                    ema_residual_error.mean()
+                    / residual_energy.mean().clamp_min(1e-8)
                 ),
             }
         )
@@ -684,7 +895,9 @@ def main() -> None:
     report = {
         "evaluation_protocol": {
             "goal": "conventional SAE quality plus endpoint-forecast validity",
-            "sae": "final full-EMA high/low encoder-decoder",
+            "sae_comparison": "online and EMA high/low encoder-decoder pairs",
+            "primary_forecast": "P(E_online(h_k), k) -> E_EMA(h_T)",
+            "secondary_forecast": "P(E_EMA(h_k), k) -> E_EMA(h_T)",
             "forecast_controls": [
                 "different-question shuffled context",
                 "position-only predictor",
@@ -696,13 +909,21 @@ def main() -> None:
         "standard_sae_quality": sae_quality,
         "loss_recovered": loss_recovered,
         "forecast_validity": {
+            "primary_context_encoder": "online (training-matched)",
+            "secondary_context_encoder": "EMA compatibility",
             "horizon_curve": horizon_curve,
             "longest_horizon": longest,
-            "positive_over_shuffled": (
-                longest["context_gain_over_shuffled"]["ci95_low"] > 0
+            "online_positive_over_shuffled": (
+                longest["online_gain_over_shuffled"]["ci95_low"] > 0
             ),
-            "positive_over_position_only": (
-                longest["context_gain_over_position_only"]["ci95_low"] > 0
+            "online_positive_over_position_only": (
+                longest["online_gain_over_position_only"]["ci95_low"] > 0
+            ),
+            "ema_positive_over_shuffled": (
+                longest["ema_gain_over_shuffled"]["ci95_low"] > 0
+            ),
+            "ema_positive_over_position_only": (
+                longest["ema_gain_over_position_only"]["ci95_low"] > 0
             ),
         },
         "mmlu_probe_accuracy": probes,
@@ -731,27 +952,47 @@ def main() -> None:
         fieldnames = [
             "context_position",
             "horizon",
-            "context_target_cosine",
-            "code_cosine",
-            "shuffled_context_cosine",
+            "online_context_target_cosine",
+            "online_code_cosine",
+            "online_shuffled_context_cosine",
+            "ema_context_target_cosine",
+            "ema_code_cosine",
+            "ema_shuffled_context_cosine",
             "position_only_cosine",
-            "gain_over_shuffled",
-            "gain_over_shuffled_ci95_low",
-            "gain_over_shuffled_ci95_high",
-            "gain_over_position_only",
-            "gain_over_position_only_ci95_low",
-            "gain_over_position_only_ci95_high",
-            "code_nrmse",
-            "support_precision",
-            "support_recall",
-            "support_jaccard",
-            "residual_prediction_fvu",
+            "online_gain_over_shuffled",
+            "online_gain_over_shuffled_ci95_low",
+            "online_gain_over_shuffled_ci95_high",
+            "online_gain_over_position_only",
+            "online_gain_over_position_only_ci95_low",
+            "online_gain_over_position_only_ci95_high",
+            "ema_gain_over_shuffled",
+            "ema_gain_over_shuffled_ci95_low",
+            "ema_gain_over_shuffled_ci95_high",
+            "ema_gain_over_position_only",
+            "ema_gain_over_position_only_ci95_low",
+            "ema_gain_over_position_only_ci95_high",
+            "online_minus_ema_cosine",
+            "online_minus_ema_cosine_ci95_low",
+            "online_minus_ema_cosine_ci95_high",
+            "online_code_nrmse",
+            "ema_code_nrmse",
+            "online_support_precision",
+            "online_support_recall",
+            "online_support_jaccard",
+            "ema_support_precision",
+            "ema_support_recall",
+            "ema_support_jaccard",
+            "online_residual_prediction_fvu",
+            "ema_residual_prediction_fvu",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in horizon_curve:
-            shuffled = row["context_gain_over_shuffled"]
-            position = row["context_gain_over_position_only"]
+            online_shuffled = row["online_gain_over_shuffled"]
+            online_position = row["online_gain_over_position_only"]
+            ema_shuffled = row["ema_gain_over_shuffled"]
+            ema_position = row["ema_gain_over_position_only"]
+            online_minus_ema = row["online_minus_ema_cosine"]
             writer.writerow(
                 {
                     **{
@@ -759,16 +1000,28 @@ def main() -> None:
                         for key, value in row.items()
                         if key
                         not in {
-                            "context_gain_over_shuffled",
-                            "context_gain_over_position_only",
+                            "online_gain_over_shuffled",
+                            "online_gain_over_position_only",
+                            "ema_gain_over_shuffled",
+                            "ema_gain_over_position_only",
+                            "online_minus_ema_cosine",
                         }
                     },
-                    "gain_over_shuffled": shuffled["mean"],
-                    "gain_over_shuffled_ci95_low": shuffled["ci95_low"],
-                    "gain_over_shuffled_ci95_high": shuffled["ci95_high"],
-                    "gain_over_position_only": position["mean"],
-                    "gain_over_position_only_ci95_low": position["ci95_low"],
-                    "gain_over_position_only_ci95_high": position["ci95_high"],
+                    "online_gain_over_shuffled": online_shuffled["mean"],
+                    "online_gain_over_shuffled_ci95_low": online_shuffled["ci95_low"],
+                    "online_gain_over_shuffled_ci95_high": online_shuffled["ci95_high"],
+                    "online_gain_over_position_only": online_position["mean"],
+                    "online_gain_over_position_only_ci95_low": online_position["ci95_low"],
+                    "online_gain_over_position_only_ci95_high": online_position["ci95_high"],
+                    "ema_gain_over_shuffled": ema_shuffled["mean"],
+                    "ema_gain_over_shuffled_ci95_low": ema_shuffled["ci95_low"],
+                    "ema_gain_over_shuffled_ci95_high": ema_shuffled["ci95_high"],
+                    "ema_gain_over_position_only": ema_position["mean"],
+                    "ema_gain_over_position_only_ci95_low": ema_position["ci95_low"],
+                    "ema_gain_over_position_only_ci95_high": ema_position["ci95_high"],
+                    "online_minus_ema_cosine": online_minus_ema["mean"],
+                    "online_minus_ema_cosine_ci95_low": online_minus_ema["ci95_low"],
+                    "online_minus_ema_cosine_ci95_high": online_minus_ema["ci95_high"],
                 }
             )
     with (output_dir / "mmlu_probe_accuracy.csv").open(
@@ -805,11 +1058,18 @@ def main() -> None:
     test_tensor = torch.as_tensor(test_indices, dtype=torch.long)
     torch.save(
         {
-            "predicted_endpoint_high": pca_embedding(
-                representations["predicted_endpoint_high"].index_select(0, test_tensor)
+            "predicted_endpoint_high_online": pca_embedding(
+                representations["predicted_endpoint_high_online"].index_select(
+                    0, test_tensor
+                )
             ),
-            "endpoint_high": pca_embedding(
-                representations["endpoint_high"].index_select(0, test_tensor)
+            "predicted_endpoint_high_ema": pca_embedding(
+                representations["predicted_endpoint_high_ema"].index_select(
+                    0, test_tensor
+                )
+            ),
+            "endpoint_high_ema": pca_embedding(
+                representations["endpoint_high_ema"].index_select(0, test_tensor)
             ),
             "semantic_labels": [
                 str(metadata[index][PROBE_LABELS["semantics"]])

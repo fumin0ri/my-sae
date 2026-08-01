@@ -104,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--hook-point", choices=["pre", "post"], default="post")
     parser.add_argument(
+        "--context-encoder",
+        choices=["online", "ema"],
+        default="online",
+        help=(
+            "online matches predictor training; ema is a secondary compatibility test"
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=["patch", "ablate", "random_ablate"],
         default="patch",
@@ -273,10 +281,15 @@ def main() -> None:
             dtype=torch.long,
         )
         with torch.inference_mode():
-            source_context = jepa.encode_forecast_ema(
+            encode_context = (
+                jepa.encode_forecast_online
+                if args.context_encoder == "online"
+                else jepa.encode_forecast_ema
+            )
+            source_context = encode_context(
                 source_window[context_position : context_position + 1]
             )
-            target_context = jepa.encode_forecast_ema(
+            target_context = encode_context(
                 target_window[context_position : context_position + 1]
             )
             source_prediction = jepa.predict_from_code(
@@ -405,6 +418,7 @@ def main() -> None:
                 "row_index": row_index,
                 "eligible_index": eligible_index,
                 "mode": args.mode,
+                "context_encoder": args.context_encoder,
                 "alpha": args.alpha,
                 "context_position": context_position,
                 "target_position": target_position,

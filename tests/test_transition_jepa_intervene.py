@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from shared_residual.transition_jepa_intervene import (
+    build_parser,
     resolve_horizon,
     select_eligible_pairs,
 )
@@ -16,6 +17,24 @@ def test_explicit_intervention_horizon_is_validated() -> None:
     assert resolve_horizon(4, 5) == 4
     with pytest.raises(ValueError):
         resolve_horizon(5, 5)
+
+
+def test_intervention_defaults_to_training_matched_online_context() -> None:
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "model",
+            "--pairs",
+            "pairs.jsonl",
+            "--checkpoint",
+            "sae.pt",
+            "--output",
+            "result.jsonl",
+            "--layer",
+            "1",
+        ]
+    )
+    assert args.context_encoder == "online"
 
 
 def test_causal_pair_selection_skips_short_prefixes_before_limit() -> None:

@@ -197,7 +197,7 @@ if (( START_STAGE <= 5 && END_STAGE >= 5 )); then
 fi
 
 if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
-  echo "[6/8] Evaluate standard SAE quality and locked forecast validity"
+  echo "[6/8] Compare online/EMA SAE quality and run Online-matched forecast validity"
   EVAL_ARGS=(
     --activation-manifest "$ACTIVATION_MANIFEST"
     --activations "$EVAL_ACTIVATIONS"
@@ -234,6 +234,7 @@ if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
         --checkpoint "$CHECKPOINT" \
         --output "$RUN_DIR/analysis/intervention-$OUTPUT_MODE.jsonl" \
         --layer "$LAYER" --hook-point post --mode "$MODE" \
+        --context-encoder online \
         --horizon "$INTERVENTION_HORIZON" --max-pairs "$PAIRS" \
         --minimum-pairs "$PAIRS" --seed "$SEED"
     done
