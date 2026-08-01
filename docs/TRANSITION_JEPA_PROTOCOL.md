@@ -1,269 +1,190 @@
-# All-context fixed-endpoint JEPA-SAE protocol
+# High/low fixed-endpoint JEPA-SAE protocol
 
-## Confirmatory question
+## Research question
 
-Can joint latent forecasting reshape an SAE dictionary so that every earlier
-position exposes a sparse component of one fixed future endpoint that is
-forecastable from that position?
+Can a sparse dictionary be divided into:
 
-For a prespecified window of `W >= 2` residual positions, define `T = W - 1`.
+- a small high-level group that is reconstructive and forecastable from prior
+  residual positions; and
+- a larger low-level group that captures incremental reconstruction detail?
 
-```text
-zk_online = TopK(ReLU(E_online(normalize(hk)))), k = 0,...,T
-zT_target = stopgrad(TopK(ReLU(E_EMA(normalize(hT))))
-z_hat_T_from_k = softplus(P(zk_online, embedding(k))), k = 0,...,T-1
-```
+The model contains no unsplit SAE condition. For a window of `W` residuals,
+`T = W - 1` is the fixed endpoint and every `k < T` is a context.
 
-Every earlier position is a separate context. All contexts predict the same
-EMA endpoint code. Target representations are neither averaged nor pooled,
-and the predictor is not autoregressive.
+## Architecture
 
-## Interpretation boundary
-
-The predictor does not observe the tokens between `k` and `T`. It estimates
-the component of the fixed endpoint that is forecastable under the data
-distribution:
-
-```text
-P(zk, k) approximately estimates E[zT | zk, k].
-```
-
-This is not a deterministic transition operator. The innovation contains
-intervening-token information, lexical realization, and other unpredictable
-updates. Comparing different `k` values measures how endpoint information
-becomes available as context approaches the endpoint.
-
-## Training stages
-
-1. Stream the Pile mixture and extract document-disjoint train/validation
-   residual windows.
-2. Train one standard Top-K SAE on all positions as a shared initialization.
-3. Copy the online encoder, decoder, and normalization bias into a full EMA
-   target SAE.
-4. Initialize unsplit joint, hierarchical high/low, fixed-SAE, and
-   position-only conditions from the exact same checkpoint and activation
-   fingerprint.
-5. Warm up each predictor with the SAE frozen.
-6. For the joint condition, unfreeze the online encoder and decoder, ramp the
-   forecasting loss, update the full target SAE by EMA, and row-normalize the
-   EMA decoder after every update.
-
-MMLU is never used for SAE or predictor optimization. Its pinned test split is
-opened only after training for grouped locked evaluation and causal tests.
-Residual extraction and base-model scoring must cover identical stable
-question IDs and exclude prompts shorter than `W` real tokens.
-
-## Training corpus
-
-The default is the pinned `default` configuration of
-`EleutherAI/the_pile_deduplicated`, streamed from Parquet with an additional
-finite shuffle buffer. The default budget is 5,242,880 training and 163,840
-validation residual positions. Thus activation storage remains approximately
-constant as `W` changes.
-
-Each document is assigned wholly to train or validation by deterministic hash.
-BF16 shards use atomic partial-file replacement and a fixed position budget.
-The manifest records source configuration, model revision, layer, counts,
-normalization statistics, capacity estimate, and a data fingerprint. All
-conditions must share that fingerprint. If component labels are absent from
-the public Parquet schema, the manifest reports that limitation rather than
-inferring labels.
-
-## Full EMA SAE and objective
-
-The online endpoint code reconstructs `hT` through the online decoder. The
-online encoder-decoder pair is the gradient-trained student. The EMA encoder,
-decoder, and normalization bias form the teacher and final SAE. The EMA
-decoder is row-normalized after each EMA update.
-
-Predicted sparse codes are decoded through the frozen EMA decoder. Gradients
-therefore propagate from residual prediction to the predictor output, but
-never into the EMA SAE. No EMA-code/online-decoder compatibility objective and
-no variance regularizer are used.
-
-```text
-L = FVU(D_online(zT_online), hT)
-  + lambda_prediction * mean_{k<T}[
-      1 - cosine(z_hat_T_from_k, zT_target)
-      + 0.25 * normalized_MSE(z_hat_T_from_k, zT_target)
-      + lambda_residual * FVU(D_EMA(TopK(z_hat_T_from_k)), hT)
-    ]
-```
-
-The predictor output remains dense and non-negative for the latent regression
-loss. Top-K is applied for sparse-support metrics, residual decoding, and
-causal interventions. Input-dependent EMA targets, online reconstruction,
-latent prediction, and predicted-residual reconstruction provide the
-anti-collapse constraints. Collapse statistics remain monitored outcomes.
-
-## T-SAE-inspired hierarchical condition
-
-The proposed condition adapts the two-group Temporal Matryoshka SAE design in
-[AI4LIFE-GROUP/temporal-saes](https://github.com/AI4LIFE-GROUP/temporal-saes).
-As in the upstream T-SAE experiment configuration, group 0 is the high-level
-20% of the dictionary and group 1 is the low-level 80%. Unlike a temporal
-smoothness penalty, our group-0 supervision is fixed-endpoint JEPA
-forecastability.
-
-The total dictionary width and total Top-K budget equal the unsplit joint
-baseline. Each group has an independent Top-K budget:
+The dictionary and sparsity budget are partitioned:
 
 ```text
 d_high + d_low = d_sae
 k_high + k_low = k
 
-z_high = TopK_high(ReLU(E_high(h)))
-z_low  = TopK_low(ReLU(E_low(h)))
+z_k_high = TopK_high(ReLU(E_high(normalize(h_k))))
+z_k_low  = TopK_low(ReLU(E_low(normalize(h_k))))
 ```
 
-This prevents global competition from starving the low group. The endpoint
-uses a cumulative (Matryoshka) reconstruction:
+The default split is 20% high and 80% low, following the experiment
+configuration in
+[AI4LIFE-GROUP/temporal-saes](https://github.com/AI4LIFE-GROUP/temporal-saes).
+Independent Top-K operators prevent the low group from being starved by global
+feature competition.
+
+The endpoint uses cumulative reconstruction:
 
 ```text
-h_hat_high = bias + D_high(zT_high)
-h_hat_full = bias + D_high(zT_high) + D_low(zT_low)
-
-L_rec_hierarchical =
-    alpha * FVU(h_hat_high, hT)
-  + (1 - alpha) * FVU(h_hat_full, hT)
+h_hat_high = bias + D_high(z_T_high)
+h_hat_full = bias + D_high(z_T_high) + D_low(z_T_low)
 ```
 
-Only the high group is exposed to the predictor and latent forecast loss:
+Only high features receive endpoint-prediction supervision:
 
 ```text
-z_hat_T_high_from_k = P(z_k_high, k)
-zT_high_target = stopgrad(E_EMA_high(hT))
-h_hat_predictable = bias_EMA + D_EMA_high(TopK_high(z_hat_T_high_from_k))
+z_hat_T_high(k) = softplus(P(z_k_high, embedding(k)))
+z_T_target = stopgrad(E_EMA_high(h_T))
 ```
 
-The low group receives gradients only through full endpoint reconstruction.
-The entire online high/low encoder and decoder are EMA-updated, and both EMA
-decoder blocks are row-normalized. Thus low is not discarded from the final
-SAE, while the high block is explicitly the proposed forecastable state.
+## Training
 
-Default `high_fraction = alpha = 0.2`. These are prespecified but exposed as
-ablation parameters. The high/low interpretation is supported only if high
-beats low on semantic/context probes or forecast outcomes without sacrificing
-full reconstruction, and is weakened if low carries equal abstract signal.
+The online high/low SAE is initialized directly from the Pile activation mean
+and scalar RMS. There is no standard or unsplit SAE pretraining.
 
-## Confirmatory comparison
+Training has two phases:
 
-The primary statistic is the per-question mean endpoint-code cosine across all
-context positions:
+1. SAE-only warm-up: high-only and cumulative full reconstruction.
+2. Joint phase: retain reconstruction and ramp the high endpoint-prediction
+   objective.
 
 ```text
-joint JEPA-SAE minus fixed standard-SAE predictor
+L_rec = alpha * FVU(h_hat_high, h_T)
+      + (1-alpha) * FVU(h_hat_full, h_T)
+
+L_pred = mean_k<T [
+    1 - cosine(z_hat_T_high(k), z_T_target)
+    + 0.25 * normalized_MSE(z_hat_T_high(k), z_T_target)
+    + lambda_residual * FVU(
+        bias_EMA + D_EMA_high(TopK_high(z_hat_T_high(k))), h_T
+      )
+]
+
+L = L_rec + lambda_prediction * L_pred
 ```
 
-A question-group bootstrap supplies the 95% confidence interval. Horizon-wise
-curves remain available and must not be replaced by only the average.
+The online encoder, decoder, and bias are gradient-trained. Their full
+high/low state is EMA-updated. EMA decoder rows are unit-normalized after every
+update. The final research artifact and all evaluation use the EMA SAE.
 
-The new primary architectural comparison is:
+## Data
+
+Training and activation evaluation use deterministic document-disjoint shards
+from the pinned `EleutherAI/the_pile_deduplicated` release. The default budgets
+are 5,242,880 training and 163,840 validation positions. Holding the position
+budget fixed keeps storage approximately invariant to window size.
+
+The default window size is 128 to match the activation context used by the
+T-SAE evaluation entrypoint. Window size remains an explicit experimental
+variable.
+
+LLM loss recovered streams `monology/pile-uncopyrighted`, matching T-SAE's
+`eval_temporal.py` default. Its default maximum context is 2048 tokens and its
+batch size is one text, while the temporal activation metrics use 128-position
+sequences, matching the two distinct upstream settings.
+
+## Evaluation source of truth
+
+Metric definitions are ported from:
+
+- [`dictionary_learning/evaluation.py`](https://github.com/AI4LIFE-GROUP/temporal-saes/blob/main/dictionary_learning/dictionary_learning/evaluation.py)
+- [`dictionary_learning/eval_temporal.py`](https://github.com/AI4LIFE-GROUP/temporal-saes/blob/main/dictionary_learning/dictionary_learning/eval_temporal.py)
+
+The inspected upstream `evaluation.py` blob is pinned as
+`0f0deec54f828137d8f637ecc8f12ec9af3a84cc` in each report.
+
+The port keeps the upstream metric names and formulas.
+
+### Reconstruction and sparsity
+
+For final EMA codes `f` and full reconstruction `x_hat`:
 
 ```text
-hierarchical high-group forecast cosine minus unsplit joint forecast cosine
+l2_loss = mean ||x - x_hat||_2
+l1_loss = mean ||f||_1
+l0 = mean count(f != 0)
+sequence_l0 = mean count(sum_time(f) != 0)
+cossim = mean cosine(x, x_hat)
+l2_ratio = mean ||x_hat||_2 / ||x||_2
+relative_reconstruction_bias = mean ||x_hat||^2 / mean <x, x_hat>
 ```
 
-The high and low context/endpoint codes are separately probed for MMLU
-semantics, domain context, and syntax. High-only and full EMA reconstruction
-FVU are reported together so that apparent abstraction cannot be purchased by
-silently dropping endpoint information.
+`frac_alive` is the fraction of dictionary features with nonzero summed
+activation over evaluation.
 
-The joint claim requires:
+### High/low reconstruction FVE
 
-- joint forecasting to exceed the fixed-SAE predictor;
-- matching contexts to exceed different-question, matching-position contexts;
-- matching contexts to exceed the position-only predictor;
-- direct `cosine(zk_EMA, zT_EMA)` to be reported separately from
-  predictor performance;
-- online-student and final-EMA endpoint reconstruction to remain acceptable;
-- representations not to collapse;
-- learned causal effects to exceed norm-matched random edits.
-
-## Controls
-
-- one standard SAE checkpoint shared by all conditions;
-- frozen standard SAE plus the same position-conditioned predictor;
-- position-only predictor with the context projection disabled;
-- different-question context trajectories at evaluation;
-- raw final-EMA context versus final-EMA endpoint cosine;
-- online versus EMA encoding of the exact same endpoint, with separate probe,
-  collapse, alignment, and reconstruction diagnostics;
-- norm-matched random causal edits.
-- capacity-matched unsplit joint JEPA-SAE for the hierarchical condition;
-- low-group probes and collapse diagnostics as a negative/control channel.
-
-## Locked-test outcomes
-
-Locked evaluation uses `E_EMA` for every context and endpoint code and uses
-`D_EMA` for all predicted-residual metrics. The online SAE is retained only
-for the same-endpoint student-versus-final diagnostic.
-
-For each context `k = 0,...,T-1`, report:
-
-- horizon `T-k`;
-- raw context-target cosine;
-- predicted target-code cosine and normalized MSE;
-- matching-context minus shuffled-context cosine;
-- Top-K support precision, recall, and Jaccard;
-- endpoint residual-prediction FVU and innovation-energy ratio;
-- predictor and endpoint-target norms.
-
-Evaluation streams dense tensors batch by batch and retains per-question
-scalar horizon statistics. Dense codes are retained only for the prespecified
-longest-horizon feature analysis, preventing memory from scaling as
-`questions x W x d_sae`.
-
-Secondary outcomes are:
-
-- MMLU semantics accuracy: balanced correct-option decoding;
-- context accuracy: official broad MMLU domain decoding;
-- syntax accuracy: independently balanced prompt-form decoding;
-- frozen base-LLM zero-shot accuracy;
-- collapse diagnostics;
-- top longest-horizon forecast features and examples;
-- endpoint patching, ablation, and norm-matched random controls.
-- direct high-versus-low MMLU probe comparison and high-only causal edits.
-
-The base score uses the same balanced zero-shot prompts and minimum-token
-eligibility rule as representation analysis. It is not the official five-shot
-leaderboard protocol.
-
-## Causal intervention
-
-One horizon is prespecified; the default is the longest horizon, `k=0`.
-Contexts are encoded by `E_EMA`; the learned forecast component is decoded by
-`D_EMA` and applied exactly once at the fixed endpoint residual:
+As in upstream `recon_splits`, individual high and low reconstructions exclude
+the shared decoder bias:
 
 ```text
-delta_hT = D_EMA(
-    TopK(P(z_source_k, k))
-    - TopK(P(z_target_k, k))
-)
+x_hat_high = f_high @ W_high
+x_hat_low  = f_low  @ W_low
+FVE = 1 - Var(x - x_hat) / Var(x)
 ```
 
-Ablation removes `D_EMA(TopK(P(z_target_k, k)))`. The random control uses an
-independent direction with the exact learned-edit norm. Source and target
-prompts must each have at least `W` real tokens. Patch, ablation, and random
-conditions use identical eligible pair IDs.
+The report includes full, high-only, and low-only FVE.
 
-## Falsification conditions
+### Temporal smoothness
 
-The main claim is rejected or weakened if:
+For high and low groups separately:
 
-- the joint-minus-fixed group-bootstrap interval includes zero;
-- shuffled or position-only contexts match the true-context result;
-- predictor performance is explained entirely by raw code similarity;
-- improvement requires materially worse online or EMA-code reconstruction;
-- codes collapse to horizon, position, or prompt-template shortcuts;
-- learned endpoint edits do not beat norm-matched random edits;
-- results fail to replicate across models, layers, split seeds, or feature
-  seeds.
+- `smoothness_tv`: adjacent absolute activation change summed over time and
+  features;
+- `lipschitz_cont`: for each active feature, maximum adjacent
+  `|delta f| / ||delta x||_2`, averaged over active features;
+- `fft`: high-frequency energy divided by low-frequency energy;
+- `wavelet`: accumulated Haar-like detail energy divided by final
+  approximation energy;
+- `multiscale`: scale-1 difference variance divided by the coarsest valid
+  difference variance.
 
-## Replication
+The total group is also reported for all smoothness metrics except TV, exactly
+following upstream output naming.
 
-The replication unit is model x layer x MMLU split seed x feature seed.
-Recommended scaling uses Pythia 1.4B, 2.8B, and 6.9B, three prespecified layer
-fractions, and at least three seeds. Changing the fixed-endpoint architecture
-invalidates old transition checkpoints, but matching Pile activations and the
-standard-SAE initialization can be reused by restarting at pipeline stage 6.
+### LLM loss recovered
+
+Run the frozen LLM three times on each evaluation text:
+
+1. original residual;
+2. residual replaced by the final EMA SAE reconstruction;
+3. residual replaced by zero.
+
+```text
+frac_recovered =
+    (loss_reconstructed - loss_zero)
+    / (loss_original - loss_zero)
+```
+
+This is the same loss-recovered definition used by T-SAE. It is a functional
+faithfulness metric, not an endpoint forecast metric.
+
+## Interpretation
+
+The intended high-level separation is supported when the high group is
+temporally smoother than the low group while retaining meaningful high-only
+FVE and the full SAE recovers model loss. Raw TV depends on group width, so it
+must be interpreted together with Lipschitz, spectral, wavelet, multiscale,
+and reconstruction metrics.
+
+The claim is weakened if:
+
+- high smoothness is explained only by high-group size or inactivity;
+- high-only FVE is negligible;
+- low features are equally or more temporally stable across normalized
+  metrics;
+- full reconstruction cosine/FVE or loss recovered is poor;
+- a large fraction of either dictionary is dead;
+- results fail to replicate across model, layer, window, and seed.
+
+## Reproducibility
+
+Each report records model revision, layer, hook point, data fingerprint,
+window size, group sizes, Top-K budgets, package environment, GPU metadata,
+training history, and the exact evaluation metric source URLs.
