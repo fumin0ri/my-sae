@@ -14,13 +14,26 @@ import numpy as np
 
 from .io import write_json
 
+
 HIGH = "#059669"
 LOW = "#84cc16"
 TOTAL = "#2563eb"
+NULL = "#94a3b8"
+POSITION = "#d97706"
 
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def save_figure(fig: plt.Figure, output: Path, name: str) -> None:
@@ -30,21 +43,22 @@ def save_figure(fig: plt.Figure, output: Path, name: str) -> None:
 
 
 def training_plot(run_dir: Path, figures: Path) -> None:
-    report = load_json(run_dir / "model" / "training_report.json")
-    history = report["history"]
+    history = load_json(run_dir / "model" / "training_report.json")["history"]
     steps = [row["step"] for row in history]
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.4))
-    for key, label, color, style in (
-        ("ema_high_reconstruction_fvu", "EMA high only", HIGH, "--"),
-        ("ema_reconstruction_fvu", "EMA high + low", TOTAL, "-"),
-    ):
-        axes[0].plot(
-            steps,
-            [row["validation"][key] for row in history],
-            label=label,
-            color=color,
-            linestyle=style,
-        )
+    axes[0].plot(
+        steps,
+        [row["validation"]["ema_reconstruction_fvu"] for row in history],
+        color=TOTAL,
+        label="Full EMA SAE",
+    )
+    axes[0].plot(
+        steps,
+        [row["validation"]["ema_high_reconstruction_fvu"] for row in history],
+        color=HIGH,
+        linestyle="--",
+        label="High only",
+    )
     axes[1].plot(
         steps,
         [row["validation"]["code_cosine"] for row in history],
@@ -52,22 +66,22 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     )
     axes[2].plot(
         steps,
-        [row["validation"]["high_l0"] for row in history],
-        color=HIGH,
-        label="High L0",
+        [row["validation"]["support_recall"] for row in history],
+        color="#7c3aed",
+        label="Support recall",
     )
     axes[2].plot(
         steps,
-        [row["validation"]["low_l0"] for row in history],
-        color=LOW,
-        label="Low L0",
+        [row["validation"]["support_precision"] for row in history],
+        color="#db2777",
+        label="Support precision",
     )
-    axes[0].set_title("Cumulative endpoint reconstruction")
-    axes[0].set_ylabel("Validation FVU")
-    axes[1].set_title("High endpoint forecast")
-    axes[1].set_ylabel("Code cosine")
-    axes[2].set_title("Independent group sparsity")
-    axes[2].set_ylabel("Active features / position")
+    axes[0].set_title("Endpoint reconstruction")
+    axes[0].set_ylabel("FVU (lower is better)")
+    axes[1].set_title("Endpoint-code prediction")
+    axes[1].set_ylabel("Cosine (higher is better)")
+    axes[2].set_title("Predicted sparse support")
+    axes[2].set_ylabel("Score")
     for axis in axes:
         axis.set_xlabel("Optimizer step")
         axis.grid(alpha=0.2)
@@ -77,133 +91,238 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     save_figure(fig, figures, "training")
 
 
-def reconstruction_plot(report: dict[str, Any], figures: Path) -> None:
-    metrics = report["activation_metrics"]
-    labels = ["High", "Low", "High + low"]
-    fve = [
-        metrics["frac_variance_explained_high"],
-        metrics["frac_variance_explained_low"],
-        metrics["frac_variance_explained"],
-    ]
-    fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.4))
-    axes[0].bar(labels, fve, color=[HIGH, LOW, TOTAL])
+def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
+    quality = report["standard_sae_quality"]
+    recovered = report.get("loss_recovered")
+    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5))
+    axes[0].bar(
+        ["High", "Low", "Full"],
+        [
+            quality["high_only_fraction_variance_explained"],
+            quality["low_only_fraction_variance_explained"],
+            quality["fraction_variance_explained"],
+        ],
+        color=[HIGH, LOW, TOTAL],
+    )
     axes[0].axhline(0, color="#334155", linewidth=1)
-    axes[0].set_title("Fraction of activation variance explained")
-    axes[0].set_ylabel("FVE")
-    secondary_labels = ["Cosine", "L2 ratio", "Relative bias"]
-    secondary = [
-        metrics["cossim"],
-        metrics["l2_ratio"],
-        metrics["relative_reconstruction_bias"],
-    ]
-    axes[1].bar(secondary_labels, secondary, color=[TOTAL, "#7c3aed", "#d97706"])
-    axes[1].axhline(1, color="#334155", linestyle="--", label="Ideal ratio/bias")
-    axes[1].set_title("Reconstruction geometry")
-    axes[1].legend(frameon=False)
+    axes[0].set_title("Variance explained")
+    axes[0].set_ylabel("FVE (higher is better)")
+    axes[1].bar(
+        ["Cosine", "Alive"],
+        [quality["reconstruction_cosine"], quality["alive_feature_fraction"]],
+        color=[TOTAL, HIGH],
+    )
+    axes[1].set_ylim(0, 1)
+    axes[1].set_title("Reconstruction and dictionary use")
+    if recovered is None:
+        axes[2].text(0.5, 0.5, "Loss recovered skipped", ha="center", va="center")
+        axes[2].set_axis_off()
+    else:
+        axes[2].bar(
+            ["Original", "SAE recon", "Zero"],
+            [
+                recovered["loss_original"],
+                recovered["loss_reconstructed"],
+                recovered["loss_zero"],
+            ],
+            color=[TOTAL, HIGH, "#dc2626"],
+        )
+        axes[2].set_title(
+            f"Loss recovered = {recovered['fraction_loss_recovered']:.3f}"
+        )
+        axes[2].set_ylabel("Next-token cross entropy")
     for axis in axes:
         axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    save_figure(fig, figures, "reconstruction")
+    save_figure(fig, figures, "standard-sae-quality")
 
 
-def smoothness_plot(report: dict[str, Any], figures: Path) -> None:
-    metrics = report["activation_metrics"]
-    definitions = [
-        ("TV", "smoothness_tv_h", "smoothness_tv_l"),
-        ("Lipschitz", "lipschitz_cont_h", "lipschitz_cont_l"),
-        ("FFT", "fft_h", "fft_l"),
-        ("Wavelet", "wavelet_h", "wavelet_l"),
-        ("Multiscale", "multiscale_h", "multiscale_l"),
+def forecast_plot(report: dict[str, Any], figures: Path) -> None:
+    rows = sorted(
+        report["forecast_validity"]["horizon_curve"], key=lambda row: row["horizon"]
+    )
+    horizon = np.asarray([row["horizon"] for row in rows])
+    fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.6))
+    axes[0].plot(
+        horizon,
+        [row["code_cosine"] for row in rows],
+        marker="o",
+        color=HIGH,
+        label="Learned context predictor",
+    )
+    axes[0].plot(
+        horizon,
+        [row["shuffled_context_cosine"] for row in rows],
+        color=NULL,
+        linestyle="--",
+        label="Shuffled context",
+    )
+    axes[0].plot(
+        horizon,
+        [row["position_only_cosine"] for row in rows],
+        color=POSITION,
+        linestyle=":",
+        label="Position only",
+    )
+    axes[0].plot(
+        horizon,
+        [row["context_target_cosine"] for row in rows],
+        color=TOTAL,
+        alpha=0.7,
+        label="Raw context code",
+    )
+    gain_shuffled = [row["context_gain_over_shuffled"]["mean"] for row in rows]
+    gain_position = [
+        row["context_gain_over_position_only"]["mean"] for row in rows
     ]
-    high = np.asarray([metrics[h] for _, h, _ in definitions], dtype=float)
-    low = np.asarray([metrics[l] for _, _, l in definitions], dtype=float)
-    # Ratios make differently-scaled upstream metrics readable together.
-    denominator = np.maximum(np.abs(high) + np.abs(low), 1e-12)
-    high_share = high / denominator
-    low_share = low / denominator
-    positions = np.arange(len(definitions))
-    width = 0.38
-    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.7))
-    axes[0].bar(positions - width / 2, high, width, label="High", color=HIGH)
-    axes[0].bar(positions + width / 2, low, width, label="Low", color=LOW)
-    axes[0].set_yscale("symlog", linthresh=1e-4)
-    axes[0].set_title("T-SAE smoothness metrics (raw)")
-    axes[0].set_ylabel("Lower generally means smoother")
-    axes[1].bar(positions - width / 2, high_share, width, label="High", color=HIGH)
-    axes[1].bar(positions + width / 2, low_share, width, label="Low", color=LOW)
-    axes[1].set_title("Within-metric high/low contribution")
-    axes[1].set_ylabel("Value / (|high| + |low|)")
+    axes[1].plot(horizon, gain_shuffled, marker="o", color=HIGH, label="vs shuffled")
+    axes[1].plot(horizon, gain_position, marker="o", color=POSITION, label="vs position")
+    axes[1].axhline(0, color="#334155", linewidth=1)
+    axes[2].plot(
+        horizon,
+        [row["residual_prediction_fvu"] for row in rows],
+        marker="o",
+        color="#7c3aed",
+    )
+    axes[0].set_title("Endpoint-code forecast controls")
+    axes[0].set_ylabel("Cosine with EMA endpoint high code")
+    axes[1].set_title("Context-dependent forecast gain")
+    axes[1].set_ylabel("Paired cosine gain")
+    axes[2].set_title("Predicted high residual")
+    axes[2].set_ylabel("FVU (lower is better)")
     for axis in axes:
-        axis.set_xticks(positions, [row[0] for row in definitions], rotation=18)
+        axis.set_xlabel("Forecast horizon (tokens)")
+        axis.grid(alpha=0.2)
+    axes[0].legend(frameon=False, fontsize=8)
+    axes[1].legend(frameon=False)
+    fig.tight_layout()
+    save_figure(fig, figures, "forecast-validity")
+
+
+def probe_plot(report: dict[str, Any], figures: Path) -> None:
+    probes = report["mmlu_probe_accuracy"]
+    preferred = [
+        "context_high",
+        "predicted_endpoint_high",
+        "endpoint_high",
+        "context_low",
+        "endpoint_low",
+        "endpoint_full",
+    ]
+    labels = {
+        "context_high": "Context high",
+        "predicted_endpoint_high": "Predicted high",
+        "endpoint_high": "Endpoint high",
+        "context_low": "Context low",
+        "endpoint_low": "Endpoint low",
+        "endpoint_full": "Endpoint full",
+    }
+    colors = [HIGH, "#0d9488", "#047857", LOW, "#65a30d", TOTAL]
+    fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.0), sharey=False)
+    for axis, (probe_axis, results) in zip(axes, probes.items()):
+        names = [name for name in preferred if name in results]
+        values = [results[name]["balanced_accuracy"] for name in names]
+        chance = np.mean([results[name]["chance_accuracy"] for name in names])
+        axis.bar(
+            np.arange(len(names)), values, color=colors[: len(names)]
+        )
+        axis.axhline(chance, color="#334155", linestyle="--", label="Chance")
+        axis.set_xticks(
+            np.arange(len(names)), [labels[name] for name in names], rotation=35, ha="right"
+        )
+        axis.set_title(f"{probe_axis.capitalize()} probe")
+        axis.set_ylabel("Locked-test balanced accuracy")
         axis.grid(axis="y", alpha=0.2)
         axis.legend(frameon=False)
     fig.tight_layout()
-    save_figure(fig, figures, "smoothness")
+    save_figure(fig, figures, "mmlu-probes")
 
 
-def sparsity_plot(report: dict[str, Any], figures: Path) -> None:
-    metrics = report["activation_metrics"]
-    values = [metrics["l0"], metrics["sequence_l0"]]
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
-    axes[0].bar(["Per position L0", "Sequence L0"], values, color=[TOTAL, HIGH])
-    axes[0].set_title("Sparse feature usage")
-    axes[0].set_ylabel("Active features")
-    axes[1].bar(
-        ["Alive", "Dead"],
-        [metrics["frac_alive"], 1.0 - metrics["frac_alive"]],
-        color=[HIGH, "#cbd5e1"],
+def causal_plot(run_dir: Path, figures: Path) -> dict[str, Any] | None:
+    conditions = {
+        "Patch": (
+            run_dir / "analysis" / "intervention-patch.jsonl",
+            "delta_contrast_minus_target_logprob",
+        ),
+        "Ablate": (
+            run_dir / "analysis" / "intervention-ablate.jsonl",
+            "delta_answer_logprob",
+        ),
+        "Random ablate": (
+            run_dir / "analysis" / "intervention-random.jsonl",
+            "delta_answer_logprob",
+        ),
+    }
+    summary: dict[str, Any] = {}
+    for label, (path, metric) in conditions.items():
+        rows = load_jsonl(path)
+        values = np.asarray(
+            [float(row[metric]) for row in rows if metric in row], dtype=float
+        )
+        if not len(values):
+            continue
+        summary[label] = {
+            "metric": metric,
+            "n": len(values),
+            "mean": float(values.mean()),
+            "standard_error": float(values.std(ddof=1) / np.sqrt(len(values)))
+            if len(values) > 1
+            else 0.0,
+        }
+    if not summary:
+        return None
+    labels = list(summary)
+    means = [summary[label]["mean"] for label in labels]
+    errors = [1.96 * summary[label]["standard_error"] for label in labels]
+    fig, ax = plt.subplots(figsize=(8.4, 4.7))
+    ax.bar(
+        labels,
+        means,
+        yerr=errors,
+        capsize=5,
+        color=[HIGH, "#dc2626", NULL][: len(labels)],
     )
-    axes[1].set_ylim(0, 1)
-    axes[1].set_title("Dictionary coverage")
-    axes[1].set_ylabel("Feature fraction")
-    for axis in axes:
-        axis.grid(axis="y", alpha=0.2)
-    fig.tight_layout()
-    save_figure(fig, figures, "sparsity")
-
-
-def loss_recovered_plot(report: dict[str, Any], figures: Path) -> None:
-    result = report.get("loss_recovered")
-    if result is None:
-        return
-    labels = ["Original", "SAE reconstructed", "Zero ablation"]
-    values = [
-        result["loss_original"],
-        result["loss_reconstructed"],
-        result["loss_zero"],
-    ]
-    fig, ax = plt.subplots(figsize=(7.8, 4.5))
-    ax.bar(labels, values, color=[TOTAL, HIGH, "#dc2626"])
-    ax.set_ylabel("Next-token cross entropy")
-    ax.set_title(f"Loss recovered = {result['frac_recovered']:.3f}")
+    ax.axhline(0, color="#334155", linewidth=1)
+    ax.set_title("Causal effect of forecastable high features")
+    ax.set_ylabel("Log-probability change (95% normal CI)")
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    save_figure(fig, figures, "loss-recovered")
+    save_figure(fig, figures, "causal-interventions")
+    return summary
 
 
 def fmt(value: Any) -> str:
     return f"{value:.4f}" if isinstance(value, (float, int)) else html.escape(str(value))
 
 
-def write_html(output: Path, report: dict[str, Any]) -> None:
-    metrics = report["activation_metrics"]
+def write_html(
+    output: Path,
+    report: dict[str, Any],
+    causal_summary: dict[str, Any] | None,
+) -> None:
+    quality = report["standard_sae_quality"]
     recovered = report.get("loss_recovered")
+    forecast = report["forecast_validity"]
+    longest = forecast["longest_horizon"]
+    base_mmlu = report["base_model_mmlu_accuracy"].get("accuracy")
     figures = [
         ("Training", "figures/training.png"),
-        ("Reconstruction", "figures/reconstruction.png"),
-        ("High/low temporal smoothness", "figures/smoothness.png"),
-        ("Sparsity", "figures/sparsity.png"),
+        ("Conventional SAE quality", "figures/standard-sae-quality.png"),
+        ("Forecast validity and null controls", "figures/forecast-validity.png"),
+        ("MMLU semantic/context/syntax probes", "figures/mmlu-probes.png"),
     ]
-    if recovered is not None:
-        figures.append(("LLM loss recovered", "figures/loss-recovered.png"))
+    if causal_summary is not None:
+        figures.append(("Causal interventions", "figures/causal-interventions.png"))
     figure_html = "\n".join(
         f'<section><h2>{html.escape(title)}</h2><img src="{path}" alt="{html.escape(title)}"></section>'
         for title, path in figures
     )
-    recovered_value = "skipped" if recovered is None else fmt(recovered["frac_recovered"])
+    recovered_value = (
+        "skipped" if recovered is None else fmt(recovered["fraction_loss_recovered"])
+    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>High/low JEPA-SAE — T-SAE evaluation</title>
+<title>High/low JEPA-SAE evaluation</title>
 <style>
 :root{{--bg:#f5f7fb;--card:#fff;--fg:#172033;--muted:#64748b;--line:#dbe2ea}}
 *{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
@@ -214,23 +333,25 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
 <h1>High/low endpoint JEPA-SAE</h1>
-<p class="subtitle">Evaluation ports the metrics and formulas in AI4LIFE-GROUP/temporal-saes. The evaluated artifact is the final full-EMA high/low SAE; no unsplit SAE condition is present.</p>
+<p class="subtitle">Conventional SAE quality plus locked-test evidence that endpoint prediction uses context rather than a position-only or shuffled-context shortcut.</p>
 <div class="metrics">
-<div class="metric"><span>Full FVE</span><strong>{fmt(metrics['frac_variance_explained'])}</strong></div>
-<div class="metric"><span>High-only FVE</span><strong>{fmt(metrics['frac_variance_explained_high'])}</strong></div>
-<div class="metric"><span>Low-only FVE</span><strong>{fmt(metrics['frac_variance_explained_low'])}</strong></div>
-<div class="metric"><span>Reconstruction cosine</span><strong>{fmt(metrics['cossim'])}</strong></div>
-<div class="metric"><span>Per-position L0</span><strong>{fmt(metrics['l0'])}</strong></div>
-<div class="metric"><span>Feature alive fraction</span><strong>{fmt(metrics['frac_alive'])}</strong></div>
-<div class="metric"><span>LLM loss recovered</span><strong>{recovered_value}</strong></div>
+<div class="metric"><span>Full FVE</span><strong>{fmt(quality['fraction_variance_explained'])}</strong></div>
+<div class="metric"><span>Reconstruction cosine</span><strong>{fmt(quality['reconstruction_cosine'])}</strong></div>
+<div class="metric"><span>Alive features</span><strong>{fmt(quality['alive_feature_fraction'])}</strong></div>
+<div class="metric"><span>Loss recovered</span><strong>{recovered_value}</strong></div>
+<div class="metric"><span>Longest-horizon gain vs shuffled</span><strong>{fmt(longest['context_gain_over_shuffled']['mean'])}</strong></div>
+<div class="metric"><span>Longest-horizon gain vs position</span><strong>{fmt(longest['context_gain_over_position_only']['mean'])}</strong></div>
+<div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>
 </div>{figure_html}
-<section><h2>Machine-readable artifacts</h2><p><code>analysis/temporal_sae_eval.json</code> and <code>analysis/temporal_sae_metrics.csv</code>.</p></section>
+<section><h2>Machine-readable artifacts</h2><p><code>analysis/transition_jepa_report.json</code>, <code>transition_horizon_metrics.csv</code>, and <code>mmlu_probe_accuracy.csv</code>.</p></section>
 </main></body></html>"""
     (output / "index.html").write_text(document, encoding="utf-8", newline="\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Visualize T-SAE-compatible evaluation")
+    parser = argparse.ArgumentParser(
+        description="Visualize standard SAE and endpoint-forecast validity results"
+    )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--output-dir")
     return parser
@@ -242,18 +363,20 @@ def main() -> None:
     output = Path(args.output_dir) if args.output_dir else run_dir / "report"
     figures = output / "figures"
     figures.mkdir(parents=True, exist_ok=True)
-    report = load_json(run_dir / "analysis" / "temporal_sae_eval.json")
+    report = load_json(run_dir / "analysis" / "transition_jepa_report.json")
     training_plot(run_dir, figures)
-    reconstruction_plot(report, figures)
-    smoothness_plot(report, figures)
-    sparsity_plot(report, figures)
-    loss_recovered_plot(report, figures)
-    write_html(output, report)
+    sae_quality_plot(report, figures)
+    forecast_plot(report, figures)
+    probe_plot(report, figures)
+    causal_summary = causal_plot(run_dir, figures)
+    write_html(output, report, causal_summary)
     write_json(
         output / "visualization_summary.json",
         {
-            "activation_metrics": report["activation_metrics"],
+            "standard_sae_quality": report["standard_sae_quality"],
             "loss_recovered": report.get("loss_recovered"),
+            "forecast_validity": report["forecast_validity"],
+            "causal_interventions": causal_summary,
             "figures": sorted(path.name for path in figures.glob("*.png")),
         },
     )

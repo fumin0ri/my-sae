@@ -112,6 +112,7 @@ class PositionConditionedPredictor(nn.Module):
         self,
         context_code: torch.Tensor,
         context_positions: torch.Tensor,
+        use_context: bool = True,
     ) -> torch.Tensor:
         if context_code.ndim == 2:
             context_code = context_code[:, None, :]
@@ -120,6 +121,8 @@ class PositionConditionedPredictor(nn.Module):
         if context_positions.shape != (context_code.shape[1],):
             raise ValueError("context_positions must match the context axis")
         state = self.context_projection(context_code)
+        if not use_context:
+            state = torch.zeros_like(state)
         queries = state + self.position_embedding(context_positions)[None]
         return F.softplus(self.output(self.mlp(queries)))
 
@@ -141,6 +144,18 @@ class TransitionJEPASAE(nn.Module):
         self.ema_decoder = nn.Parameter(self.decoder.detach().clone(), requires_grad=False)
         self.register_buffer("ema_pre_bias", self.pre_bias.detach().clone())
         self.transition_predictor = PositionConditionedPredictor(cfg)
+
+    @property
+    def forecast_dim(self) -> int:
+        return self.cfg.d_high
+
+    @property
+    def forecast_k(self) -> int:
+        return self.cfg.k_high
+
+    @property
+    def low_dim(self) -> int:
+        return self.cfg.d_low
 
     @torch.no_grad()
     def initialize_from_statistics(
@@ -199,6 +214,11 @@ class TransitionJEPASAE(nn.Module):
     def encode_ema(self, x: torch.Tensor) -> torch.Tensor:
         return self.ema_encoder((x - self.ema_pre_bias) / self.pre_scale)
 
+    @torch.no_grad()
+    def encode_forecast_ema(self, x: torch.Tensor) -> torch.Tensor:
+        high, _ = self.split_code(self.encode_ema(x))
+        return high
+
     def decode(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
         value = self.pre_scale * (z @ self.decoder)
         return value + self.pre_bias if add_bias else value
@@ -206,6 +226,11 @@ class TransitionJEPASAE(nn.Module):
     def decode_ema(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
         value = self.pre_scale * (z @ self.ema_decoder)
         return value + self.ema_pre_bias if add_bias else value
+
+    def decode_forecast_ema(
+        self, z: torch.Tensor, add_bias: bool = True
+    ) -> torch.Tensor:
+        return self.decode_high(z, ema=True, add_bias=add_bias)
 
     def decode_high(
         self, z: torch.Tensor, *, ema: bool, add_bias: bool = True
@@ -227,6 +252,7 @@ class TransitionJEPASAE(nn.Module):
         self,
         context_high: torch.Tensor,
         context_positions: torch.Tensor | None = None,
+        use_context: bool = True,
         sparse_output: bool = False,
     ) -> torch.Tensor:
         if context_high.shape[-1] == self.cfg.d_sae:
@@ -239,16 +265,28 @@ class TransitionJEPASAE(nn.Module):
             context_positions = torch.arange(
                 context_high.shape[1], device=context_high.device, dtype=torch.long
             )
-        dense = self.transition_predictor(context_high, context_positions)
+        dense = self.transition_predictor(
+            context_high, context_positions, use_context=use_context
+        )
         return topk_relu(dense, self.cfg.k_high) if sparse_output else dense
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        use_context: bool = True,
+        use_ema_context: bool = False,
+    ) -> dict[str, torch.Tensor]:
         if x.ndim != 3 or x.shape[1:] != (self.cfg.window_size, self.cfg.d_in):
             raise ValueError(
                 f"x must have shape [batch, {self.cfg.window_size}, {self.cfg.d_in}]"
             )
         codes = self.encode(x)
         high, low = self.split_code(codes)
+        if use_ema_context:
+            ema_context_code = self.encode_ema(x[:, :-1])
+            context_high, context_low = self.split_code(ema_context_code)
+        else:
+            context_high, context_low = high[:, :-1], low[:, :-1]
         online_target_high = high[:, -1]
         online_target_low = low[:, -1]
         high_reconstruction = self.decode_high(online_target_high, ema=False)
@@ -262,7 +300,9 @@ class TransitionJEPASAE(nn.Module):
             ema_full_reconstruction = ema_high_reconstruction + self.decode_low(
                 ema_target_low, ema=True, add_bias=False
             )
-        prediction = self.predict_from_code(high[:, :-1])
+        prediction = self.predict_from_code(
+            context_high, use_context=use_context
+        )
         sparse_prediction = topk_relu(prediction, self.cfg.k_high)
         predictable_residual = self.decode_high(sparse_prediction, ema=True)
         target_codes = ema_target_high[:, None].expand_as(prediction)
@@ -271,8 +311,12 @@ class TransitionJEPASAE(nn.Module):
             "codes": codes,
             "high_codes": high,
             "low_codes": low,
+            "context_code": context_high,
+            "context_codes": context_high,
+            "low_context_code": context_low,
             "online_target_high": online_target_high,
             "online_target_low": online_target_low,
+            "online_target_code": online_target_high,
             "online_high_reconstruction": high_reconstruction,
             "online_target_reconstruction": full_reconstruction,
             "target_code": ema_target_high,

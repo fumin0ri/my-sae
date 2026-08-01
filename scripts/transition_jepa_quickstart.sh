@@ -17,8 +17,7 @@ default_safetensors_revision() {
 REVISION="${REVISION:-$(default_safetensors_revision "$MODEL")}"
 USE_SAFETENSORS="${USE_SAFETENSORS:-1}"
 LAYER="${LAYER:-16}"
-# T-SAE evaluates 128-position activation sequences; retain configurability.
-WINDOW_SIZE="${WINDOW_SIZE:-128}"
+WINDOW_SIZE="${WINDOW_SIZE:-32}"
 if (( WINDOW_SIZE < 2 )); then
   echo "WINDOW_SIZE must be at least 2" >&2
   exit 2
@@ -60,21 +59,43 @@ PILE_DATASET_REVISION="${PILE_DATASET_REVISION:-fcbfcfde4222cbb1acd1d33bad0be250
 PILE_DATASET_TRUST_REMOTE_CODE="${PILE_DATASET_TRUST_REMOTE_CODE:-0}"
 PILE_REQUIRE_ALL_DOMAINS="${PILE_REQUIRE_ALL_DOMAINS:-0}"
 
+EVAL_EXTRACT_BATCH_SIZE="${EVAL_EXTRACT_BATCH_SIZE:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-$DEFAULT_WINDOW_BATCH_SIZE}"
-EVAL_MAXIMUM_BATCHES="${EVAL_MAXIMUM_BATCHES:-0}"
-EVAL_DATASET="${EVAL_DATASET:-monology/pile-uncopyrighted}"
-EVAL_DATASET_CONFIG="${EVAL_DATASET_CONFIG:-}"
+EVAL_MAXIMUM_VALIDATION_BATCHES="${EVAL_MAXIMUM_VALIDATION_BATCHES:-0}"
+PROBE_MAX_DIM="${PROBE_MAX_DIM:-1024}"
+MMLU_MAX_QUESTIONS="${MMLU_MAX_QUESTIONS:-4096}"
+MMLU_DATASET="${MMLU_DATASET:-cais/mmlu}"
+MMLU_DATASET_CONFIG="${MMLU_DATASET_CONFIG:-all}"
+MMLU_DATASET_REVISION="${MMLU_DATASET_REVISION:-c30699e8356da336a370243923dbaf21066bb9fe}"
+MMLU_MAX_LENGTH="${MMLU_MAX_LENGTH:-1536}"
+
 LOSS_RECOVERED_INPUTS="${LOSS_RECOVERED_INPUTS:-32}"
 LOSS_RECOVERED_CONTEXT_LENGTH="${LOSS_RECOVERED_CONTEXT_LENGTH:-2048}"
 RUN_LOSS_RECOVERED="${RUN_LOSS_RECOVERED:-1}"
+RUN_CAUSAL="${RUN_CAUSAL:-1}"
+PAIRS="${PAIRS:-128}"
+PAIR_POOL_SIZE="${PAIR_POOL_SIZE:-$((PAIRS * 16))}"
+INTERVENTION_HORIZON="${INTERVENTION_HORIZON:-$((WINDOW_SIZE - 1))}"
+if (( INTERVENTION_HORIZON < 1 || INTERVENTION_HORIZON >= WINDOW_SIZE )); then
+  echo "INTERVENTION_HORIZON must lie in [1, WINDOW_SIZE-1]" >&2
+  exit 2
+fi
+if (( MMLU_MAX_QUESTIONS > 0 && PAIR_POOL_SIZE > MMLU_MAX_QUESTIONS )); then
+  PAIR_POOL_SIZE="$MMLU_MAX_QUESTIONS"
+fi
+if (( PAIR_POOL_SIZE < PAIRS )); then
+  echo "PAIR_POOL_SIZE must be at least PAIRS" >&2
+  exit 2
+fi
 
 SEED="${SEED:-0}"
+SPLIT_SEED="${SPLIT_SEED:-0}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 RUN_DIR="${RUN_DIR:-runs/high-low-jepa-pile}"
 START_STAGE="${START_STAGE:-1}"
-END_STAGE="${END_STAGE:-4}"
-if (( START_STAGE < 1 || START_STAGE > 4 || END_STAGE < 1 || END_STAGE > 4 )); then
-  echo "START_STAGE and END_STAGE must lie in [1, 4]" >&2
+END_STAGE="${END_STAGE:-8}"
+if (( START_STAGE < 1 || START_STAGE > 8 || END_STAGE < 1 || END_STAGE > 8 )); then
+  echo "START_STAGE and END_STAGE must lie in [1, 8]" >&2
   exit 2
 fi
 if (( START_STAGE > END_STAGE )); then
@@ -85,7 +106,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "High/low config: W=$WINDOW_SIZE, D=$D_SAE, K=$K, high=$HIGH_FRACTION, high-reconstruction-weight=$HIGH_RECONSTRUCTION_WEIGHT"
+echo "Config: W=$WINDOW_SIZE, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -98,6 +119,9 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > 
 
 ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
 CHECKPOINT="$RUN_DIR/model/transition_jepa_sae.pt"
+EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
+MMLU_PROMPTS="$RUN_DIR/evaluation-data/mmlu-prompts.jsonl"
+CAUSAL_PAIRS="$RUN_DIR/evaluation-data/mmlu-causal-pairs.jsonl"
 
 PILE_DATA_ARGS=(--dataset "$PILE_DATASET" --dataset-config "$PILE_DATASET_CONFIG")
 if [[ -n "$PILE_DATASET_REVISION" ]]; then PILE_DATA_ARGS+=(--dataset-revision "$PILE_DATASET_REVISION"); fi
@@ -115,75 +139,116 @@ if [[ -n "$PILE_SHARD_WINDOWS" ]]; then PILE_BUDGET_ARGS+=(--shard-windows "$PIL
 if [[ "$PILE_SKIP_DISK_SPACE_CHECK" == "1" ]]; then PILE_BUDGET_ARGS+=(--skip-disk-space-check); fi
 
 if (( START_STAGE <= 1 && END_STAGE >= 1 )); then
-  echo "[1/4] Extract document-disjoint Pile residual windows"
+  echo "[1/8] Extract document-disjoint Pile residual windows"
   sr-extract-pile \
-    "${MODEL_LOAD_ARGS[@]}" \
-    "${PILE_DATA_ARGS[@]}" \
+    "${MODEL_LOAD_ARGS[@]}" "${PILE_DATA_ARGS[@]}" \
     --output-dir "$RUN_DIR/pile-activations" \
-    --layer "$LAYER" \
-    --hook-point post \
-    --window-size "$WINDOW_SIZE" \
-    --sequence-length "$PILE_SEQUENCE_LENGTH" \
+    --layer "$LAYER" --hook-point post \
+    --window-size "$WINDOW_SIZE" --sequence-length "$PILE_SEQUENCE_LENGTH" \
     "${PILE_BUDGET_ARGS[@]}" \
-    --batch-size "$PILE_EXTRACT_BATCH_SIZE" \
-    --dtype bfloat16 \
-    --seed "$SEED"
+    --batch-size "$PILE_EXTRACT_BATCH_SIZE" --dtype bfloat16 --seed "$SEED"
 fi
 
 if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
-  echo "[2/4] Train the only model: high/low full-EMA endpoint JEPA-SAE"
+  echo "[2/8] Train the high/low full-EMA endpoint JEPA-SAE"
   sr-train-transition-jepa-sae \
     --activation-manifest "$ACTIVATION_MANIFEST" \
     --output-dir "$RUN_DIR/model" \
-    --d-sae "$D_SAE" \
-    --k "$K" \
+    --d-sae "$D_SAE" --k "$K" \
     --high-fraction "$HIGH_FRACTION" \
     --high-reconstruction-weight "$HIGH_RECONSTRUCTION_WEIGHT" \
     --predictor-width "$PREDICTOR_WIDTH" \
-    --steps "$TRAIN_STEPS" \
-    --sae-warmup-steps "$SAE_WARMUP_STEPS" \
+    --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
     --prediction-ramp-steps "$PREDICTION_RAMP_STEPS" \
     --batch-size "$BATCH_SIZE" \
     --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
-    --amp-dtype bfloat16 \
-    --predictor-lr 0.0003 \
-    --sae-lr 0.0002 \
-    --warmup-steps 500 \
-    --log-every 400 \
-    --device "$TRAIN_DEVICE" \
-    --seed "$SEED"
+    --amp-dtype bfloat16 --predictor-lr 0.0003 --sae-lr 0.0002 \
+    --warmup-steps 500 --log-every 400 --device "$TRAIN_DEVICE" --seed "$SEED"
 fi
 
 if (( START_STAGE <= 3 && END_STAGE >= 3 )); then
-  echo "[3/4] Evaluate with AI4LIFE temporal-saes metrics"
+  echo "[3/8] Build balanced MMLU probes and causal pairs"
+  mkdir -p "$RUN_DIR/evaluation-data"
+  sr-make-mmlu \
+    --prompts-output "$MMLU_PROMPTS" --pairs-output "$CAUSAL_PAIRS" \
+    --dataset "$MMLU_DATASET" --dataset-config "$MMLU_DATASET_CONFIG" \
+    --dataset-revision "$MMLU_DATASET_REVISION" \
+    --max-questions "$MMLU_MAX_QUESTIONS" --pairs "$PAIR_POOL_SIZE" --seed "$SEED"
+fi
+
+if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
+  echo "[4/8] Extract MMLU residual trajectories"
+  sr-extract-grid \
+    "${MODEL_LOAD_ARGS[@]}" --data "$MMLU_PROMPTS" \
+    --output-dir "$RUN_DIR/activations" --layers "$LAYER" \
+    --hook-point post --window-size "$WINDOW_SIZE" \
+    --batch-size "$EVAL_EXTRACT_BATCH_SIZE" --max-length "$MMLU_MAX_LENGTH" \
+    --truncation-side left --dtype bfloat16 --storage-dtype bfloat16
+fi
+
+if (( START_STAGE <= 5 && END_STAGE >= 5 )); then
+  echo "[5/8] Measure zero-shot base-model MMLU accuracy"
+  mkdir -p "$RUN_DIR/analysis"
+  sr-score-mmlu \
+    "${MODEL_LOAD_ARGS[@]}" --data "$MMLU_PROMPTS" \
+    --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
+    --batch-size "$EVAL_EXTRACT_BATCH_SIZE" --max-length "$MMLU_MAX_LENGTH" \
+    --minimum-tokens "$WINDOW_SIZE" --dtype bfloat16
+fi
+
+if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
+  echo "[6/8] Evaluate standard SAE quality and locked forecast validity"
   EVAL_ARGS=(
     --activation-manifest "$ACTIVATION_MANIFEST"
+    --activations "$EVAL_ACTIVATIONS"
     --checkpoint "$CHECKPOINT"
+    --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json"
     --output-dir "$RUN_DIR/analysis"
+    --group-key question_id
+    --probe-max-dim "$PROBE_MAX_DIM"
     --batch-size "$EVAL_BATCH_SIZE"
-    --maximum-batches "$EVAL_MAXIMUM_BATCHES"
+    --maximum-validation-batches "$EVAL_MAXIMUM_VALIDATION_BATCHES"
     --device "$TRAIN_DEVICE"
     --amp-dtype bfloat16
+    --seed "$SEED"
+    --split-seed "$SPLIT_SEED"
     "${MODEL_LOAD_ARGS[@]}"
     --layer "$LAYER"
     --hook-point post
-    --eval-dataset "$EVAL_DATASET"
     --loss-recovered-inputs "$LOSS_RECOVERED_INPUTS"
     --loss-recovered-context-length "$LOSS_RECOVERED_CONTEXT_LENGTH"
     --dtype bfloat16
   )
-  if [[ -n "$EVAL_DATASET_CONFIG" ]]; then EVAL_ARGS+=(--eval-dataset-config "$EVAL_DATASET_CONFIG"); fi
   if [[ "$RUN_LOSS_RECOVERED" != "1" ]]; then EVAL_ARGS+=(--skip-loss-recovered); fi
   sr-evaluate-transition-jepa-sae "${EVAL_ARGS[@]}"
 fi
 
-if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
-  echo "[4/4] Build T-SAE metric PNG/PDF figures and HTML report"
+if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
+  if [[ "$RUN_CAUSAL" == "1" ]]; then
+    echo "[7/8] Patch, ablate, and norm-matched-random-control forecast features"
+    for MODE in patch ablate random_ablate; do
+      OUTPUT_MODE="$MODE"
+      if [[ "$MODE" == "random_ablate" ]]; then OUTPUT_MODE="random"; fi
+      sr-intervene-transition-jepa-sae \
+        "${MODEL_LOAD_ARGS[@]}" --pairs "$CAUSAL_PAIRS" \
+        --checkpoint "$CHECKPOINT" \
+        --output "$RUN_DIR/analysis/intervention-$OUTPUT_MODE.jsonl" \
+        --layer "$LAYER" --hook-point post --mode "$MODE" \
+        --horizon "$INTERVENTION_HORIZON" --max-pairs "$PAIRS" \
+        --minimum-pairs "$PAIRS" --seed "$SEED"
+    done
+  else
+    echo "[7/8] Causal interventions skipped (RUN_CAUSAL=$RUN_CAUSAL)"
+  fi
+fi
+
+if (( START_STAGE <= 8 && END_STAGE >= 8 )); then
+  echo "[8/8] Build standard-quality, forecast, probe, and causal figures"
   sr-visualize-transition-jepa-sae --run-dir "$RUN_DIR"
 fi
 
 echo
-if (( END_STAGE == 4 )); then
+if (( END_STAGE == 8 )); then
   echo "Done. Open: $RUN_DIR/report/index.html"
 else
   echo "Done. Completed stages $START_STAGE through $END_STAGE."

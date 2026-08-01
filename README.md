@@ -1,8 +1,7 @@
 # High/low fixed-endpoint JEPA-SAE
 
-LLMの同一系列にあるresidual trajectoryから、将来endpointを予測できる
-high-level sparse featuresと、再構成の細部を補うlow-level sparse featuresを
-分けて学習します。
+LLMの同一系列にあるresidual trajectoryから、endpointを予測できるhigh-level
+sparse featuresと、再構成の細部を補うlow-level sparse featuresを分けて学習します。
 
 ```text
 residual h_k
@@ -16,13 +15,9 @@ residual h_k
 h_T ≈ bias + D_high(z_T^high) + D_low(z_T^low)
 ```
 
-high/low分割は
-[AI4LIFE-GROUP/temporal-saes](https://github.com/AI4LIFE-GROUP/temporal-saes)
-のTemporal Matryoshka SAEを参考にしています。辞書の20%をhigh、80%をlowへ
-割り当て、独立したTop-K budgetを使います。
-
-現在の実験にはunsplit SAE、fixed SAE、position-only、MMLU probe、独自の
-因果介入評価は含まれません。学習・評価対象はhigh/low SAEだけです。
+学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、position-only学習
+モデルはありません。position-onlyとshuffled-contextは、同じ学習済みpredictorへ
+入力を変えて作る評価時null controlです。
 
 ## Quickstart
 
@@ -40,7 +35,7 @@ python -m pip install --upgrade -e .
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-既存cloneでは次だけで実行できます。
+既存cloneでは:
 
 ```bash
 git pull origin main
@@ -54,156 +49,143 @@ bash scripts/transition_jepa_quickstart.sh
 |---|---:|
 | frozen LLM | `EleutherAI/pythia-6.9b-deduped` |
 | layer | 16 |
-| evaluation-compatible window | 128 positions |
+| window | 32 token |
 | dictionary | 32,768 features |
 | total sparsity | Top-K 64 |
 | high / low | 20% / 80% |
 | training | 12,000 steps |
 | SAE-only warm-up | 4,000 steps |
+| MMLU | 4,096 questions、question-locked split |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
 
-`WINDOW_SIZE`は変更できます。ただしT-SAE repoの既定評価contextと揃えるため、
-本repoの既定値も128です。
+`WINDOW_SIZE`は任意に変更できます。
 
 ```bash
-WINDOW_SIZE=32 RUN_DIR=runs/w32 \
+WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-## Pipeline
+## 8-stage pipeline
 
-quickstartは4 stageだけです。
+1. document-disjointなPile train/validation residualを抽出
+2. high/low full-EMA endpoint JEPA-SAEを学習
+3. balanced MMLU probeと因果pairを生成
+4. MMLU residual trajectoryを抽出
+5. frozen LLMのzero-shot MMLU accuracyを測定
+6. 通常のSAE品質、forecast null、semantics/context/syntax probeを評価
+7. forecastable high featuresをpatch、ablate、norm-matched random ablate
+8. PNG、PDF、CSV、JSON、HTMLレポートを生成
 
-1. document-disjointなPile train/validation residual windowを抽出
-2. high/low full-EMA endpoint JEPA-SAEを直接学習
-3. T-SAE互換指標とLLM loss recoveredを評価
-4. PNG、PDF、CSV、JSON、HTMLを生成
-
-完了済みartifactから再開できます。
+既存のhigh/low checkpointとPile activationはそのまま再利用できます。評価だけ
+やり直す場合はstage 3から実行してください。
 
 ```bash
-# 評価から再開
 START_STAGE=3 RUN_DIR=runs/high-low-jepa-pile \
 bash scripts/transition_jepa_quickstart.sh
+```
 
-# 可視化だけ再生成
-START_STAGE=4 END_STAGE=4 RUN_DIR=runs/high-low-jepa-pile \
+因果評価を省略する場合:
+
+```bash
+RUN_CAUSAL=0 START_STAGE=3 \
 bash scripts/transition_jepa_quickstart.sh
 ```
 
-旧versionの`joint/`, `fixed/`, `k_only/`, `standard/` checkpointは新しい
-architectureと互換性がありません。Pile activation shardだけはwindow、model、
-layerが同じなら再利用できます。新しいmodelはstage 2から学習してください。
+小規模確認:
 
-## Training objective
-
-online SAE全体を勾配更新し、encoder、decoder、biasをEMA SAEへ更新します。
-評価と最終artifactにはEMA SAEだけを使います。
-
-```text
-L_rec = alpha * FVU(D_high(z_T^high), h_T)
-      + (1-alpha) * FVU(
-          D_high(z_T^high) + D_low(z_T^low), h_T
-        )
-
-L = L_rec
-  + lambda_prediction * mean_k<T [
-      1 - cosine(z_hat_T^high(k), z_T,EMA^high)
-      + 0.25 * normalized_MSE
-      + lambda_residual * FVU(
-          D_high,EMA(TopK(z_hat_T^high(k))), h_T
-        )
-    ]
+```bash
+MODEL=EleutherAI/pythia-70m-deduped \
+LAYER=3 WINDOW_SIZE=16 D_SAE=2048 K=32 PREDICTOR_WIDTH=64 \
+PILE_TRAIN_WINDOWS=4096 PILE_VALIDATION_WINDOWS=512 \
+PILE_SHARD_WINDOWS=512 TRAIN_STEPS=300 SAE_WARMUP_STEPS=100 \
+MMLU_MAX_QUESTIONS=256 PAIRS=8 PAIR_POOL_SIZE=128 \
+LOSS_RECOVERED_INPUTS=2 RUN_DIR=runs/smoke \
+bash scripts/transition_jepa_quickstart.sh
 ```
 
-最初の`SAE_WARMUP_STEPS`では`lambda_prediction=0`です。その後JEPA lossを
-徐々に立ち上げます。unsplit standard SAEによる事前学習は行いません。
+## 評価1: 通常のSAE性能
 
-## T-SAE-compatible evaluation
+document-disjoint Pile validation residualについて、最終EMA SAEを評価します。
 
-評価式は上流の
-[`dictionary_learning/evaluation.py`](https://github.com/AI4LIFE-GROUP/temporal-saes/blob/main/dictionary_learning/dictionary_learning/evaluation.py)
-を移植しています。最終EMA SAEについて次を計算します。
-
-- `l2_loss`, `l1_loss`, per-position `l0`, `sequence_l0`
-- high/low total variation
-- total/high/low Lipschitz continuity
-- total/high/low FFT high/low frequency energy ratio
-- total/high/low wavelet detail/approximation ratio
-- total/high/low multiscale fine/coarse variation ratio
-- total/high-only/low-only fraction of variance explained
-- reconstruction cosine、L2 ratio、relative reconstruction bias
-- alive feature fraction
-- original / SAE-reconstructed / zero-ablated LLM loss
+- reconstruction FVU / fraction of variance explained
+- reconstruction cosine、平均L2誤差
+- L1、per-position L0、high/low L0
+- alive/dead feature fraction
+- high-only、low-only、full reconstruction FVE
+- original、SAE reconstructed、zero-ablated LLM loss
 - fraction of loss recovered
 
-activation指標はdocument-disjoint Pile validation shardで計算します。
-loss recoveredは上流と同じ`monology/pile-uncopyrighted`を既定datasetとして、
-LLM residualをEMA SAE再構成で置換して測定します。
+これにより、予測しやすさのためにSAEがresidual情報を捨てていないかを確認します。
 
-loss recoveredを一時的に省略する場合:
+## 評価2: 提案手法は本当にcontextを使うか
 
-```bash
-RUN_LOSS_RECOVERED=0 START_STAGE=3 \
-bash scripts/transition_jepa_quickstart.sh
-```
+各context位置 `k<T` からEMA endpoint high codeを予測し、距離別に以下を比較します。
 
-評価数は変更できます。
+- learned context predictor
+- 別MMLU問題からcontext codeを入れるshuffled-context null
+- context projectionをゼロにするposition-only null
+- predictorなしのraw context-to-endpoint cosine
 
-```bash
-LOSS_RECOVERED_INPUTS=128 \
-LOSS_RECOVERED_CONTEXT_LENGTH=2048 \
-START_STAGE=3 \
-bash scripts/transition_jepa_quickstart.sh
-```
+`learned - shuffled`と`learned - position-only`にはquestion-group bootstrap 95% CIを
+付けます。最長horizonで両方のCI下限が0より大きいことを主要な有効性判定とします。
+
+## 評価3: MMLU semantics / context / syntax
+
+MMLU option順とprompt templateを決定論的に均衡化し、問題単位でdevelopmentとlocked
+testを分離します。linear probeのaccuracyとbalanced accuracyを次の表現で表示します。
+
+- context high
+- predicted endpoint high
+- actual endpoint high
+- context low
+- endpoint low
+- endpoint full
+
+軸は以下です。
+
+- `semantics`: 正解選択肢 A/B/C/D
+- `context`: STEM / humanities / social sciences / other
+- `syntax`: 4種類のprompt template
+
+high表現がcontext/semanticsを保持し、low表現との役割差が生じているかを測ります。
+
+## 評価4: 因果介入
+
+同じcontext category・syntaxで正解だけが異なるMMLU pairを使います。
+
+- `patch`: sourceから予測したhigh codeとtarget予測codeの差をendpointへ追加
+- `ablate`: targetの予測可能high componentを除去
+- `random_ablate`:同じL2 normのランダム方向を除去
+
+patchのsource-vs-target answer log-prob差、ablationのtarget answer log-prob低下、
+norm-matched randomとの差を可視化します。
 
 ## Outputs
 
 ```text
 runs/high-low-jepa-pile/
   pile-activations/
-    manifest.json
-    train/shard-*.pt
-    validation/shard-*.pt
   model/
     transition_jepa_sae.pt
     ema_sae.pt
     training_report.json
+  evaluation-data/
+    mmlu-prompts.jsonl
+    mmlu-causal-pairs.jsonl
+  activations/
   analysis/
-    temporal_sae_eval.json
-    temporal_sae_metrics.csv
+    transition_jepa_report.json
+    transition_horizon_metrics.csv
+    mmlu_probe_accuracy.csv
+    mmlu_model_accuracy.json
+    intervention-*.jsonl
   report/
     index.html
     figures/*.png
     figures/*.pdf
 ```
 
-最終レポート:
+最終レポートは`runs/high-low-jepa-pile/report/index.html`です。
 
-```text
-runs/high-low-jepa-pile/report/index.html
-```
-
-## Smoke test
-
-```bash
-MODEL=EleutherAI/pythia-70m-deduped \
-LAYER=3 \
-WINDOW_SIZE=16 \
-D_SAE=2048 \
-K=32 \
-PREDICTOR_WIDTH=64 \
-PILE_TRAIN_WINDOWS=4096 \
-PILE_VALIDATION_WINDOWS=512 \
-PILE_SHARD_WINDOWS=512 \
-TRAIN_STEPS=300 \
-SAE_WARMUP_STEPS=100 \
-LOSS_RECOVERED_INPUTS=2 \
-PILE_EXTRACT_BATCH_SIZE=32 \
-RUN_DIR=runs/smoke \
-bash scripts/transition_jepa_quickstart.sh
-```
-
-研究プロトコルは
-[`docs/TRANSITION_JEPA_PROTOCOL.md`](docs/TRANSITION_JEPA_PROTOCOL.md)
+研究プロトコルは[`docs/TRANSITION_JEPA_PROTOCOL.md`](docs/TRANSITION_JEPA_PROTOCOL.md)
 に固定しています。

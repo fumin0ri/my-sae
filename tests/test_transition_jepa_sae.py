@@ -48,6 +48,20 @@ def test_prediction_supervises_only_high_endpoint() -> None:
     assert torch.allclose(outputs["online_target_reconstruction"], expected)
 
 
+def test_position_only_control_is_independent_of_context_code() -> None:
+    model = make_model()
+    positions = torch.arange(model.cfg.window_size - 1)
+    first = torch.randn(2, model.cfg.window_size - 1, model.cfg.d_high)
+    second = torch.randn_like(first)
+    first_prediction = model.predict_from_code(
+        first, positions, use_context=False
+    )
+    second_prediction = model.predict_from_code(
+        second, positions, use_context=False
+    )
+    assert torch.allclose(first_prediction, second_prediction)
+
+
 def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
     model = make_model()
     loss, metrics = transition_jepa_loss(
