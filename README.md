@@ -67,6 +67,11 @@ bash scripts/transition_jepa_quickstart.sh
 `WINDOW_SIZE`はmaximum span length、`MIN_SPAN_LENGTH`はminimum span lengthです。
 学習時は`L`をこの範囲から選び、span内の非endpoint位置をcontextとして一様に選びます。
 したがってhorizonのsupportは`1..WINDOW_SIZE-1`です。
+この生成過程で短いhorizonが多くなるため、既定ではlatent prediction lossを
+`1 / P(h)`に比例して重み付けし、各horizonの期待寄与を等しくします。
+random span/contextの生成とreconstruction lossは変更しません。
+
+旧来の非補正条件を対照実験として使う場合だけ、`HORIZON_WEIGHTING=none`を指定します。
 
 ```bash
 WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \

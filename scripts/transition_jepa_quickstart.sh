@@ -37,6 +37,11 @@ PREDICTOR_WIDTH="${PREDICTOR_WIDTH:-512}"
 TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-4000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
+HORIZON_WEIGHTING="${HORIZON_WEIGHTING:-inverse_probability}"
+if [[ "$HORIZON_WEIGHTING" != "inverse_probability" && "$HORIZON_WEIGHTING" != "none" ]]; then
+  echo "HORIZON_WEIGHTING must be inverse_probability or none" >&2
+  exit 2
+fi
 
 DEFAULT_PAIR_BATCH_SIZE=160
 BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_PAIR_BATCH_SIZE}"
@@ -111,7 +116,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), horizon_weighting=$HORIZON_WEIGHTING, sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -167,6 +172,7 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --predictor-width "$PREDICTOR_WIDTH" \
     --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
     --prediction-ramp-steps "$PREDICTION_RAMP_STEPS" \
+    --horizon-weighting "$HORIZON_WEIGHTING" \
     --batch-size "$BATCH_SIZE" \
     --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
     --amp-dtype bfloat16 --predictor-lr 0.0003 --sae-lr 0.0002 \

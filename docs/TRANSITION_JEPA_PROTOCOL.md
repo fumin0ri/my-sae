@@ -21,6 +21,13 @@ Context indices must lie after a prespecified burn-in region. Every span and
 horizon uses the same eligible endpoint range, so `h` cannot identify distance
 from the extracted-sequence boundary.
 
+Uniform span length followed by uniform context does not induce a uniform
+horizon distribution. Training therefore multiplies each per-example latent
+prediction loss by `1 / ((max_horizon) P(h))`. This leaves random span/context
+sampling and reconstruction losses unchanged while giving every horizon equal
+expected prediction-loss mass. The unweighted condition is retained only as an
+explicit ablation.
+
 For each pair `(x_(t-h), x_t, h)`, one online SAE is divided into independent
 high and low Top-K groups. The high group receives both high-only reconstruction
 and endpoint prediction supervision. The low group receives incremental full

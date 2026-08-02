@@ -27,6 +27,42 @@ from .training import (
 )
 
 ARCHITECTURE_ID = "high_low_random_pair_horizon_ema_sae_v3"
+HORIZON_WEIGHTING_MODES = ("none", "inverse_probability")
+
+
+def horizon_sampling_probabilities(
+    min_span_length: int,
+    max_span_length: int,
+) -> torch.Tensor:
+    """Exact P(h) induced by uniform L and uniform non-endpoint context."""
+    if not 2 <= min_span_length <= max_span_length:
+        raise ValueError("span bounds must satisfy 2 <= min <= max")
+    probabilities = torch.zeros(max_span_length, dtype=torch.float64)
+    span_count = max_span_length - min_span_length + 1
+    for span_length in range(min_span_length, max_span_length + 1):
+        probabilities[1:span_length] += 1.0 / (
+            span_count * (span_length - 1)
+        )
+    return probabilities
+
+
+def horizon_loss_weight_table(
+    min_span_length: int,
+    max_span_length: int,
+    mode: str,
+) -> torch.Tensor:
+    """Weights whose expected contribution is equal for every horizon."""
+    if mode not in HORIZON_WEIGHTING_MODES:
+        raise ValueError(f"unsupported horizon weighting mode: {mode}")
+    probabilities = horizon_sampling_probabilities(
+        min_span_length, max_span_length
+    )
+    weights = torch.ones(max_span_length, dtype=torch.float64)
+    if mode == "inverse_probability":
+        max_horizon = max_span_length - 1
+        weights[1:] = 1.0 / (max_horizon * probabilities[1:])
+    weights[0] = 0.0
+    return weights.float()
 
 
 @dataclass
@@ -367,6 +403,7 @@ def transition_jepa_loss(
     horizon: torch.Tensor,
     prediction_weight: float,
     span_length: torch.Tensor | None = None,
+    horizon_weight_table: torch.Tensor | None = None,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     outputs = model(context, target, horizon)
@@ -399,7 +436,20 @@ def transition_jepa_loss(
     cosine = F.cosine_similarity(prediction, target_codes, dim=-1)
     target_energy = target_codes.square().mean(dim=-1).clamp_min(1e-8)
     nrmse = (prediction - target_codes).square().mean(dim=-1) / target_energy
-    prediction_loss = (1.0 - cosine + 0.25 * nrmse).mean()
+    per_sample_prediction_loss = 1.0 - cosine + 0.25 * nrmse
+    if horizon_weight_table is None:
+        sample_weights = torch.ones_like(per_sample_prediction_loss)
+    else:
+        if horizon_weight_table.shape != (model.cfg.max_span_length,):
+            raise ValueError(
+                "horizon_weight_table must have shape [max_span_length]"
+            )
+        sample_weights = horizon_weight_table.to(
+            device=horizon.device,
+            dtype=per_sample_prediction_loss.dtype,
+        ).index_select(0, horizon)
+    prediction_loss_unweighted = per_sample_prediction_loss.mean()
+    prediction_loss = (sample_weights * per_sample_prediction_loss).mean()
     loss = reconstruction + prediction_weight * prediction_loss
     if not collect_metrics:
         return loss, {}
@@ -413,6 +463,10 @@ def transition_jepa_loss(
         "ema_high_reconstruction_fvu": float(ema_high_fvu.detach()),
         "ema_reconstruction_fvu": float(ema_full_fvu.detach()),
         "prediction_loss": float(prediction_loss.detach()),
+        "prediction_loss_unweighted": float(
+            prediction_loss_unweighted.detach()
+        ),
+        "mean_horizon_loss_weight": float(sample_weights.mean().detach()),
         "code_cosine": float(cosine.mean().detach()),
         "code_nrmse": float(nrmse.mean().detach()),
         "support_precision": float(precision.mean()),
@@ -442,6 +496,7 @@ def evaluate_losses(
     prediction_weight: float,
     amp_dtype: str,
     seed: int,
+    horizon_weight_table: torch.Tensor,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
@@ -461,6 +516,7 @@ def evaluate_losses(
                 batch["horizon"],
                 prediction_weight,
                 span_length=batch["span_length"],
+                horizon_weight_table=horizon_weight_table,
             )
         count += len(batch["target"])
         for key, value in metrics.items():
@@ -486,6 +542,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor-width", type=int, default=256)
     parser.add_argument("--predictor-expansion", type=int, default=2)
     parser.add_argument("--prediction-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--horizon-weighting",
+        choices=HORIZON_WEIGHTING_MODES,
+        default="inverse_probability",
+        help=(
+            "Correct the horizon imbalance induced by random span/context "
+            "sampling. inverse_probability gives every horizon equal expected "
+            "prediction-loss mass."
+        ),
+    )
     parser.add_argument("--ema-decay", type=float, default=0.996)
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--sae-warmup-steps", type=int, default=4000)
@@ -537,6 +603,15 @@ def main() -> None:
         high_reconstruction_weight=args.high_reconstruction_weight,
     )
     model = TransitionJEPASAE(cfg).to(device)
+    horizon_probabilities = horizon_sampling_probabilities(
+        int(manifest["min_span_length"]),
+        int(manifest["max_span_length"]),
+    )
+    horizon_weight_table = horizon_loss_weight_table(
+        int(manifest["min_span_length"]),
+        int(manifest["max_span_length"]),
+        args.horizon_weighting,
+    ).to(device)
     normalization = manifest["normalization"]
     model.initialize_from_statistics(
         torch.tensor(normalization["mean"]),
@@ -591,6 +666,7 @@ def main() -> None:
                     batch["horizon"],
                     active_prediction_weight,
                     span_length=batch["span_length"],
+                    horizon_weight_table=horizon_weight_table,
                     collect_metrics=should_log,
                 )
                 scaled_loss = loss / args.gradient_accumulation_steps
@@ -622,6 +698,7 @@ def main() -> None:
                 args.prediction_weight,
                 args.amp_dtype if device.type == "cuda" else "none",
                 args.seed + 1,
+                horizon_weight_table,
             )
             history.append(
                 {"step": step, "phase": phase, "train": metrics, "validation": validation}
@@ -690,6 +767,22 @@ def main() -> None:
                 "n_validation_sequences": manifest["validation"]["sequences"],
                 "n_train_positions": manifest["train"]["positions"],
                 "n_validation_positions": manifest["validation"]["positions"],
+            },
+            "horizon_balancing": {
+                "mode": args.horizon_weighting,
+                "sampling_probabilities": {
+                    str(horizon): float(horizon_probabilities[horizon])
+                    for horizon in range(1, cfg.max_span_length)
+                },
+                "prediction_loss_weights": {
+                    str(horizon): float(horizon_weight_table[horizon].cpu())
+                    for horizon in range(1, cfg.max_span_length)
+                },
+                "normalization": (
+                    "E_sampling[weight(h)] = 1; each horizon has equal "
+                    "expected prediction-loss mass"
+                ),
+                "reconstruction_loss_weighting": "unchanged",
             },
             "accelerator": {
                 "device": str(device),

@@ -4,6 +4,8 @@ import pytest
 from shared_residual.transition_jepa_sae import (
     TransitionJEPAConfig,
     TransitionJEPASAE,
+    horizon_loss_weight_table,
+    horizon_sampling_probabilities,
     transition_jepa_loss,
 )
 
@@ -21,6 +23,22 @@ def make_model() -> TransitionJEPASAE:
     )
     model.initialize_from_statistics(torch.zeros(8), 1.0)
     return model
+
+
+def test_inverse_probability_weights_equalize_expected_horizon_mass() -> None:
+    probabilities = horizon_sampling_probabilities(2, 8)
+    weights = horizon_loss_weight_table(2, 8, "inverse_probability").double()
+    assert torch.allclose(probabilities.sum(), torch.tensor(1.0, dtype=torch.float64))
+    expected_mass = probabilities[1:] * weights[1:]
+    assert torch.allclose(
+        expected_mass,
+        torch.full_like(expected_mass, 1.0 / 7.0),
+    )
+    assert abs(float(probabilities[1] / probabilities[7]) - 18.15) < 0.02
+    assert torch.allclose(
+        horizon_loss_weight_table(2, 8, "none")[1:],
+        torch.ones(7),
+    )
 
 
 def test_only_high_low_partition_exists() -> None:
@@ -100,6 +118,10 @@ def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
     assert model.ema_decoder.grad is None
     assert metrics["high_l0"] <= model.cfg.k_high
     assert metrics["low_l0"] <= model.cfg.k_low
+    assert metrics["prediction_loss"] == pytest.approx(
+        metrics["prediction_loss_unweighted"]
+    )
+    assert metrics["mean_horizon_loss_weight"] == pytest.approx(1.0)
     assert "residual_prediction_fvu" not in metrics
 
 
