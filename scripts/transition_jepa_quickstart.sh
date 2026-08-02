@@ -39,6 +39,9 @@ if [[ "$PREDICTOR_OUTPUT" != "softplus" && "$PREDICTOR_OUTPUT" != "relu_topk" ]]
   echo "PREDICTOR_OUTPUT must be softplus or relu_topk" >&2
   exit 2
 fi
+PREDICTOR_AUXK_WEIGHT="${PREDICTOR_AUXK_WEIGHT:-0}"
+PREDICTOR_AUXK="${PREDICTOR_AUXK:-512}"
+PREDICTOR_DEAD_BATCHES="${PREDICTOR_DEAD_BATCHES:-500}"
 TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-4000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
@@ -121,7 +124,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), horizon_weighting=$HORIZON_WEIGHTING, predictor_output=$PREDICTOR_OUTPUT, sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), horizon_weighting=$HORIZON_WEIGHTING, predictor_output=$PREDICTOR_OUTPUT, auxk_weight=$PREDICTOR_AUXK_WEIGHT, sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -134,9 +137,11 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > 
 
 ACTIVATION_MANIFEST="${ACTIVATION_MANIFEST:-$RUN_DIR/pile-activations/manifest.json}"
 CHECKPOINT="$RUN_DIR/model/transition_jepa_sae.pt"
-EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
-MMLU_PROMPTS="$RUN_DIR/evaluation-data/mmlu-prompts.jsonl"
-CAUSAL_PAIRS="$RUN_DIR/evaluation-data/mmlu-causal-pairs.jsonl"
+EVAL_ACTIVATIONS="${EVAL_ACTIVATIONS:-$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt}"
+EVAL_ACTIVATION_DIR="${EVAL_ACTIVATION_DIR:-$(dirname "$EVAL_ACTIVATIONS")}"
+MMLU_PROMPTS="${MMLU_PROMPTS:-$RUN_DIR/evaluation-data/mmlu-prompts.jsonl}"
+CAUSAL_PAIRS="${CAUSAL_PAIRS:-$RUN_DIR/evaluation-data/mmlu-causal-pairs.jsonl}"
+MMLU_MODEL_RESULTS="${MMLU_MODEL_RESULTS:-$RUN_DIR/analysis/mmlu_model_accuracy.json}"
 
 PILE_DATA_ARGS=(--dataset "$PILE_DATASET" --dataset-config "$PILE_DATASET_CONFIG")
 if [[ -n "$PILE_DATASET_REVISION" ]]; then PILE_DATA_ARGS+=(--dataset-revision "$PILE_DATASET_REVISION"); fi
@@ -176,6 +181,9 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --high-reconstruction-weight "$HIGH_RECONSTRUCTION_WEIGHT" \
     --predictor-width "$PREDICTOR_WIDTH" \
     --predictor-output "$PREDICTOR_OUTPUT" \
+    --predictor-auxk-weight "$PREDICTOR_AUXK_WEIGHT" \
+    --predictor-auxk "$PREDICTOR_AUXK" \
+    --predictor-dead-batches "$PREDICTOR_DEAD_BATCHES" \
     --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
     --prediction-ramp-steps "$PREDICTION_RAMP_STEPS" \
     --horizon-weighting "$HORIZON_WEIGHTING" \
@@ -187,7 +195,7 @@ fi
 
 if (( START_STAGE <= 3 && END_STAGE >= 3 )); then
   echo "[3/8] Build balanced MMLU probes and causal pairs"
-  mkdir -p "$RUN_DIR/evaluation-data"
+  mkdir -p "$(dirname "$MMLU_PROMPTS")" "$(dirname "$CAUSAL_PAIRS")"
   sr-make-mmlu \
     --prompts-output "$MMLU_PROMPTS" --pairs-output "$CAUSAL_PAIRS" \
     --dataset "$MMLU_DATASET" --dataset-config "$MMLU_DATASET_CONFIG" \
@@ -199,7 +207,7 @@ if (( START_STAGE <= 4 && END_STAGE >= 4 )); then
   echo "[4/8] Extract MMLU residual trajectories"
   sr-extract-grid \
     "${MODEL_LOAD_ARGS[@]}" --data "$MMLU_PROMPTS" \
-    --output-dir "$RUN_DIR/activations" --layers "$LAYER" \
+    --output-dir "$EVAL_ACTIVATION_DIR" --layers "$LAYER" \
     --hook-point post --window-size "$WINDOW_SIZE" \
     --batch-size "$EVAL_EXTRACT_BATCH_SIZE" --max-length "$MMLU_MAX_LENGTH" \
     --truncation-side left --dtype bfloat16 --storage-dtype bfloat16
@@ -207,10 +215,10 @@ fi
 
 if (( START_STAGE <= 5 && END_STAGE >= 5 )); then
   echo "[5/8] Measure zero-shot base-model MMLU accuracy"
-  mkdir -p "$RUN_DIR/analysis"
+  mkdir -p "$(dirname "$MMLU_MODEL_RESULTS")"
   sr-score-mmlu \
     "${MODEL_LOAD_ARGS[@]}" --data "$MMLU_PROMPTS" \
-    --output "$RUN_DIR/analysis/mmlu_model_accuracy.json" \
+    --output "$MMLU_MODEL_RESULTS" \
     --batch-size "$EVAL_EXTRACT_BATCH_SIZE" --max-length "$MMLU_MAX_LENGTH" \
     --minimum-tokens "$WINDOW_SIZE" --dtype bfloat16
 fi
@@ -221,7 +229,7 @@ if (( START_STAGE <= 6 && END_STAGE >= 6 )); then
     --activation-manifest "$ACTIVATION_MANIFEST"
     --activations "$EVAL_ACTIVATIONS"
     --checkpoint "$CHECKPOINT"
-    --mmlu-model-results "$RUN_DIR/analysis/mmlu_model_accuracy.json"
+    --mmlu-model-results "$MMLU_MODEL_RESULTS"
     --output-dir "$RUN_DIR/analysis"
     --group-key question_id
     --probe-max-dim "$PROBE_MAX_DIM"

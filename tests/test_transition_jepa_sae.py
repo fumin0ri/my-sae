@@ -4,10 +4,12 @@ import torch
 import pytest
 
 from shared_residual.transition_jepa_sae import (
+    PredictorActivityTracker,
     TransitionJEPAConfig,
     TransitionJEPASAE,
     horizon_loss_weight_table,
     horizon_sampling_probabilities,
+    predictor_auxk_per_sample_loss,
     predictor_output_bias_init,
     transition_jepa_loss,
 )
@@ -122,6 +124,48 @@ def test_softplus_predictor_remains_dense_baseline() -> None:
     )
     assert torch.all(prediction > 0)
     assert torch.all(model.transition_predictor.output.bias == -4.0)
+
+
+def test_predictor_activity_tracker_starts_after_explicit_updates() -> None:
+    tracker = PredictorActivityTracker(
+        features=4,
+        dead_after_batches=2,
+        device=torch.device("cpu"),
+    )
+    prediction = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    tracker.update(prediction)
+    assert not tracker.dead_mask.any()
+    tracker.update(prediction)
+    assert torch.equal(
+        tracker.dead_mask, torch.tensor([False, True, True, True])
+    )
+    reactivated = tracker.update(torch.tensor([[0.0, 1.0, 0.0, 0.0]]))
+    assert int(reactivated) == 1
+    assert not tracker.dead_mask[1]
+    assert tracker.summary()["total_reactivations"] == 1
+
+
+def test_predictor_auxk_routes_gradient_only_to_dead_logits() -> None:
+    logits = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4]], requires_grad=True
+    )
+    main_prediction = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0]], requires_grad=True
+    )
+    target = torch.tensor([[1.0, 0.0, 0.0, 2.0]])
+    loss, aux_l0 = predictor_auxk_per_sample_loss(
+        logits,
+        main_prediction,
+        target,
+        torch.tensor([False, True, True, True]),
+        k_aux=1,
+    )
+    loss.mean().backward()
+    assert aux_l0.item() == 1
+    assert logits.grad is not None
+    assert logits.grad[0, 3] != 0
+    assert torch.all(logits.grad[0, :3] == 0)
+    assert main_prediction.grad is None
 
 
 def test_online_forecast_encoder_matches_online_high_partition() -> None:

@@ -24,6 +24,12 @@ predictor出力は比較可能な2条件です。既定の`softplus`は従来ど
 死ぬため、ReLU条件は`softplus(-4) ≈ 0.01815`の正biasで初期化します。これにより
 初期出力の正値スケールをbaselineへ合わせながら、最初からTop-K経路へ勾配を流します。
 
+`relu_topk`では任意にcode-space AuxKを使えます。joint phase中のmain Top-Kに
+一定batch数選ばれなかったpredictor featureをdeadとし、そのfeatureのpre-Top-K
+ReLU出力からAuxKを作ります。補助targetは
+`stopgrad(ReLU(z_target - z_main))`です。したがってAuxKは既存winnerではなく、
+未予測の正target codeをdead featureで説明するようにだけ学習されます。
+
 学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、horizon-only学習
 モデルはありません。horizon-onlyとshuffled-contextは、同じ学習済みpredictorへ
 入力を変えて作る評価時null controlです。
@@ -116,6 +122,45 @@ Softplus baselineは`PREDICTOR_OUTPUT=softplus`です。checkpoint、training re
 `predictor_output_l0`、`predictor_zero_sample_fraction`、
 `predictor_batch_alive_fraction`も保存するため、ReLU predictorのdead outputを
 直接監視できます。
+
+## Predictor AuxK 3条件比較
+
+次の1コマンドで、同一Pile activation、同一seed、同一MMLU locked split、
+`inverse_probability` horizon weightingを使って3条件を順番に実行します。
+
+1. Softplus
+2. ReLU + Top-K、AuxKなし
+3. ReLU + Top-K、AuxKあり
+
+```bash
+HIGH_FRACTION=0.5 \
+HIGH_RECONSTRUCTION_WEIGHT=0.25 \
+WINDOW_SIZE=8 LAYER=16 \
+RUN_DIR=runs/l16_win8_HF0.5_HW0.25_auxk_comparison \
+bash scripts/predictor_auxk_comparison.sh
+```
+
+Pile residualとMMLU residual/base scoreは一度だけ生成して3条件で共有します。各条件の
+学習、SAE評価、forecast、probe、因果介入は独立に実行します。最後に次の比較reportを
+生成します。
+
+```text
+runs/l16_win8_HF0.5_HW0.25_auxk_comparison/comparison/index.html
+```
+
+既存のrandom-span activationを再利用する場合:
+
+```bash
+ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
+HIGH_FRACTION=0.5 HIGH_RECONSTRUCTION_WEIGHT=0.25 \
+WINDOW_SIZE=8 LAYER=16 \
+RUN_DIR=runs/l16_win8_HF0.5_HW0.25_auxk_comparison \
+bash scripts/predictor_auxk_comparison.sh
+```
+
+AuxKの既定値は`PREDICTOR_AUXK=512`、`PREDICTOR_AUXK_WEIGHT=0.03125`、
+`PREDICTOR_DEAD_BATCHES=500`です。dead counterはSAE-only warm-up中には更新されず、
+predictorが学習を開始するjoint phaseだけを数えます。
 
 ```bash
 WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \

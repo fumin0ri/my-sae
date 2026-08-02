@@ -166,12 +166,12 @@ class HorizonConditionedPredictor(nn.Module):
             predictor_output_bias_init(cfg.predictor_output),
         )
 
-    def forward(
+    def forward_with_logits(
         self,
         context_code: torch.Tensor,
         horizons: torch.Tensor,
         use_context: bool = True,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         squeeze_context = context_code.ndim == 2
         if context_code.ndim == 2:
             context_code = context_code[:, None, :]
@@ -199,7 +199,118 @@ class HorizonConditionedPredictor(nn.Module):
             output = F.softplus(logits)
         else:
             output = topk_relu(logits, self.cfg.k_high)
-        return output[:, 0] if squeeze_context else output
+        if squeeze_context:
+            return output[:, 0], logits[:, 0]
+        return output, logits
+
+    def forward(
+        self,
+        context_code: torch.Tensor,
+        horizons: torch.Tensor,
+        use_context: bool = True,
+    ) -> torch.Tensor:
+        output, _ = self.forward_with_logits(
+            context_code, horizons, use_context=use_context
+        )
+        return output
+
+
+class PredictorActivityTracker:
+    """Track main-path inactivity without counting the SAE-only warm-up."""
+
+    def __init__(
+        self,
+        features: int,
+        dead_after_batches: int,
+        device: torch.device,
+    ) -> None:
+        if features < 1:
+            raise ValueError("features must be positive")
+        if dead_after_batches < 1:
+            raise ValueError("dead_after_batches must be positive")
+        self.dead_after_batches = dead_after_batches
+        self.inactive_batches = torch.zeros(
+            features, dtype=torch.long, device=device
+        )
+        self.ever_active = torch.zeros(
+            features, dtype=torch.bool, device=device
+        )
+        self.prediction_batches = 0
+        self.total_reactivations = torch.zeros(
+            (), dtype=torch.long, device=device
+        )
+
+    @property
+    def dead_mask(self) -> torch.Tensor:
+        return self.inactive_batches >= self.dead_after_batches
+
+    @torch.no_grad()
+    def update(self, prediction: torch.Tensor) -> torch.Tensor:
+        if prediction.ndim != 2 or prediction.shape[-1] != len(
+            self.inactive_batches
+        ):
+            raise ValueError("prediction must have shape [batch, features]")
+        active = (prediction > 0).any(dim=0)
+        previously_dead = self.dead_mask
+        reactivated = (previously_dead & active).sum()
+        self.inactive_batches.add_(1)
+        self.inactive_batches[active] = 0
+        self.ever_active.logical_or_(active)
+        self.prediction_batches += 1
+        self.total_reactivations.add_(reactivated)
+        return reactivated
+
+    def summary(self) -> dict[str, int | float]:
+        dead = int(self.dead_mask.sum().item())
+        ever_active = int(self.ever_active.sum().item())
+        features = len(self.inactive_batches)
+        return {
+            "features": features,
+            "prediction_batches": self.prediction_batches,
+            "dead_features": dead,
+            "dead_feature_fraction": dead / features,
+            "ever_active_features": ever_active,
+            "ever_active_fraction": ever_active / features,
+            "total_reactivations": int(self.total_reactivations.item()),
+        }
+
+
+def predictor_auxk_per_sample_loss(
+    logits: torch.Tensor,
+    main_prediction: torch.Tensor,
+    target: torch.Tensor,
+    dead_mask: torch.Tensor,
+    k_aux: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use inactive predictor coordinates to fit missing positive target code."""
+    if logits.ndim != 2 or logits.shape != main_prediction.shape:
+        raise ValueError("logits and main_prediction must match [batch, features]")
+    if target.shape != logits.shape:
+        raise ValueError("target must match predictor logits")
+    if dead_mask.shape != (logits.shape[-1],) or dead_mask.dtype != torch.bool:
+        raise ValueError("dead_mask must be a boolean feature mask")
+    if k_aux < 1:
+        raise ValueError("k_aux must be positive")
+    dead_indices = dead_mask.nonzero(as_tuple=False).flatten()
+    if dead_indices.numel() == 0:
+        zeros = logits.sum(dim=-1) * 0.0
+        return zeros, zeros
+    dead_logits = logits.index_select(-1, dead_indices)
+    aux_prediction = topk_relu(
+        dead_logits, min(k_aux, dead_logits.shape[-1])
+    )
+    missing_target = torch.relu(
+        target.detach() - main_prediction.detach()
+    ).index_select(-1, dead_indices)
+    target_energy = target.detach().float().square().sum(dim=-1).clamp_min(1e-8)
+    per_sample_loss = (
+        (aux_prediction.float() - missing_target.float())
+        .square()
+        .sum(dim=-1)
+        / target_energy
+    )
+    aux_l0 = (aux_prediction > 0).sum(dim=-1).float()
+    return per_sample_loss, aux_l0
 
 
 class TransitionJEPASAE(nn.Module):
@@ -375,7 +486,7 @@ class TransitionJEPASAE(nn.Module):
             ema_full_reconstruction = ema_high_reconstruction + self.decode_low(
                 ema_target_low, ema=True, add_bias=False
             )
-        prediction = self.predict_from_code(
+        prediction, prediction_logits = self.transition_predictor.forward_with_logits(
             context_high, horizon, use_context=use_context
         )
         return {
@@ -395,6 +506,7 @@ class TransitionJEPASAE(nn.Module):
             "target_high_reconstruction": ema_high_reconstruction,
             "target_reconstruction": ema_full_reconstruction,
             "predicted_codes": prediction,
+            "prediction_logits": prediction_logits,
             "horizon": horizon,
         }
 
@@ -429,8 +541,16 @@ def transition_jepa_loss(
     prediction_weight: float,
     span_length: torch.Tensor | None = None,
     horizon_weight_table: torch.Tensor | None = None,
+    activity_tracker: PredictorActivityTracker | None = None,
+    update_activity_tracker: bool = False,
+    predictor_auxk_weight: float = 0.0,
+    predictor_auxk: int = 512,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if predictor_auxk_weight < 0:
+        raise ValueError("predictor_auxk_weight must be non-negative")
+    if predictor_auxk_weight > 0 and activity_tracker is None:
+        raise ValueError("AuxK requires an activity tracker")
     outputs = model(context, target, horizon)
     scale = (target - model.pre_bias.detach()).float().square().mean().clamp_min(1e-8)
     high_fvu = (
@@ -475,7 +595,23 @@ def transition_jepa_loss(
         ).index_select(0, horizon)
     prediction_loss_unweighted = per_sample_prediction_loss.mean()
     prediction_loss = (sample_weights * per_sample_prediction_loss).mean()
-    loss = reconstruction + prediction_weight * prediction_loss
+    reactivated = prediction.new_zeros(())
+    if activity_tracker is not None and update_activity_tracker:
+        reactivated = activity_tracker.update(prediction.detach())
+    auxk_per_sample = torch.zeros_like(per_sample_prediction_loss)
+    auxk_l0 = torch.zeros_like(per_sample_prediction_loss)
+    if predictor_auxk_weight > 0 and activity_tracker is not None:
+        auxk_per_sample, auxk_l0 = predictor_auxk_per_sample_loss(
+            outputs["prediction_logits"],
+            prediction,
+            target_codes,
+            activity_tracker.dead_mask,
+            predictor_auxk,
+        )
+    auxk_loss_unweighted = auxk_per_sample.mean()
+    auxk_loss = (sample_weights * auxk_per_sample).mean()
+    prediction_objective = prediction_loss + predictor_auxk_weight * auxk_loss
+    loss = reconstruction + prediction_weight * prediction_objective
     if not collect_metrics:
         return loss, {}
     precision, recall, jaccard = support_metrics(
@@ -491,6 +627,14 @@ def transition_jepa_loss(
         "prediction_loss_unweighted": float(
             prediction_loss_unweighted.detach()
         ),
+        "prediction_objective": float(prediction_objective.detach()),
+        "predictor_auxk_loss": float(auxk_loss.detach()),
+        "predictor_auxk_loss_unweighted": float(
+            auxk_loss_unweighted.detach()
+        ),
+        "predictor_auxk_l0": float(auxk_l0.mean().detach()),
+        "predictor_auxk_weight": predictor_auxk_weight,
+        "predictor_reactivated_features": float(reactivated.detach()),
         "mean_horizon_loss_weight": float(sample_weights.mean().detach()),
         "code_cosine": float(cosine.mean().detach()),
         "code_nrmse": float(nrmse.mean().detach()),
@@ -516,6 +660,20 @@ def transition_jepa_loss(
     }
     if span_length is not None:
         metrics["mean_span_length"] = float(span_length.float().mean())
+    if activity_tracker is not None:
+        tracker_summary = activity_tracker.summary()
+        metrics["predictor_dead_features"] = float(
+            tracker_summary["dead_features"]
+        )
+        metrics["predictor_dead_feature_fraction"] = float(
+            tracker_summary["dead_feature_fraction"]
+        )
+        metrics["predictor_ever_active_fraction"] = float(
+            tracker_summary["ever_active_fraction"]
+        )
+        metrics["predictor_total_reactivations"] = float(
+            tracker_summary["total_reactivations"]
+        )
     return loss, metrics
 
 
@@ -531,6 +689,9 @@ def evaluate_losses(
     amp_dtype: str,
     seed: int,
     horizon_weight_table: torch.Tensor,
+    activity_tracker: PredictorActivityTracker | None = None,
+    predictor_auxk_weight: float = 0.0,
+    predictor_auxk: int = 512,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
@@ -551,6 +712,10 @@ def evaluate_losses(
                 prediction_weight,
                 span_length=batch["span_length"],
                 horizon_weight_table=horizon_weight_table,
+                activity_tracker=activity_tracker,
+                update_activity_tracker=False,
+                predictor_auxk_weight=predictor_auxk_weight,
+                predictor_auxk=predictor_auxk,
             )
         count += len(batch["target"])
         for key, value in metrics.items():
@@ -585,6 +750,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--prediction-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--predictor-auxk-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Coefficient for code-space AuxK. Only valid with relu_topk; "
+            "zero disables AuxK."
+        ),
+    )
+    parser.add_argument(
+        "--predictor-auxk",
+        type=int,
+        default=512,
+        help="Number of currently dead predictor features used by AuxK",
+    )
+    parser.add_argument(
+        "--predictor-dead-batches",
+        type=int,
+        default=500,
+        help=(
+            "Mark a predictor feature dead after this many joint-phase "
+            "training microbatches without a main-path activation"
+        ),
+    )
     parser.add_argument(
         "--horizon-weighting",
         choices=HORIZON_WEIGHTING_MODES,
@@ -621,6 +810,12 @@ def main() -> None:
         raise ValueError("sae_warmup_steps must lie in [0, steps)")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient accumulation must be positive")
+    if args.predictor_auxk_weight < 0:
+        raise ValueError("predictor_auxk_weight must be non-negative")
+    if args.predictor_auxk < 1 or args.predictor_dead_batches < 1:
+        raise ValueError("AuxK size and dead-batch threshold must be positive")
+    if args.predictor_auxk_weight > 0 and args.predictor_output != "relu_topk":
+        raise ValueError("predictor AuxK is only valid with relu_topk output")
     torch.manual_seed(args.seed)
     device = torch.device(
         args.device
@@ -647,6 +842,15 @@ def main() -> None:
         high_reconstruction_weight=args.high_reconstruction_weight,
     )
     model = TransitionJEPASAE(cfg).to(device)
+    activity_tracker = (
+        PredictorActivityTracker(
+            cfg.d_high,
+            args.predictor_dead_batches,
+            device,
+        )
+        if cfg.predictor_output == "relu_topk"
+        else None
+    )
     horizon_probabilities = horizon_sampling_probabilities(
         int(manifest["min_span_length"]),
         int(manifest["max_span_length"]),
@@ -711,6 +915,10 @@ def main() -> None:
                     active_prediction_weight,
                     span_length=batch["span_length"],
                     horizon_weight_table=horizon_weight_table,
+                    activity_tracker=activity_tracker,
+                    update_activity_tracker=joint_step > 0,
+                    predictor_auxk_weight=args.predictor_auxk_weight,
+                    predictor_auxk=args.predictor_auxk,
                     collect_metrics=should_log,
                 )
                 scaled_loss = loss / args.gradient_accumulation_steps
@@ -743,6 +951,9 @@ def main() -> None:
                 args.amp_dtype if device.type == "cuda" else "none",
                 args.seed + 1,
                 horizon_weight_table,
+                activity_tracker,
+                args.predictor_auxk_weight,
+                args.predictor_auxk,
             )
             history.append(
                 {"step": step, "phase": phase, "train": metrics, "validation": validation}
@@ -802,6 +1013,23 @@ def main() -> None:
                 "predictor_output_topk": (
                     cfg.k_high if cfg.predictor_output == "relu_topk" else None
                 ),
+                "predictor_auxk": {
+                    "enabled": args.predictor_auxk_weight > 0,
+                    "coefficient": args.predictor_auxk_weight,
+                    "k_aux": args.predictor_auxk,
+                    "dead_after_prediction_batches": args.predictor_dead_batches,
+                    "dead_definition": (
+                        "not selected by main ReLU+Top-K output during joint-phase "
+                        "training microbatches"
+                    ),
+                    "target": "stopgrad(ReLU(z_target - z_main)) on dead coordinates",
+                    "normalization": "squared code error / total target-code energy",
+                    "final_activity": (
+                        activity_tracker.summary()
+                        if activity_tracker is not None
+                        else None
+                    ),
+                },
                 "high_role": "high-only reconstruction plus endpoint JEPA prediction",
                 "low_role": "incremental full reconstruction only",
                 "initialization": "from Pile activation mean/RMS; no unsplit SAE",

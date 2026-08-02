@@ -45,48 +45,91 @@ def save_figure(fig: plt.Figure, output: Path, name: str) -> None:
 def training_plot(run_dir: Path, figures: Path) -> None:
     history = load_json(run_dir / "model" / "training_report.json")["history"]
     steps = [row["step"] for row in history]
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.4))
-    axes[0].plot(
+    fig, axes = plt.subplots(2, 3, figsize=(15.8, 8.5))
+    axes[0, 0].plot(
         steps,
         [row["validation"]["ema_reconstruction_fvu"] for row in history],
         color=TOTAL,
         label="Full EMA SAE",
     )
-    axes[0].plot(
+    axes[0, 0].plot(
         steps,
         [row["validation"]["ema_high_reconstruction_fvu"] for row in history],
         color=HIGH,
         linestyle="--",
         label="High only",
     )
-    axes[1].plot(
+    axes[0, 1].plot(
         steps,
         [row["validation"]["code_cosine"] for row in history],
         color=HIGH,
     )
-    axes[2].plot(
+    axes[0, 2].plot(
         steps,
         [row["validation"]["support_recall"] for row in history],
         color="#7c3aed",
         label="Support recall",
     )
-    axes[2].plot(
+    axes[0, 2].plot(
         steps,
         [row["validation"]["support_precision"] for row in history],
         color="#db2777",
         label="Support precision",
     )
-    axes[0].set_title("Endpoint reconstruction")
-    axes[0].set_ylabel("FVU (lower is better)")
-    axes[1].set_title("Endpoint-code prediction")
-    axes[1].set_ylabel("Cosine (higher is better)")
-    axes[2].set_title("Predicted sparse support")
-    axes[2].set_ylabel("Score")
-    for axis in axes:
+    axes[1, 0].plot(
+        steps,
+        [row["validation"].get("predictor_output_l0", np.nan) for row in history],
+        color="#0f766e",
+    )
+    axes[1, 1].plot(
+        steps,
+        [
+            row["validation"].get("predictor_dead_feature_fraction", np.nan)
+            for row in history
+        ],
+        color="#dc2626",
+    )
+    axes[1, 2].plot(
+        steps,
+        [row["validation"].get("predictor_auxk_loss", 0.0) for row in history],
+        color="#ea580c",
+        label="AuxK loss",
+    )
+    aux_l0_axis = axes[1, 2].twinx()
+    aux_l0_axis.plot(
+        steps,
+        [
+            row["validation"].get("predictor_auxk_l0", 0.0)
+            for row in history
+        ],
+        color="#7c3aed",
+        linestyle="--",
+        label="AuxK L0",
+    )
+    axes[0, 0].set_title("Endpoint reconstruction")
+    axes[0, 0].set_ylabel("FVU (lower is better)")
+    axes[0, 1].set_title("Endpoint-code prediction")
+    axes[0, 1].set_ylabel("Cosine (higher is better)")
+    axes[0, 2].set_title("Predicted sparse support")
+    axes[0, 2].set_ylabel("Score")
+    axes[1, 0].set_title("Main predictor sparsity")
+    axes[1, 0].set_ylabel("Output L0")
+    axes[1, 1].set_title("Predictor dead-feature fraction")
+    axes[1, 1].set_ylabel("Fraction")
+    axes[1, 2].set_title("AuxK rescue path")
+    axes[1, 2].set_ylabel("AuxK loss")
+    aux_l0_axis.set_ylabel("AuxK L0")
+    for axis in axes.flat:
         axis.set_xlabel("Optimizer step")
         axis.grid(alpha=0.2)
-    axes[0].legend(frameon=False)
-    axes[2].legend(frameon=False)
+    axes[0, 0].legend(frameon=False)
+    axes[0, 2].legend(frameon=False)
+    aux_lines = axes[1, 2].get_lines() + aux_l0_axis.get_lines()
+    axes[1, 2].legend(
+        aux_lines,
+        [line.get_label() for line in aux_lines],
+        frameon=False,
+    )
     fig.tight_layout()
     save_figure(fig, figures, "training")
 
@@ -460,6 +503,7 @@ def main() -> None:
     figures = output / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     report = load_json(run_dir / "analysis" / "transition_jepa_report.json")
+    training_report = load_json(run_dir / "model" / "training_report.json")
     training_plot(run_dir, figures)
     sae_quality_plot(report, figures)
     forecast_plot(report, figures)
@@ -471,6 +515,9 @@ def main() -> None:
         {
             "predictor_output": report["checkpoint"]["config"].get(
                 "predictor_output", "softplus"
+            ),
+            "predictor_auxk": training_report["architecture"].get(
+                "predictor_auxk"
             ),
             "standard_sae_quality": report["standard_sae_quality"],
             "loss_recovered": report.get("loss_recovered"),

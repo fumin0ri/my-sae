@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.16.0"
+version = "0.17.0"
 description = "Train high/low forecastable sparse states and test reconstruction, representation, and causal validity"
 requires-python = ">=3.10"
 dependencies = [
@@ -39,6 +39,7 @@ sr-train-transition-jepa-sae = "shared_residual.transition_jepa_sae:main"
 sr-evaluate-transition-jepa-sae = "shared_residual.transition_jepa_eval:main"
 sr-intervene-transition-jepa-sae = "shared_residual.transition_jepa_intervene:main"
 sr-visualize-transition-jepa-sae = "shared_residual.transition_jepa_visualize:main"
+sr-compare-transition-predictors = "shared_residual.transition_jepa_compare:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
