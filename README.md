@@ -18,6 +18,12 @@ z_hat_t   = P(z_context, horizon=h)
 predictorはlatent endpoint codeだけで学習します。予測codeをdecoderへ通した
 residual reconstructionは学習損失に含めず、評価・因果介入だけに使います。
 
+predictor出力は比較可能な2条件です。既定の`softplus`は従来どおりdenseな正値codeを
+学習し、評価時にTop-K化します。`relu_topk`は学習時から`ReLU + high-group Top-K`を
+適用します。ReLU条件にSoftplus条件のbias `-4`を流用すると全出力が負になり勾配が
+死ぬため、ReLU条件は`softplus(-4) ≈ 0.01815`の正biasで初期化します。これにより
+初期出力の正値スケールをbaselineへ合わせながら、最初からTop-K経路へ勾配を流します。
+
 学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、horizon-only学習
 モデルはありません。horizon-onlyとshuffled-contextは、同じ学習済みpredictorへ
 入力を変えて作る評価時null controlです。
@@ -91,6 +97,25 @@ bash scripts/transition_jepa_quickstart.sh
 jq '.horizon_balancing' \
   runs/l16_win8_HF0.5_HW0.25_horizon_balanced/model/training_report.json
 ```
+
+同じactivation、seed、学習条件でReLU + Top-K predictorを比較する場合:
+
+```bash
+START_STAGE=2 \
+ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
+RUN_DIR=runs/l16_win8_HF0.5_HW0.25_horizon_balanced_relu_topk \
+WINDOW_SIZE=8 LAYER=16 HIGH_FRACTION=0.5 \
+HIGH_RECONSTRUCTION_WEIGHT=0.25 \
+HORIZON_WEIGHTING=inverse_probability \
+PREDICTOR_OUTPUT=relu_topk \
+bash scripts/transition_jepa_quickstart.sh
+```
+
+Softplus baselineは`PREDICTOR_OUTPUT=softplus`です。checkpoint、training report、
+`visualization_summary.json`へ使用した出力方式を保存します。学習ログには
+`predictor_output_l0`、`predictor_zero_sample_fraction`、
+`predictor_batch_alive_fraction`も保存するため、ReLU predictorのdead outputを
+直接監視できます。
 
 ```bash
 WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \

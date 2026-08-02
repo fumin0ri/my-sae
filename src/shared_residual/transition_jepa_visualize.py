@@ -469,6 +469,9 @@ def main() -> None:
     write_json(
         output / "visualization_summary.json",
         {
+            "predictor_output": report["checkpoint"]["config"].get(
+                "predictor_output", "softplus"
+            ),
             "standard_sae_quality": report["standard_sae_quality"],
             "loss_recovered": report.get("loss_recovered"),
             "forecast_validity": report["forecast_validity"],

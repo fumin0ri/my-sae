@@ -34,6 +34,11 @@ K="${K:-64}"
 HIGH_FRACTION="${HIGH_FRACTION:-0.2}"
 HIGH_RECONSTRUCTION_WEIGHT="${HIGH_RECONSTRUCTION_WEIGHT:-0.2}"
 PREDICTOR_WIDTH="${PREDICTOR_WIDTH:-512}"
+PREDICTOR_OUTPUT="${PREDICTOR_OUTPUT:-softplus}"
+if [[ "$PREDICTOR_OUTPUT" != "softplus" && "$PREDICTOR_OUTPUT" != "relu_topk" ]]; then
+  echo "PREDICTOR_OUTPUT must be softplus or relu_topk" >&2
+  exit 2
+fi
 TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-4000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
@@ -116,7 +121,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), horizon_weighting=$HORIZON_WEIGHTING, sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), horizon_weighting=$HORIZON_WEIGHTING, predictor_output=$PREDICTOR_OUTPUT, sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -170,6 +175,7 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --high-fraction "$HIGH_FRACTION" \
     --high-reconstruction-weight "$HIGH_RECONSTRUCTION_WEIGHT" \
     --predictor-width "$PREDICTOR_WIDTH" \
+    --predictor-output "$PREDICTOR_OUTPUT" \
     --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
     --prediction-ramp-steps "$PREDICTION_RAMP_STEPS" \
     --horizon-weighting "$HORIZON_WEIGHTING" \

@@ -28,6 +28,19 @@ from .training import (
 
 ARCHITECTURE_ID = "high_low_random_pair_horizon_ema_sae_v3"
 HORIZON_WEIGHTING_MODES = ("none", "inverse_probability")
+PREDICTOR_OUTPUT_MODES = ("softplus", "relu_topk")
+SOFTPLUS_OUTPUT_BIAS_INIT = -4.0
+
+
+def predictor_output_bias_init(mode: str) -> float:
+    """Choose a non-dead, scale-matched output bias for each predictor head."""
+    if mode == "softplus":
+        return SOFTPLUS_OUTPUT_BIAS_INIT
+    if mode == "relu_topk":
+        # Reusing -4 would put every ReLU unit in its zero-gradient region.
+        # Match ReLU's initial positive level to softplus(-4) instead.
+        return math.log1p(math.exp(SOFTPLUS_OUTPUT_BIAS_INIT))
+    raise ValueError(f"unsupported predictor output mode: {mode}")
 
 
 def horizon_sampling_probabilities(
@@ -73,6 +86,7 @@ class TransitionJEPAConfig:
     max_span_length: int = 10
     predictor_width: int = 256
     predictor_expansion: int = 2
+    predictor_output: str = "softplus"
     ema_decay: float = 0.996
     high_fraction: float = 0.2
     high_reconstruction_weight: float = 0.2
@@ -90,6 +104,10 @@ class TransitionJEPAConfig:
             raise ValueError("both high and low dictionaries must be non-empty")
         if self.k_high < 1 or self.k_low < 1:
             raise ValueError("both high and low Top-K budgets must be positive")
+        if self.predictor_output not in PREDICTOR_OUTPUT_MODES:
+            raise ValueError(
+                f"predictor_output must be one of {PREDICTOR_OUTPUT_MODES}"
+            )
 
     @property
     def d_high(self) -> int:
@@ -143,7 +161,10 @@ class HorizonConditionedPredictor(nn.Module):
         )
         self.output = nn.Linear(width, cfg.d_high)
         nn.init.normal_(self.output.weight, std=0.01)
-        nn.init.constant_(self.output.bias, -4.0)
+        nn.init.constant_(
+            self.output.bias,
+            predictor_output_bias_init(cfg.predictor_output),
+        )
 
     def forward(
         self,
@@ -173,7 +194,11 @@ class HorizonConditionedPredictor(nn.Module):
         state = self.context_projection(context_code)
         if not use_context:
             state = torch.zeros_like(state)
-        output = F.softplus(self.output(self.mlp(state + horizon_state)))
+        logits = self.output(self.mlp(state + horizon_state))
+        if self.cfg.predictor_output == "softplus":
+            output = F.softplus(logits)
+        else:
+            output = topk_relu(logits, self.cfg.k_high)
         return output[:, 0] if squeeze_context else output
 
 
@@ -472,6 +497,15 @@ def transition_jepa_loss(
         "support_precision": float(precision.mean()),
         "support_recall": float(recall.mean()),
         "support_jaccard": float(jaccard.mean()),
+        "predictor_output_l0": float(
+            (prediction.detach() > 0).sum(dim=-1).float().mean()
+        ),
+        "predictor_zero_sample_fraction": float(
+            ((prediction.detach() > 0).sum(dim=-1) == 0).float().mean()
+        ),
+        "predictor_batch_alive_fraction": float(
+            (prediction.detach() > 0).any(dim=0).float().mean()
+        ),
         "high_l0": float(
             (outputs["target_high_codes_online"] > 0).sum(dim=-1).float().mean()
         ),
@@ -541,6 +575,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--high-reconstruction-weight", type=float, default=0.2)
     parser.add_argument("--predictor-width", type=int, default=256)
     parser.add_argument("--predictor-expansion", type=int, default=2)
+    parser.add_argument(
+        "--predictor-output",
+        choices=PREDICTOR_OUTPUT_MODES,
+        default="softplus",
+        help=(
+            "softplus reproduces the dense baseline; relu_topk applies ReLU "
+            "and the high-group Top-K budget inside the predictor during training"
+        ),
+    )
     parser.add_argument("--prediction-weight", type=float, default=1.0)
     parser.add_argument(
         "--horizon-weighting",
@@ -598,6 +641,7 @@ def main() -> None:
         max_span_length=int(manifest["max_span_length"]),
         predictor_width=args.predictor_width,
         predictor_expansion=args.predictor_expansion,
+        predictor_output=args.predictor_output,
         ema_decay=args.ema_decay,
         high_fraction=args.high_fraction,
         high_reconstruction_weight=args.high_reconstruction_weight,
@@ -751,6 +795,13 @@ def main() -> None:
                 "max_span_length": cfg.max_span_length,
                 "max_horizon": cfg.max_span_length - 1,
                 "conditioning": "explicit token horizon h=t-k",
+                "predictor_output": cfg.predictor_output,
+                "predictor_output_bias_initialization": predictor_output_bias_init(
+                    cfg.predictor_output
+                ),
+                "predictor_output_topk": (
+                    cfg.k_high if cfg.predictor_output == "relu_topk" else None
+                ),
                 "high_role": "high-only reconstruction plus endpoint JEPA prediction",
                 "low_role": "incremental full reconstruction only",
                 "initialization": "from Pile activation mean/RMS; no unsplit SAE",

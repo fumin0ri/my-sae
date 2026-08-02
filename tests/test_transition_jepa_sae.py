@@ -1,3 +1,5 @@
+import math
+
 import torch
 import pytest
 
@@ -6,11 +8,12 @@ from shared_residual.transition_jepa_sae import (
     TransitionJEPASAE,
     horizon_loss_weight_table,
     horizon_sampling_probabilities,
+    predictor_output_bias_init,
     transition_jepa_loss,
 )
 
 
-def make_model() -> TransitionJEPASAE:
+def make_model(predictor_output: str = "softplus") -> TransitionJEPASAE:
     model = TransitionJEPASAE(
         TransitionJEPAConfig(
             d_in=8,
@@ -18,6 +21,7 @@ def make_model() -> TransitionJEPASAE:
             k=5,
             max_span_length=6,
             predictor_width=8,
+            predictor_output=predictor_output,
             high_fraction=0.2,
         )
     )
@@ -92,6 +96,32 @@ def test_pair_predictor_uses_explicit_per_sample_horizon() -> None:
     assert output.shape == (3, model.cfg.d_high)
     with pytest.raises(ValueError):
         model.predict_from_code(context, torch.tensor([0, 3, 5]))
+
+
+def test_relu_topk_predictor_uses_non_dead_scale_matched_initialization() -> None:
+    model = make_model("relu_topk")
+    expected_bias = math.log1p(math.exp(-4.0))
+    assert predictor_output_bias_init("relu_topk") == pytest.approx(expected_bias)
+    assert torch.allclose(
+        model.transition_predictor.output.bias,
+        torch.full_like(model.transition_predictor.output.bias, expected_bias),
+    )
+    with torch.no_grad():
+        model.transition_predictor.output.weight.zero_()
+    prediction = model.predict_from_code(
+        torch.randn(3, model.cfg.d_high), torch.tensor([1, 3, 5])
+    )
+    assert torch.all((prediction > 0).sum(dim=-1) == model.cfg.k_high)
+    assert torch.all(prediction[prediction > 0] > 0)
+
+
+def test_softplus_predictor_remains_dense_baseline() -> None:
+    model = make_model("softplus")
+    prediction = model.predict_from_code(
+        torch.randn(3, model.cfg.d_high), torch.tensor([1, 3, 5])
+    )
+    assert torch.all(prediction > 0)
+    assert torch.all(model.transition_predictor.output.bias == -4.0)
 
 
 def test_online_forecast_encoder_matches_online_high_partition() -> None:
