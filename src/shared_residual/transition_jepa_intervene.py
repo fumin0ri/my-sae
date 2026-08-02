@@ -47,12 +47,12 @@ def load_transition_model(
 
 def resolve_horizon(
     requested: int | None,
-    window_size: int,
+    max_span_length: int,
 ) -> int:
-    horizon = window_size - 1 if requested is None else requested
-    if not 1 <= horizon < window_size:
+    horizon = max_span_length - 1 if requested is None else requested
+    if not 1 <= horizon < max_span_length:
         raise ValueError(
-            f"--horizon must lie in [1, {window_size - 1}]"
+            f"--horizon must lie in [1, {max_span_length - 1}]"
         )
     return horizon
 
@@ -60,7 +60,7 @@ def resolve_horizon(
 def select_eligible_pairs(
     rows: list[dict[str, Any]],
     tokenizer: Any,
-    window_size: int,
+    max_span_length: int,
     source_key: str,
     target_key: str,
     maximum: int,
@@ -84,7 +84,7 @@ def select_eligible_pairs(
             str(row[target_key]),
             add_special_tokens=True,
         )
-        if min(len(source_ids), len(target_ids)) < window_size:
+        if min(len(source_ids), len(target_ids)) < max_span_length:
             skipped_short += 1
             continue
         selected.append((row_index, row, source_ids, target_ids))
