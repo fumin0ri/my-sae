@@ -127,7 +127,7 @@ git rev-parse HEAD > "$RUN_DIR/code-commit.txt"
 python -m pip freeze > "$RUN_DIR/python-environment.txt"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > "$RUN_DIR/gpu-environment.csv"
 
-ACTIVATION_MANIFEST="$RUN_DIR/pile-activations/manifest.json"
+ACTIVATION_MANIFEST="${ACTIVATION_MANIFEST:-$RUN_DIR/pile-activations/manifest.json}"
 CHECKPOINT="$RUN_DIR/model/transition_jepa_sae.pt"
 EVAL_ACTIVATIONS="$RUN_DIR/activations/layer-$(printf '%03d' "$LAYER").pt"
 MMLU_PROMPTS="$RUN_DIR/evaluation-data/mmlu-prompts.jsonl"

@@ -73,6 +73,25 @@ random span/contextの生成とreconstruction lossは変更しません。
 
 旧来の非補正条件を対照実験として使う場合だけ、`HORIZON_WEIGHTING=none`を指定します。
 
+既存のrandom-span activationを再利用して、補正版を別runとしてstage 2から学習する場合:
+
+```bash
+START_STAGE=2 \
+ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
+RUN_DIR=runs/l16_win8_HF0.5_HW0.25_horizon_balanced \
+WINDOW_SIZE=8 LAYER=16 HIGH_FRACTION=0.5 \
+HIGH_RECONSTRUCTION_WEIGHT=0.25 \
+HORIZON_WEIGHTING=inverse_probability \
+bash scripts/transition_jepa_quickstart.sh
+```
+
+`training_report.json`で実際に使用された補正を確認できます。
+
+```bash
+jq '.horizon_balancing' \
+  runs/l16_win8_HF0.5_HW0.25_horizon_balanced/model/training_report.json
+```
+
 ```bash
 WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \
 bash scripts/transition_jepa_quickstart.sh
