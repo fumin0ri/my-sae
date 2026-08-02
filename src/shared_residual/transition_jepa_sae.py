@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from tqdm import trange
 
 from .activation_store import (
-    ShuffledShardBatches,
+    RandomPairShardBatches,
     load_activation_manifest,
     manifest_fingerprint,
-    validation_batches,
+    validation_pair_batches,
 )
 from .group_sae import topk_relu
 from .io import write_json
@@ -26,7 +26,7 @@ from .training import (
     cosine_learning_rate,
 )
 
-ARCHITECTURE_ID = "high_low_fixed_endpoint_ema_sae_v2"
+ARCHITECTURE_ID = "high_low_random_pair_horizon_ema_sae_v3"
 
 
 @dataclass
@@ -34,7 +34,7 @@ class TransitionJEPAConfig:
     d_in: int
     d_sae: int = 2048
     k: int = 32
-    window_size: int = 10
+    max_span_length: int = 10
     predictor_width: int = 256
     predictor_expansion: int = 2
     ema_decay: float = 0.996
@@ -42,8 +42,8 @@ class TransitionJEPAConfig:
     high_reconstruction_weight: float = 0.2
 
     def __post_init__(self) -> None:
-        if self.window_size < 2:
-            raise ValueError("window_size must be at least two")
+        if self.max_span_length < 2:
+            raise ValueError("max_span_length must be at least two")
         if self.k < 2 or self.k > self.d_sae:
             raise ValueError("k must lie in [2, d_sae]")
         if not 0.0 < self.high_fraction < 1.0:
@@ -88,15 +88,16 @@ class HierarchicalSparseEncoder(nn.Module):
         return torch.cat((high, low), dim=-1)
 
 
-class PositionConditionedPredictor(nn.Module):
-    """Predict the fixed endpoint high code from each earlier high code."""
+class HorizonConditionedPredictor(nn.Module):
+    """Predict a future high code from context code and explicit token distance."""
 
     def __init__(self, cfg: TransitionJEPAConfig):
         super().__init__()
+        self.cfg = cfg
         width = cfg.predictor_width
         hidden = cfg.predictor_expansion * width
         self.context_projection = nn.Linear(cfg.d_high, width, bias=False)
-        self.position_embedding = nn.Embedding(cfg.window_size, width)
+        self.horizon_embedding = nn.Embedding(cfg.max_span_length, width)
         self.mlp = nn.Sequential(
             nn.LayerNorm(width),
             nn.Linear(width, hidden),
@@ -111,20 +112,33 @@ class PositionConditionedPredictor(nn.Module):
     def forward(
         self,
         context_code: torch.Tensor,
-        context_positions: torch.Tensor,
+        horizons: torch.Tensor,
         use_context: bool = True,
     ) -> torch.Tensor:
+        squeeze_context = context_code.ndim == 2
         if context_code.ndim == 2:
             context_code = context_code[:, None, :]
         if context_code.ndim != 3:
             raise ValueError("context_code must have shape [batch, contexts, d_high]")
-        if context_positions.shape != (context_code.shape[1],):
-            raise ValueError("context_positions must match the context axis")
+        if torch.any(horizons < 1) or torch.any(horizons >= self.cfg.max_span_length):
+            raise ValueError("horizons must lie in [1, max_span_length-1]")
+        if squeeze_context and horizons.shape == (context_code.shape[0],):
+            horizon_state = self.horizon_embedding(horizons)[:, None, :]
+        elif (
+            not squeeze_context
+            and horizons.ndim == 1
+            and horizons.shape == (context_code.shape[1],)
+        ):
+            horizon_state = self.horizon_embedding(horizons)[None, :, :]
+        elif horizons.shape == context_code.shape[:2]:
+            horizon_state = self.horizon_embedding(horizons)
+        else:
+            raise ValueError("horizons must match the batch or context axis")
         state = self.context_projection(context_code)
         if not use_context:
             state = torch.zeros_like(state)
-        queries = state + self.position_embedding(context_positions)[None]
-        return F.softplus(self.output(self.mlp(queries)))
+        output = F.softplus(self.output(self.mlp(state + horizon_state)))
+        return output[:, 0] if squeeze_context else output
 
 
 class TransitionJEPASAE(nn.Module):
@@ -143,7 +157,7 @@ class TransitionJEPASAE(nn.Module):
             parameter.requires_grad_(False)
         self.ema_decoder = nn.Parameter(self.decoder.detach().clone(), requires_grad=False)
         self.register_buffer("ema_pre_bias", self.pre_bias.detach().clone())
-        self.transition_predictor = PositionConditionedPredictor(cfg)
+        self.transition_predictor = HorizonConditionedPredictor(cfg)
 
     @property
     def forecast_dim(self) -> int:
@@ -255,65 +269,59 @@ class TransitionJEPASAE(nn.Module):
     def predict_from_code(
         self,
         context_high: torch.Tensor,
-        context_positions: torch.Tensor | None = None,
+        horizons: torch.Tensor,
         use_context: bool = True,
         sparse_output: bool = False,
     ) -> torch.Tensor:
         if context_high.shape[-1] == self.cfg.d_sae:
             context_high = context_high[..., : self.cfg.d_high]
-        if context_high.ndim == 2:
-            context_high = context_high[:, None, :]
         if context_high.shape[-1] != self.cfg.d_high:
             raise ValueError("predictor input must be a high-group code")
-        if context_positions is None:
-            context_positions = torch.arange(
-                context_high.shape[1], device=context_high.device, dtype=torch.long
-            )
         dense = self.transition_predictor(
-            context_high, context_positions, use_context=use_context
+            context_high, horizons, use_context=use_context
         )
         return topk_relu(dense, self.cfg.k_high) if sparse_output else dense
 
     def forward(
         self,
-        x: torch.Tensor,
+        context: torch.Tensor,
+        target: torch.Tensor,
+        horizon: torch.Tensor,
         use_context: bool = True,
         use_ema_context: bool = False,
     ) -> dict[str, torch.Tensor]:
-        if x.ndim != 3 or x.shape[1:] != (self.cfg.window_size, self.cfg.d_in):
-            raise ValueError(
-                f"x must have shape [batch, {self.cfg.window_size}, {self.cfg.d_in}]"
-            )
-        codes = self.encode(x)
-        high, low = self.split_code(codes)
+        if context.ndim != 2 or context.shape[-1] != self.cfg.d_in:
+            raise ValueError("context must have shape [batch, d_in]")
+        if target.shape != context.shape:
+            raise ValueError("target must match context shape")
+        if horizon.shape != (len(context),):
+            raise ValueError("horizon must have shape [batch]")
+        target_code = self.encode(target)
+        online_target_high, online_target_low = self.split_code(target_code)
         if use_ema_context:
-            ema_context_code = self.encode_ema(x[:, :-1])
-            context_high, context_low = self.split_code(ema_context_code)
+            context_code = self.encode_ema(context)
         else:
-            context_high, context_low = high[:, :-1], low[:, :-1]
-        online_target_high = high[:, -1]
-        online_target_low = low[:, -1]
+            context_code = self.encode(context)
+        context_high, context_low = self.split_code(context_code)
         high_reconstruction = self.decode_high(online_target_high, ema=False)
         full_reconstruction = high_reconstruction + self.decode_low(
             online_target_low, ema=False, add_bias=False
         )
         with torch.no_grad():
-            ema_target = self.encode_ema(x[:, -1])
+            ema_target = self.encode_ema(target)
             ema_target_high, ema_target_low = self.split_code(ema_target)
             ema_high_reconstruction = self.decode_high(ema_target_high, ema=True)
             ema_full_reconstruction = ema_high_reconstruction + self.decode_low(
                 ema_target_low, ema=True, add_bias=False
             )
         prediction = self.predict_from_code(
-            context_high, use_context=use_context
+            context_high, horizon, use_context=use_context
         )
-        target_codes = ema_target_high[:, None].expand_as(prediction)
         return {
-            "codes": codes,
-            "high_codes": high,
-            "low_codes": low,
+            "target_codes_online": target_code,
+            "target_high_codes_online": online_target_high,
+            "target_low_codes_online": online_target_low,
             "context_code": context_high,
-            "context_codes": context_high,
             "low_context_code": context_low,
             "online_target_high": online_target_high,
             "online_target_low": online_target_low,
@@ -322,10 +330,11 @@ class TransitionJEPASAE(nn.Module):
             "online_target_reconstruction": full_reconstruction,
             "target_code": ema_target_high,
             "target_low_code": ema_target_low,
-            "target_codes": target_codes,
+            "target_codes": ema_target_high,
             "target_high_reconstruction": ema_high_reconstruction,
             "target_reconstruction": ema_full_reconstruction,
             "predicted_codes": prediction,
+            "horizon": horizon,
         }
 
     @torch.no_grad()
@@ -353,12 +362,14 @@ def support_metrics(
 
 def transition_jepa_loss(
     model: TransitionJEPASAE,
-    x: torch.Tensor,
+    context: torch.Tensor,
+    target: torch.Tensor,
+    horizon: torch.Tensor,
     prediction_weight: float,
+    span_length: torch.Tensor | None = None,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    outputs = model(x)
-    target = x[:, -1]
+    outputs = model(context, target, horizon)
     scale = (target - model.pre_bias.detach()).float().square().mean().clamp_min(1e-8)
     high_fvu = (
         (outputs["online_high_reconstruction"] - target).float().square().mean()
@@ -395,7 +406,7 @@ def transition_jepa_loss(
     precision, recall, jaccard = support_metrics(
         prediction.detach(), target_codes, model.cfg.k_high
     )
-    return loss, {
+    metrics = {
         "loss": float(loss.detach()),
         "online_high_reconstruction_fvu": float(high_fvu.detach()),
         "online_reconstruction_fvu": float(full_fvu.detach()),
@@ -407,9 +418,17 @@ def transition_jepa_loss(
         "support_precision": float(precision.mean()),
         "support_recall": float(recall.mean()),
         "support_jaccard": float(jaccard.mean()),
-        "high_l0": float((outputs["high_codes"] > 0).sum(dim=-1).float().mean()),
-        "low_l0": float((outputs["low_codes"] > 0).sum(dim=-1).float().mean()),
+        "high_l0": float(
+            (outputs["target_high_codes_online"] > 0).sum(dim=-1).float().mean()
+        ),
+        "low_l0": float(
+            (outputs["target_low_codes_online"] > 0).sum(dim=-1).float().mean()
+        ),
+        "mean_horizon": float(horizon.float().mean()),
     }
+    if span_length is not None:
+        metrics["mean_span_length"] = float(span_length.float().mean())
+    return loss, metrics
 
 
 @torch.no_grad()
@@ -422,19 +441,30 @@ def evaluate_losses(
     device: torch.device,
     prediction_weight: float,
     amp_dtype: str,
+    seed: int,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
     count = 0
-    for x in validation_batches(root, manifest, batch_size, maximum_batches):
-        x = x.to(device, non_blocking=True)
+    for batch in validation_pair_batches(
+        root, manifest, batch_size, maximum_batches, seed
+    ):
+        batch = {
+            key: value.to(device, non_blocking=True)
+            for key, value in batch.items()
+        }
         with autocast_context(device, amp_dtype):
             _, metrics = transition_jepa_loss(
-                model, x, prediction_weight
+                model,
+                batch["context"],
+                batch["target"],
+                batch["horizon"],
+                prediction_weight,
+                span_length=batch["span_length"],
             )
-        count += len(x)
+        count += len(batch["target"])
         for key, value in metrics.items():
-            sums[key] = sums.get(key, 0.0) + len(x) * value
+            sums[key] = sums.get(key, 0.0) + len(batch["target"]) * value
     model.train()
     return {key: value / max(count, 1) for key, value in sums.items()}
 
@@ -445,7 +475,7 @@ def trainable_parameters(model: nn.Module) -> Iterable[nn.Parameter]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the high/low fixed-endpoint EMA JEPA-SAE"
+        description="Train the high/low random-pair horizon-conditioned EMA JEPA-SAE"
     )
     parser.add_argument("--activation-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -493,11 +523,13 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
     root, manifest = load_activation_manifest(args.activation_manifest)
     fingerprint = manifest_fingerprint(manifest)
+    if int(manifest["max_horizon"]) != int(manifest["max_span_length"]) - 1:
+        raise ValueError("activation manifest has inconsistent horizon bounds")
     cfg = TransitionJEPAConfig(
         d_in=int(manifest["d_in"]),
         d_sae=args.d_sae,
         k=args.k,
-        window_size=int(manifest["window_size"]),
+        max_span_length=int(manifest["max_span_length"]),
         predictor_width=args.predictor_width,
         predictor_expansion=args.predictor_expansion,
         ema_decay=args.ema_decay,
@@ -511,7 +543,7 @@ def main() -> None:
         float(normalization["scalar_rms"]),
     )
     iterator = iter(
-        ShuffledShardBatches(root, manifest, "train", args.batch_size, args.seed)
+        RandomPairShardBatches(root, manifest, "train", args.batch_size, args.seed)
     )
     predictor_parameters = list(model.transition_predictor.parameters())
     predictor_ids = {id(parameter) for parameter in predictor_parameters}
@@ -547,12 +579,18 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         metric_sums: dict[str, float] = {}
         for _ in range(args.gradient_accumulation_steps):
-            batch = next(iterator).to(device, non_blocking=True)
+            batch = {
+                key: value.to(device, non_blocking=True)
+                for key, value in next(iterator).items()
+            }
             with autocast_context(device, args.amp_dtype):
                 loss, metrics = transition_jepa_loss(
                     model,
-                    batch,
+                    batch["context"],
+                    batch["target"],
+                    batch["horizon"],
                     active_prediction_weight,
+                    span_length=batch["span_length"],
                     collect_metrics=should_log,
                 )
                 scaled_loss = loss / args.gradient_accumulation_steps
@@ -583,6 +621,7 @@ def main() -> None:
                 device,
                 args.prediction_weight,
                 args.amp_dtype if device.type == "cuda" else "none",
+                args.seed + 1,
             )
             history.append(
                 {"step": step, "phase": phase, "train": metrics, "validation": validation}
@@ -625,14 +664,16 @@ def main() -> None:
     write_json(
         output_dir / "training_report.json",
         {
-            "method": "high/low fixed-endpoint full-EMA JEPA-SAE",
+            "method": "high/low random-pair horizon-conditioned full-EMA JEPA-SAE",
             "architecture": {
                 "id": ARCHITECTURE_ID,
                 "d_high": cfg.d_high,
                 "d_low": cfg.d_low,
                 "k_high": cfg.k_high,
                 "k_low": cfg.k_low,
-                "target_position": cfg.window_size - 1,
+                "max_span_length": cfg.max_span_length,
+                "max_horizon": cfg.max_span_length - 1,
+                "conditioning": "explicit token horizon h=t-k",
                 "high_role": "high-only reconstruction plus endpoint JEPA prediction",
                 "low_role": "incremental full reconstruction only",
                 "initialization": "from Pile activation mean/RMS; no unsplit SAE",
@@ -641,8 +682,14 @@ def main() -> None:
             "data": {
                 "dataset": manifest["dataset"],
                 "fingerprint": fingerprint,
-                "n_train_windows": manifest["train"]["windows"],
-                "n_validation_windows": manifest["validation"]["windows"],
+                "sampling": "random span length, endpoint, and non-endpoint context",
+                "min_span_length": manifest["min_span_length"],
+                "sequence_length": manifest["sequence_length"],
+                "burn_in_tokens": manifest["burn_in_tokens"],
+                "n_train_sequences": manifest["train"]["sequences"],
+                "n_validation_sequences": manifest["validation"]["sequences"],
+                "n_train_positions": manifest["train"]["positions"],
+                "n_validation_positions": manifest["validation"]["positions"],
             },
             "accelerator": {
                 "device": str(device),

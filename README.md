@@ -1,25 +1,25 @@
-# High/low fixed-endpoint JEPA-SAE
+# High/low random-pair horizon JEPA-SAE
 
 LLMの同一系列にあるresidual trajectoryから、endpointを予測できるhigh-level
 sparse featuresと、再構成の細部を補うlow-level sparse featuresを分けて学習します。
 
-```text
-residual h_k
-    │
-    ├─ E_high ─ z_k^high ─ predictor(z_k^high, k) ─ z_T^high
-    │                         endpoint JEPA supervision
-    │
-    └─ E_low  ─ z_k^low
-              reconstruction detail only
+長い連続residual列からspan長`L`とendpoint `t`を選び、span内の`k<t`を
+contextとしてサンプリングします。predictorへ渡すのは`h=t-k`だけで、固定window
+番号や境界は渡しません。
 
-h_T ≈ bias + D_high(z_T^high) + D_low(z_T^low)
+```text
+long residual sequence: x_0 ... x_(t-h) ... x_t ...
+
+z_context = E_online(x_(t-h))
+z_target  = stopgrad(E_EMA(x_t))
+z_hat_t   = P(z_context, horizon=h)
 ```
 
 predictorはlatent endpoint codeだけで学習します。予測codeをdecoderへ通した
 residual reconstructionは学習損失に含めず、評価・因果介入だけに使います。
 
-学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、position-only学習
-モデルはありません。position-onlyとshuffled-contextは、同じ学習済みpredictorへ
+学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、horizon-only学習
+モデルはありません。horizon-onlyとshuffled-contextは、同じ学習済みpredictorへ
 入力を変えて作る評価時null controlです。
 
 ## Quickstart
@@ -52,7 +52,10 @@ bash scripts/transition_jepa_quickstart.sh
 |---|---:|
 | frozen LLM | `EleutherAI/pythia-6.9b-deduped` |
 | layer | 16 |
-| window | 32 token |
+| maximum sampled span | 32 token（最大horizon 31） |
+| stored residual sequence | 320 token、32 token burn-in |
+| sampled span | `L ~ Uniform(2, WINDOW_SIZE)` |
+| pair batch | 160、各span内でcontextを一様サンプル |
 | dictionary | 32,768 features |
 | total sparsity | Top-K 64 |
 | high / low | 20% / 80% |
@@ -61,7 +64,9 @@ bash scripts/transition_jepa_quickstart.sh
 | MMLU | full 14,042-question test split、question-locked split |
 | arithmetic | BF16 autocast + TF32 + fused AdamW |
 
-`WINDOW_SIZE`は任意に変更できます。
+`WINDOW_SIZE`はmaximum span length、`MIN_SPAN_LENGTH`はminimum span lengthです。
+学習時は`L`をこの範囲から選び、span内の非endpoint位置をcontextとして一様に選びます。
+したがってhorizonのsupportは`1..WINDOW_SIZE-1`です。
 
 ```bash
 WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \
@@ -70,8 +75,8 @@ bash scripts/transition_jepa_quickstart.sh
 
 ## 8-stage pipeline
 
-1. document-disjointなPile train/validation residualを抽出
-2. high/low full-EMA endpoint JEPA-SAEを学習
+1. document-disjointな長いPile train/validation residual sequenceを抽出
+2. random `(context, endpoint, horizon)` pairでhigh/low full-EMA JEPA-SAEを学習
 3. balanced MMLU probeと因果pairを生成
 4. MMLU residual trajectoryを抽出
 5. frozen LLMのzero-shot MMLU accuracyを測定
@@ -79,8 +84,8 @@ bash scripts/transition_jepa_quickstart.sh
 7. forecastable high featuresをpatch、ablate、norm-matched random ablate
 8. PNG、PDF、CSV、JSON、HTMLレポートを生成
 
-既存のhigh/low checkpoint、Pile activation、MMLU activationはそのまま再利用できます。
-今回のOnline-matched評価だけやり直す場合はstage 6から実行してください。
+旧固定window形式のPile activationとcheckpointは新方式とは互換性がないため、最初の
+runはstage 1から実行してください。新形式で学習済みならstage 6から評価だけ再実行できます。
 
 ```bash
 START_STAGE=6 RUN_DIR=runs/high-low-jepa-pile \
@@ -99,8 +104,8 @@ bash scripts/transition_jepa_quickstart.sh
 ```bash
 MODEL=EleutherAI/pythia-70m-deduped \
 LAYER=3 WINDOW_SIZE=16 D_SAE=2048 K=32 PREDICTOR_WIDTH=64 \
-PILE_TRAIN_WINDOWS=4096 PILE_VALIDATION_WINDOWS=512 \
-PILE_SHARD_WINDOWS=512 TRAIN_STEPS=300 SAE_WARMUP_STEPS=100 \
+PILE_TRAIN_POSITIONS=65536 PILE_VALIDATION_POSITIONS=8192 \
+PILE_SHARD_POSITIONS=8192 TRAIN_STEPS=300 SAE_WARMUP_STEPS=100 \
 MMLU_MAX_QUESTIONS=256 PAIRS=8 PAIR_POOL_SIZE=128 \
 LOSS_RECOVERED_INPUTS=2 RUN_DIR=runs/smoke \
 bash scripts/transition_jepa_quickstart.sh
@@ -125,16 +130,16 @@ encoder/decoderと最終EMA encoder/decoderを並べて評価します。
 ## 評価2: 提案手法は本当にcontextを使うか
 
 主要評価は、学習時と同じOnline-matched経路
-`P(E_online(h_k), k) -> E_EMA(h_T)`です。距離別に以下を比較します。
+`P(E_online(x_(t-h)), h) -> E_EMA(x_t)`です。距離別に以下を比較します。
 
 - online contextを使うlearned predictor
 - 別MMLU問題のonline context codeを入れるshuffled-context null
-- context projectionをゼロにするposition-only null
+- context projectionをゼロにするhorizon-only null
 - predictorなしのonline context-to-EMA endpoint cosine
 
-`learned - shuffled`と`learned - position-only`にはquestion-group bootstrap 95% CIを
+`learned - shuffled`と`learned - horizon-only`にはquestion-group bootstrap 95% CIを
 付けます。最長horizonで両方のCI下限が0より大きいことを主要な有効性判定とします。
-`P(E_EMA(h_k), k) -> E_EMA(h_T)`も、学習時に使っていないEMA-context互換性の
+`P(E_EMA(x_(t-h)), h) -> E_EMA(x_t)`も、学習時に使っていないEMA-context互換性の
 副次評価として同じグラフに表示します。
 
 ## 評価3: MMLU semantics / context / syntax

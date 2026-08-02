@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from shared_residual.transition_jepa_sae import (
     TransitionJEPAConfig,
@@ -13,7 +14,7 @@ def make_model() -> TransitionJEPASAE:
             d_in=8,
             d_sae=20,
             k=5,
-            window_size=6,
+            max_span_length=6,
             predictor_width=8,
             high_fraction=0.2,
         )
@@ -38,9 +39,13 @@ def test_only_high_low_partition_exists() -> None:
 
 def test_prediction_supervises_only_high_endpoint() -> None:
     model = make_model()
-    outputs = model(torch.randn(2, 6, 8))
-    assert outputs["predicted_codes"].shape == (2, 5, 4)
-    assert outputs["target_codes"].shape == (2, 5, 4)
+    outputs = model(
+        torch.randn(2, 8),
+        torch.randn(2, 8),
+        torch.tensor([1, 5]),
+    )
+    assert outputs["predicted_codes"].shape == (2, 4)
+    assert outputs["target_codes"].shape == (2, 4)
     assert outputs["target_low_code"].shape == (2, 16)
     expected = outputs["online_high_reconstruction"] + model.decode_low(
         outputs["online_target_low"], ema=False, add_bias=False
@@ -48,18 +53,27 @@ def test_prediction_supervises_only_high_endpoint() -> None:
     assert torch.allclose(outputs["online_target_reconstruction"], expected)
 
 
-def test_position_only_control_is_independent_of_context_code() -> None:
+def test_horizon_only_control_is_independent_of_context_code() -> None:
     model = make_model()
-    positions = torch.arange(model.cfg.window_size - 1)
-    first = torch.randn(2, model.cfg.window_size - 1, model.cfg.d_high)
+    horizons = torch.arange(model.cfg.max_span_length - 1, 0, -1)
+    first = torch.randn(2, model.cfg.max_span_length - 1, model.cfg.d_high)
     second = torch.randn_like(first)
     first_prediction = model.predict_from_code(
-        first, positions, use_context=False
+        first, horizons, use_context=False
     )
     second_prediction = model.predict_from_code(
-        second, positions, use_context=False
+        second, horizons, use_context=False
     )
     assert torch.allclose(first_prediction, second_prediction)
+
+
+def test_pair_predictor_uses_explicit_per_sample_horizon() -> None:
+    model = make_model()
+    context = torch.randn(3, model.cfg.d_high)
+    output = model.predict_from_code(context, torch.tensor([1, 3, 5]))
+    assert output.shape == (3, model.cfg.d_high)
+    with pytest.raises(ValueError):
+        model.predict_from_code(context, torch.tensor([0, 3, 5]))
 
 
 def test_online_forecast_encoder_matches_online_high_partition() -> None:
@@ -73,7 +87,9 @@ def test_loss_updates_online_sae_and_predictor_not_ema() -> None:
     model = make_model()
     loss, metrics = transition_jepa_loss(
         model,
-        torch.randn(4, 6, 8),
+        torch.randn(4, 8),
+        torch.randn(4, 8),
+        torch.tensor([1, 2, 3, 5]),
         prediction_weight=1.0,
     )
     loss.backward()

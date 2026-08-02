@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# High/low endpoint JEPA-SAE on one RTX 4090, CUDA 12.1 / torch 2.5.1.
+# High/low random-pair horizon JEPA-SAE on one RTX 4090, CUDA 12.1 / torch 2.5.1.
 MODEL="${MODEL:-EleutherAI/pythia-6.9b-deduped}"
 default_safetensors_revision() {
   case "$1" in
@@ -22,6 +22,12 @@ if (( WINDOW_SIZE < 2 )); then
   echo "WINDOW_SIZE must be at least 2" >&2
   exit 2
 fi
+MIN_SPAN_LENGTH="${MIN_SPAN_LENGTH:-2}"
+if (( MIN_SPAN_LENGTH < 2 || MIN_SPAN_LENGTH > WINDOW_SIZE )); then
+  echo "MIN_SPAN_LENGTH must lie in [2, WINDOW_SIZE]" >&2
+  exit 2
+fi
+BURN_IN_TOKENS="${BURN_IN_TOKENS:-$WINDOW_SIZE}"
 
 D_SAE="${D_SAE:-32768}"
 K="${K:-64}"
@@ -32,25 +38,22 @@ TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-4000}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-1000}"
 
-DEFAULT_WINDOW_BATCH_SIZE=$((320 / WINDOW_SIZE))
-if (( DEFAULT_WINDOW_BATCH_SIZE < 1 )); then DEFAULT_WINDOW_BATCH_SIZE=1; fi
-BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_WINDOW_BATCH_SIZE}"
+DEFAULT_PAIR_BATCH_SIZE=160
+BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_PAIR_BATCH_SIZE}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
 PILE_EXTRACT_BATCH_SIZE="${PILE_EXTRACT_BATCH_SIZE:-8}"
-DEFAULT_WINDOWS_PER_SEQUENCE=$((320 / WINDOW_SIZE))
-if (( DEFAULT_WINDOWS_PER_SEQUENCE < 1 )); then DEFAULT_WINDOWS_PER_SEQUENCE=1; fi
-PILE_SEQUENCE_LENGTH="${PILE_SEQUENCE_LENGTH:-$((WINDOW_SIZE * DEFAULT_WINDOWS_PER_SEQUENCE))}"
-if (( PILE_SEQUENCE_LENGTH % WINDOW_SIZE != 0 )); then
-  echo "PILE_SEQUENCE_LENGTH must be divisible by WINDOW_SIZE" >&2
+PILE_SEQUENCE_LENGTH="${PILE_SEQUENCE_LENGTH:-320}"
+if (( PILE_SEQUENCE_LENGTH < BURN_IN_TOKENS + WINDOW_SIZE )); then
+  echo "PILE_SEQUENCE_LENGTH must be at least BURN_IN_TOKENS + WINDOW_SIZE" >&2
   exit 2
 fi
 
 PILE_TRAIN_POSITIONS="${PILE_TRAIN_POSITIONS:-5242880}"
 PILE_VALIDATION_POSITIONS="${PILE_VALIDATION_POSITIONS:-163840}"
 PILE_SHARD_POSITIONS="${PILE_SHARD_POSITIONS:-40960}"
-PILE_TRAIN_WINDOWS="${PILE_TRAIN_WINDOWS:-}"
-PILE_VALIDATION_WINDOWS="${PILE_VALIDATION_WINDOWS:-}"
-PILE_SHARD_WINDOWS="${PILE_SHARD_WINDOWS:-}"
+PILE_TRAIN_SEQUENCES="${PILE_TRAIN_SEQUENCES:-}"
+PILE_VALIDATION_SEQUENCES="${PILE_VALIDATION_SEQUENCES:-}"
+PILE_SHARD_SEQUENCES="${PILE_SHARD_SEQUENCES:-}"
 PILE_DISK_RESERVE_GIB="${PILE_DISK_RESERVE_GIB:-5}"
 PILE_SKIP_DISK_SPACE_CHECK="${PILE_SKIP_DISK_SPACE_CHECK:-0}"
 PILE_DATASET="${PILE_DATASET:-EleutherAI/the_pile_deduplicated}"
@@ -60,7 +63,9 @@ PILE_DATASET_TRUST_REMOTE_CODE="${PILE_DATASET_TRUST_REMOTE_CODE:-0}"
 PILE_REQUIRE_ALL_DOMAINS="${PILE_REQUIRE_ALL_DOMAINS:-0}"
 
 EVAL_EXTRACT_BATCH_SIZE="${EVAL_EXTRACT_BATCH_SIZE:-8}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-$DEFAULT_WINDOW_BATCH_SIZE}"
+DEFAULT_EVAL_BATCH_SIZE=$((320 / WINDOW_SIZE))
+if (( DEFAULT_EVAL_BATCH_SIZE < 1 )); then DEFAULT_EVAL_BATCH_SIZE=1; fi
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-$DEFAULT_EVAL_BATCH_SIZE}"
 EVAL_MAXIMUM_VALIDATION_BATCHES="${EVAL_MAXIMUM_VALIDATION_BATCHES:-0}"
 PROBE_MAX_DIM="${PROBE_MAX_DIM:-1024}"
 MMLU_MAX_QUESTIONS="${MMLU_MAX_QUESTIONS:-0}"
@@ -106,7 +111,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: W=$WINDOW_SIZE, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, max_horizon=$((WINDOW_SIZE - 1)), sequence=$PILE_SEQUENCE_LENGTH, burn_in=$BURN_IN_TOKENS, D=$D_SAE, K=$K, high=$HIGH_FRACTION, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -133,24 +138,26 @@ PILE_BUDGET_ARGS=(
   --shard-positions "$PILE_SHARD_POSITIONS"
   --disk-reserve-gib "$PILE_DISK_RESERVE_GIB"
 )
-if [[ -n "$PILE_TRAIN_WINDOWS" ]]; then PILE_BUDGET_ARGS+=(--train-windows "$PILE_TRAIN_WINDOWS"); fi
-if [[ -n "$PILE_VALIDATION_WINDOWS" ]]; then PILE_BUDGET_ARGS+=(--validation-windows "$PILE_VALIDATION_WINDOWS"); fi
-if [[ -n "$PILE_SHARD_WINDOWS" ]]; then PILE_BUDGET_ARGS+=(--shard-windows "$PILE_SHARD_WINDOWS"); fi
+if [[ -n "$PILE_TRAIN_SEQUENCES" ]]; then PILE_BUDGET_ARGS+=(--train-sequences "$PILE_TRAIN_SEQUENCES"); fi
+if [[ -n "$PILE_VALIDATION_SEQUENCES" ]]; then PILE_BUDGET_ARGS+=(--validation-sequences "$PILE_VALIDATION_SEQUENCES"); fi
+if [[ -n "$PILE_SHARD_SEQUENCES" ]]; then PILE_BUDGET_ARGS+=(--shard-sequences "$PILE_SHARD_SEQUENCES"); fi
 if [[ "$PILE_SKIP_DISK_SPACE_CHECK" == "1" ]]; then PILE_BUDGET_ARGS+=(--skip-disk-space-check); fi
 
 if (( START_STAGE <= 1 && END_STAGE >= 1 )); then
-  echo "[1/8] Extract document-disjoint Pile residual windows"
+  echo "[1/8] Extract document-disjoint long Pile residual sequences"
   sr-extract-pile \
     "${MODEL_LOAD_ARGS[@]}" "${PILE_DATA_ARGS[@]}" \
     --output-dir "$RUN_DIR/pile-activations" \
     --layer "$LAYER" --hook-point post \
-    --window-size "$WINDOW_SIZE" --sequence-length "$PILE_SEQUENCE_LENGTH" \
+    --min-span-length "$MIN_SPAN_LENGTH" --max-span-length "$WINDOW_SIZE" \
+    --sequence-length "$PILE_SEQUENCE_LENGTH" \
+    --burn-in-tokens "$BURN_IN_TOKENS" \
     "${PILE_BUDGET_ARGS[@]}" \
     --batch-size "$PILE_EXTRACT_BATCH_SIZE" --dtype bfloat16 --seed "$SEED"
 fi
 
 if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
-  echo "[2/8] Train the high/low full-EMA endpoint JEPA-SAE"
+  echo "[2/8] Train the high/low full-EMA random-pair horizon JEPA-SAE"
   sr-train-transition-jepa-sae \
     --activation-manifest "$ACTIVATION_MANIFEST" \
     --output-dir "$RUN_DIR/model" \

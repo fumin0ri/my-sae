@@ -54,7 +54,7 @@ def test_causal_pair_selection_skips_short_prefixes_before_limit() -> None:
     selected, skipped, examined = select_eligible_pairs(
         rows,
         LengthTokenizer(),
-        window_size=4,
+        max_span_length=4,
         source_key="source_text",
         target_key="target_text",
         maximum=2,

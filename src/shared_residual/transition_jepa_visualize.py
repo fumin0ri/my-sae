@@ -19,7 +19,7 @@ HIGH = "#059669"
 LOW = "#84cc16"
 TOTAL = "#2563eb"
 NULL = "#94a3b8"
-POSITION = "#d97706"
+HORIZON = "#d97706"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -193,10 +193,10 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
     )
     axes[0].plot(
         horizon,
-        [row["position_only_cosine"] for row in rows],
-        color=POSITION,
+        [row["horizon_only_cosine"] for row in rows],
+        color=HORIZON,
         linestyle=":",
-        label="Position only",
+        label="Horizon only",
     )
     axes[0].plot(
         horizon,
@@ -213,15 +213,15 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
         label="EMA shuffled",
     )
     gain_shuffled = [row["online_gain_over_shuffled"]["mean"] for row in rows]
-    gain_position = [
-        row["online_gain_over_position_only"]["mean"] for row in rows
+    gain_horizon = [
+        row["online_gain_over_horizon_only"]["mean"] for row in rows
     ]
     ema_gain_shuffled = [row["ema_gain_over_shuffled"]["mean"] for row in rows]
-    ema_gain_position = [
-        row["ema_gain_over_position_only"]["mean"] for row in rows
+    ema_gain_horizon = [
+        row["ema_gain_over_horizon_only"]["mean"] for row in rows
     ]
     axes[1].plot(horizon, gain_shuffled, marker="o", color=HIGH, label="vs shuffled")
-    axes[1].plot(horizon, gain_position, marker="o", color=POSITION, label="vs position")
+    axes[1].plot(horizon, gain_horizon, marker="o", color=HORIZON, label="vs horizon")
     axes[1].fill_between(
         horizon,
         [row["online_gain_over_shuffled"]["ci95_low"] for row in rows],
@@ -231,9 +231,9 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
     )
     axes[1].fill_between(
         horizon,
-        [row["online_gain_over_position_only"]["ci95_low"] for row in rows],
-        [row["online_gain_over_position_only"]["ci95_high"] for row in rows],
-        color=POSITION,
+        [row["online_gain_over_horizon_only"]["ci95_low"] for row in rows],
+        [row["online_gain_over_horizon_only"]["ci95_high"] for row in rows],
+        color=HORIZON,
         alpha=0.1,
     )
     axes[1].plot(
@@ -245,10 +245,10 @@ def forecast_plot(report: dict[str, Any], figures: Path) -> None:
     )
     axes[1].plot(
         horizon,
-        ema_gain_position,
+        ema_gain_horizon,
         color="#a78bfa",
         linestyle=":",
-        label="EMA vs position",
+        label="EMA vs horizon",
     )
     axes[1].axhline(0, color="#334155", linewidth=1)
     axes[2].plot(
@@ -417,7 +417,7 @@ def write_html(
     )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>High/low JEPA-SAE evaluation</title>
+<title>High/low random-pair horizon JEPA-SAE evaluation</title>
 <style>
 :root{{--bg:#f5f7fb;--card:#fff;--fg:#172033;--muted:#64748b;--line:#dbe2ea}}
 *{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
@@ -427,15 +427,15 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 .metric span{{display:block;color:var(--muted);font-size:.84rem}}.metric strong{{font-size:1.35rem}}
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
-<h1>High/low endpoint JEPA-SAE</h1>
-<p class="subtitle">The primary forecast exactly matches training: P(E_online(h_k), k) to E_EMA(h_T). EMA-context forecasting is retained as a secondary compatibility test. Conventional SAE metrics compare online and EMA pairs on identical residuals.</p>
+<h1>High/low random-pair horizon JEPA-SAE</h1>
+<p class="subtitle">The primary forecast matches training: P(E_online(x_(t-h)), h) to E_EMA(x_t). EMA-context forecasting is retained as a secondary compatibility test. Conventional SAE metrics compare online and EMA pairs on identical residuals.</p>
 <div class="metrics">
 <div class="metric"><span>Online / EMA full FVE</span><strong>{fmt(online_quality['fraction_variance_explained'])} / {fmt(ema_quality['fraction_variance_explained'])}</strong></div>
 <div class="metric"><span>Online / EMA cosine</span><strong>{fmt(online_quality['reconstruction_cosine'])} / {fmt(ema_quality['reconstruction_cosine'])}</strong></div>
 <div class="metric"><span>Online / EMA alive</span><strong>{fmt(online_quality['alive_feature_fraction'])} / {fmt(ema_quality['alive_feature_fraction'])}</strong></div>
 <div class="metric"><span>Online / EMA loss recovered</span><strong>{online_recovered} / {ema_recovered}</strong></div>
 <div class="metric"><span>Online gain vs shuffled</span><strong>{fmt(longest['online_gain_over_shuffled']['mean'])}</strong></div>
-<div class="metric"><span>Online gain vs position</span><strong>{fmt(longest['online_gain_over_position_only']['mean'])}</strong></div>
+<div class="metric"><span>Online gain vs horizon prior</span><strong>{fmt(longest['online_gain_over_horizon_only']['mean'])}</strong></div>
 <div class="metric"><span>EMA compatibility gain vs shuffled</span><strong>{fmt(longest['ema_gain_over_shuffled']['mean'])}</strong></div>
 <div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>
 </div>{figure_html}

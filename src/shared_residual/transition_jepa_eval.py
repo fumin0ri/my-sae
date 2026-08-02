@@ -48,7 +48,7 @@ HORIZON_METRICS = (
     "ema_context_target_cosine",
     "ema_code_cosine",
     "ema_shuffled_context_cosine",
-    "position_only_cosine",
+    "horizon_only_cosine",
     "online_code_nrmse",
     "ema_code_nrmse",
     "online_support_precision",
@@ -99,10 +99,11 @@ def evaluate_sae_quality(
     }
     alignment: dict[str, float] = defaultdict(float)
     positions = 0
-    windows = 0
+    residuals = 0
     batches = 0
+    residual_batch_size = batch_size * model.cfg.max_span_length
     for x in tqdm(
-        validation_batches(root, manifest, batch_size, maximum_batches),
+        validation_batches(root, manifest, residual_batch_size, maximum_batches),
         desc="standard SAE metrics",
     ):
         x = x.to(device, dtype=model.pre_bias.dtype, non_blocking=True)
@@ -166,8 +167,9 @@ def evaluate_sae_quality(
             F.cosine_similarity(online_code.float(), ema_code.float(), dim=-1).sum()
         )
         alignment["support_jaccard_sum"] += float((intersection / union).sum())
-        positions += x.shape[0] * x.shape[1]
-        windows += x.shape[0]
+        batch_positions = x.numel() // model.cfg.d_in
+        positions += batch_positions
+        residuals += batch_positions
         batches += 1
     if positions == 0:
         raise ValueError("no Pile validation activations were evaluated")
@@ -194,7 +196,7 @@ def evaluate_sae_quality(
             "alive_feature_fraction": float(alive.float().mean()),
             "dead_feature_fraction": float((~alive).float().mean()),
             "n_positions": positions,
-            "n_windows": windows,
+            "n_residuals": residuals,
             "n_batches": batches,
         }
 
@@ -398,7 +400,9 @@ def encode_mmlu_representations(
     amp_dtype: str,
 ) -> dict[str, torch.Tensor]:
     representations = _allocate_representations(len(x), model)
-    position_zero = torch.zeros(1, dtype=torch.long, device=device)
+    longest_horizon = torch.full(
+        (1,), model.cfg.max_span_length - 1, dtype=torch.long, device=device
+    )
     for start in tqdm(range(0, len(x), batch_size), desc="MMLU representations"):
         end = min(start + batch_size, len(x))
         batch = x[start:end].to(
@@ -417,16 +421,16 @@ def encode_mmlu_representations(
             )
             predicted_online = model.predict_from_code(
                 context_online_high,
-                context_positions=position_zero,
+                horizons=longest_horizon.expand(len(batch)),
                 use_context=True,
                 sparse_output=True,
-            )[:, 0]
+            )
             predicted_ema = model.predict_from_code(
                 context_ema_high,
-                context_positions=position_zero,
+                horizons=longest_horizon.expand(len(batch)),
                 use_context=True,
                 sparse_output=True,
-            )[:, 0]
+            )
         values = {
             "context_high_online": context_online_high,
             "predicted_endpoint_high_online": predicted_online,
@@ -453,14 +457,16 @@ def collect_horizon_statistics(
     amp_dtype: str,
     seed: int,
 ) -> dict[str, torch.Tensor]:
-    n_contexts = model.cfg.window_size - 1
+    n_contexts = model.cfg.max_span_length - 1
     statistics = {
         name: torch.empty((len(test_indices), n_contexts), dtype=torch.float32)
         for name in HORIZON_METRICS
     }
     permutation = different_group_permutation(groups, seed)
     shuffled_indices = [test_indices[int(index)] for index in permutation]
-    positions = torch.arange(n_contexts, dtype=torch.long, device=device)
+    horizons = torch.arange(
+        n_contexts, 0, -1, dtype=torch.long, device=device
+    )
     for start in tqdm(
         range(0, len(test_indices), batch_size), desc="locked forecast nulls"
     ):
@@ -479,10 +485,10 @@ def collect_horizon_statistics(
             target_high, _ = model.split_code(model.encode_ema(batch[:, -1]))
             target = target_high[:, None].expand(-1, n_contexts, -1)
             online_prediction = model.predict_from_code(
-                online_context_high, positions, use_context=True
+                online_context_high, horizons, use_context=True
             )
             ema_prediction = model.predict_from_code(
-                ema_context_high, positions, use_context=True
+                ema_context_high, horizons, use_context=True
             )
             sparse_online_prediction = topk_relu(
                 online_prediction, model.cfg.k_high
@@ -490,8 +496,8 @@ def collect_horizon_statistics(
             sparse_ema_prediction = topk_relu(
                 ema_prediction, model.cfg.k_high
             )
-            position_only = model.predict_from_code(
-                online_context_high, positions, use_context=False
+            horizon_only = model.predict_from_code(
+                online_context_high, horizons, use_context=False
             )
             shuffled_online_high, _ = model.split_code(
                 model.encode(shuffled_batch[:, :-1])
@@ -500,10 +506,10 @@ def collect_horizon_statistics(
                 model.encode_ema(shuffled_batch[:, :-1])
             )
             shuffled_online_prediction = model.predict_from_code(
-                shuffled_online_high, positions, use_context=True
+                shuffled_online_high, horizons, use_context=True
             )
             shuffled_ema_prediction = model.predict_from_code(
-                shuffled_ema_high, positions, use_context=True
+                shuffled_ema_high, horizons, use_context=True
             )
             online_predicted_residual = model.decode_high(
                 sparse_online_prediction, ema=True, add_bias=True
@@ -550,8 +556,8 @@ def collect_horizon_statistics(
             "ema_shuffled_context_cosine": F.cosine_similarity(
                 shuffled_ema_prediction.float(), target32, dim=-1
             ),
-            "position_only_cosine": F.cosine_similarity(
-                position_only.float(), target32, dim=-1
+            "horizon_only_cosine": F.cosine_similarity(
+                horizon_only.float(), target32, dim=-1
             ),
             "online_code_nrmse": (
                 online_prediction.float() - target32
@@ -598,7 +604,7 @@ def build_horizon_curve(
         ema_shuffled = statistics[
             "ema_shuffled_context_cosine"
         ][:, context_position].numpy()
-        position_only = statistics["position_only_cosine"][:, context_position].numpy()
+        horizon_only = statistics["horizon_only_cosine"][:, context_position].numpy()
         online_residual_error = statistics[
             "online_residual_error"
         ][:, context_position]
@@ -606,7 +612,6 @@ def build_horizon_curve(
         residual_energy = statistics["residual_energy"][:, context_position]
         rows.append(
             {
-                "context_position": context_position,
                 "horizon": n_contexts - context_position,
                 "online_context_target_cosine": float(
                     statistics["online_context_target_cosine"][
@@ -622,12 +627,12 @@ def build_horizon_curve(
                 ),
                 "ema_code_cosine": float(ema_learned.mean()),
                 "ema_shuffled_context_cosine": float(ema_shuffled.mean()),
-                "position_only_cosine": float(position_only.mean()),
+                "horizon_only_cosine": float(horizon_only.mean()),
                 "online_gain_over_shuffled": clustered_mean_ci(
                     learned - shuffled, groups, seed + 101 * context_position
                 ),
-                "online_gain_over_position_only": clustered_mean_ci(
-                    learned - position_only,
+                "online_gain_over_horizon_only": clustered_mean_ci(
+                    learned - horizon_only,
                     groups,
                     seed + 10007 + 101 * context_position,
                 ),
@@ -636,8 +641,8 @@ def build_horizon_curve(
                     groups,
                     seed + 20011 + 101 * context_position,
                 ),
-                "ema_gain_over_position_only": clustered_mean_ci(
-                    ema_learned - position_only,
+                "ema_gain_over_horizon_only": clustered_mean_ci(
+                    ema_learned - horizon_only,
                     groups,
                     seed + 30011 + 101 * context_position,
                 ),
@@ -721,7 +726,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate conventional SAE quality and whether high-code endpoint "
-            "forecasting beats shuffled and position-only controls"
+            "forecasting beats shuffled and horizon-only controls"
         )
     )
     parser.add_argument("--activation-manifest", required=True)
@@ -772,8 +777,8 @@ def main() -> None:
     fingerprint = manifest_fingerprint(manifest)
     if checkpoint.get("data_fingerprint") != fingerprint:
         raise ValueError("checkpoint and Pile activation manifest fingerprints differ")
-    if model.cfg.window_size != int(manifest["window_size"]):
-        raise ValueError("checkpoint and Pile activation window sizes differ")
+    if model.cfg.max_span_length != int(manifest["max_span_length"]):
+        raise ValueError("checkpoint and Pile maximum span lengths differ")
 
     amp_dtype = args.amp_dtype if device.type == "cuda" else "none"
     sae_quality = evaluate_sae_quality(
@@ -792,11 +797,11 @@ def main() -> None:
     if len(x) != len(metadata):
         raise ValueError("MMLU activation rows and metadata differ")
     if x.ndim != 3 or x.shape[1:] != (
-        model.cfg.window_size,
+        model.cfg.max_span_length,
         model.cfg.d_in,
     ):
         raise ValueError(
-            "MMLU activations must match checkpoint window size and residual width"
+            "MMLU activation span must match checkpoint max span and residual width"
         )
     extraction = bundle.get("config", {})
     source_config = checkpoint.get("source_config", {})
@@ -894,13 +899,13 @@ def main() -> None:
     longest = horizon_curve[0]
     report = {
         "evaluation_protocol": {
-            "goal": "conventional SAE quality plus endpoint-forecast validity",
+            "goal": "conventional SAE quality plus horizon-conditioned forecast validity",
             "sae_comparison": "online and EMA high/low encoder-decoder pairs",
-            "primary_forecast": "P(E_online(h_k), k) -> E_EMA(h_T)",
-            "secondary_forecast": "P(E_EMA(h_k), k) -> E_EMA(h_T)",
+            "primary_forecast": "P(E_online(x_{t-h}), h) -> E_EMA(x_t)",
+            "secondary_forecast": "P(E_EMA(x_{t-h}), h) -> E_EMA(x_t)",
             "forecast_controls": [
                 "different-question shuffled context",
-                "position-only predictor",
+                "horizon-only predictor",
                 "raw context-to-endpoint cosine",
             ],
             "mmlu_split": "question-grouped development/locked test",
@@ -916,14 +921,14 @@ def main() -> None:
             "online_positive_over_shuffled": (
                 longest["online_gain_over_shuffled"]["ci95_low"] > 0
             ),
-            "online_positive_over_position_only": (
-                longest["online_gain_over_position_only"]["ci95_low"] > 0
+            "online_positive_over_horizon_only": (
+                longest["online_gain_over_horizon_only"]["ci95_low"] > 0
             ),
             "ema_positive_over_shuffled": (
                 longest["ema_gain_over_shuffled"]["ci95_low"] > 0
             ),
-            "ema_positive_over_position_only": (
-                longest["ema_gain_over_position_only"]["ci95_low"] > 0
+            "ema_positive_over_horizon_only": (
+                longest["ema_gain_over_horizon_only"]["ci95_low"] > 0
             ),
         },
         "mmlu_probe_accuracy": probes,
@@ -950,7 +955,6 @@ def main() -> None:
         "w", encoding="utf-8", newline=""
     ) as handle:
         fieldnames = [
-            "context_position",
             "horizon",
             "online_context_target_cosine",
             "online_code_cosine",
@@ -958,19 +962,19 @@ def main() -> None:
             "ema_context_target_cosine",
             "ema_code_cosine",
             "ema_shuffled_context_cosine",
-            "position_only_cosine",
+            "horizon_only_cosine",
             "online_gain_over_shuffled",
             "online_gain_over_shuffled_ci95_low",
             "online_gain_over_shuffled_ci95_high",
-            "online_gain_over_position_only",
-            "online_gain_over_position_only_ci95_low",
-            "online_gain_over_position_only_ci95_high",
+            "online_gain_over_horizon_only",
+            "online_gain_over_horizon_only_ci95_low",
+            "online_gain_over_horizon_only_ci95_high",
             "ema_gain_over_shuffled",
             "ema_gain_over_shuffled_ci95_low",
             "ema_gain_over_shuffled_ci95_high",
-            "ema_gain_over_position_only",
-            "ema_gain_over_position_only_ci95_low",
-            "ema_gain_over_position_only_ci95_high",
+            "ema_gain_over_horizon_only",
+            "ema_gain_over_horizon_only_ci95_low",
+            "ema_gain_over_horizon_only_ci95_high",
             "online_minus_ema_cosine",
             "online_minus_ema_cosine_ci95_low",
             "online_minus_ema_cosine_ci95_high",
@@ -989,9 +993,9 @@ def main() -> None:
         writer.writeheader()
         for row in horizon_curve:
             online_shuffled = row["online_gain_over_shuffled"]
-            online_position = row["online_gain_over_position_only"]
+            online_horizon = row["online_gain_over_horizon_only"]
             ema_shuffled = row["ema_gain_over_shuffled"]
-            ema_position = row["ema_gain_over_position_only"]
+            ema_horizon = row["ema_gain_over_horizon_only"]
             online_minus_ema = row["online_minus_ema_cosine"]
             writer.writerow(
                 {
@@ -1001,24 +1005,24 @@ def main() -> None:
                         if key
                         not in {
                             "online_gain_over_shuffled",
-                            "online_gain_over_position_only",
+                            "online_gain_over_horizon_only",
                             "ema_gain_over_shuffled",
-                            "ema_gain_over_position_only",
+                            "ema_gain_over_horizon_only",
                             "online_minus_ema_cosine",
                         }
                     },
                     "online_gain_over_shuffled": online_shuffled["mean"],
                     "online_gain_over_shuffled_ci95_low": online_shuffled["ci95_low"],
                     "online_gain_over_shuffled_ci95_high": online_shuffled["ci95_high"],
-                    "online_gain_over_position_only": online_position["mean"],
-                    "online_gain_over_position_only_ci95_low": online_position["ci95_low"],
-                    "online_gain_over_position_only_ci95_high": online_position["ci95_high"],
+                    "online_gain_over_horizon_only": online_horizon["mean"],
+                    "online_gain_over_horizon_only_ci95_low": online_horizon["ci95_low"],
+                    "online_gain_over_horizon_only_ci95_high": online_horizon["ci95_high"],
                     "ema_gain_over_shuffled": ema_shuffled["mean"],
                     "ema_gain_over_shuffled_ci95_low": ema_shuffled["ci95_low"],
                     "ema_gain_over_shuffled_ci95_high": ema_shuffled["ci95_high"],
-                    "ema_gain_over_position_only": ema_position["mean"],
-                    "ema_gain_over_position_only_ci95_low": ema_position["ci95_low"],
-                    "ema_gain_over_position_only_ci95_high": ema_position["ci95_high"],
+                    "ema_gain_over_horizon_only": ema_horizon["mean"],
+                    "ema_gain_over_horizon_only_ci95_low": ema_horizon["ci95_low"],
+                    "ema_gain_over_horizon_only_ci95_high": ema_horizon["ci95_high"],
                     "online_minus_ema_cosine": online_minus_ema["mean"],
                     "online_minus_ema_cosine_ci95_low": online_minus_ema["ci95_low"],
                     "online_minus_ema_cosine_ci95_high": online_minus_ema["ci95_high"],

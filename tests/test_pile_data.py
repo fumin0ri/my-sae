@@ -5,10 +5,12 @@ import pytest
 import torch
 
 from shared_residual.activation_store import (
-    ShuffledShardBatches,
+    ACTIVATION_FORMAT,
+    RandomPairShardBatches,
     load_activation_manifest,
     manifest_fingerprint,
     validation_batches,
+    validation_pair_batches,
 )
 from shared_residual.pile_extract import (
     DEFAULT_SHARD_POSITIONS,
@@ -20,31 +22,29 @@ from shared_residual.pile_extract import (
     document_split,
     estimate_storage_bytes,
     pile_set_name,
-    resolve_window_count,
+    resolve_sequence_count,
 )
 
 
-def make_manifest(tmp_path, window_size=7):
+def make_manifest(tmp_path, sequence_length=12, max_span_length=5):
     for split, count in (("train", 7), ("validation", 5)):
         directory = tmp_path / split
         directory.mkdir()
         torch.save(
             {
                 "activations": torch.arange(
-                    count * window_size * 4,
-                    dtype=torch.float32,
-                ).reshape(count, window_size, 4),
-                "token_ids": torch.zeros(
-                    count,
-                    window_size,
-                    dtype=torch.long,
-                ),
+                    count * sequence_length * 4, dtype=torch.float32
+                ).reshape(count, sequence_length, 4),
+                "token_ids": torch.zeros(count, sequence_length, dtype=torch.long),
                 "source_ids": torch.zeros(count, dtype=torch.int16),
+                "valid_lengths": torch.full(
+                    (count,), sequence_length, dtype=torch.int32
+                ),
             },
             directory / "shard-00000.pt",
         )
     manifest = {
-        "format": "shared-residual-activation-shards-v1",
+        "format": ACTIVATION_FORMAT,
         "dataset": {
             "name": "EleutherAI/the_pile_deduplicated",
             "config": "default",
@@ -53,53 +53,74 @@ def make_manifest(tmp_path, window_size=7):
         "layer": 1,
         "layer_path": "layers.1",
         "hook_point": "post",
-        "window_size": window_size,
+        "max_span_length": max_span_length,
+        "min_span_length": 2,
+        "max_horizon": max_span_length - 1,
+        "sequence_length": sequence_length,
+        "burn_in_tokens": 2,
+        "minimum_valid_length": 2 + max_span_length,
         "d_in": 4,
         "seed": 3,
         "normalization": {"mean": [0.0] * 4, "scalar_rms": 1.0},
         "train": {
-            "windows": 7,
+            "sequences": 7,
+            "positions": 7 * sequence_length,
             "shards": ["train/shard-00000.pt"],
             "domain_counts": {"Pile-CC": 7},
         },
         "validation": {
-            "windows": 5,
+            "sequences": 5,
+            "positions": 5 * sequence_length,
             "shards": ["validation/shard-00000.pt"],
             "domain_counts": {"Pile-CC": 5},
         },
     }
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(manifest),
-        encoding="utf-8",
-    )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return manifest
 
 
-def test_sharded_batches_cycle_without_loading_corpus_at_once(tmp_path) -> None:
+def test_random_pair_batches_follow_random_span_design_and_are_boundary_safe(
+    tmp_path,
+) -> None:
     expected = make_manifest(tmp_path)
     root, manifest = load_activation_manifest(tmp_path)
     assert manifest_fingerprint(manifest) == manifest_fingerprint(expected)
     iterator = iter(
-        ShuffledShardBatches(
-            root,
-            manifest,
-            "train",
-            batch_size=4,
-            seed=9,
-        )
+        RandomPairShardBatches(root, manifest, "train", batch_size=8, seed=9)
     )
-    assert next(iterator).shape == (4, 7, 4)
-    assert next(iterator).shape == (4, 7, 4)
-    held_out = list(validation_batches(root, manifest, 3, 2))
-    assert [len(batch) for batch in held_out] == [3, 2]
+    batch = next(iterator)
+    assert batch["context"].shape == (8, 4)
+    assert batch["target"].shape == (8, 4)
+    assert torch.equal(
+        batch["endpoint_index"] - batch["context_index"], batch["horizon"]
+    )
+    assert torch.all(batch["span_length"] >= manifest["min_span_length"])
+    assert torch.all(batch["span_length"] <= manifest["max_span_length"])
+    assert torch.all(batch["horizon"] < batch["span_length"])
+    assert torch.all(batch["context_index"] >= batch["span_start_index"])
+    assert torch.all(batch["context_index"] < batch["endpoint_index"])
+    assert int(batch["context_index"].min()) >= manifest["burn_in_tokens"]
+    assert int(batch["endpoint_index"].min()) >= (
+        manifest["burn_in_tokens"] + manifest["max_horizon"]
+    )
+
+
+def test_validation_pairs_are_deterministic_and_residuals_exclude_padding(
+    tmp_path,
+) -> None:
+    make_manifest(tmp_path)
+    root, manifest = load_activation_manifest(tmp_path)
+    left = list(validation_pair_batches(root, manifest, 3, 2, seed=11))
+    right = list(validation_pair_batches(root, manifest, 3, 2, seed=11))
+    assert len(left) == len(right) == 2
+    assert torch.equal(left[0]["endpoint_index"], right[0]["endpoint_index"])
+    held_out = list(validation_batches(root, manifest, 20, 2))
+    assert [len(batch) for batch in held_out] == [20, 20]
 
 
 def test_pile_metadata_and_official_mixture() -> None:
     assert pile_set_name({"meta": {"pile_set_name": "ArXiv"}}) == "ArXiv"
-    assert (
-        pile_set_name({"meta": '{"pile_set_name": "Pile-CC"}'})
-        == "Pile-CC"
-    )
+    assert pile_set_name({"meta": '{"pile_set_name": "Pile-CC"}'}) == "Pile-CC"
     assert len(PILE_MIXTURE_WEIGHTS) == 22
     assert abs(sum(PILE_MIXTURE_WEIGHTS.values()) - 1.0) < 1e-9
     assert pile_set_name({"text": "metadata-free Parquet row"}) == "unknown"
@@ -113,7 +134,7 @@ def test_deduplicated_pile_uses_real_hugging_face_config() -> None:
     assert args.dataset_config == "default"
 
 
-def test_pile_parser_accepts_nondefault_window_size() -> None:
+def test_pile_parser_accepts_nondefault_max_span() -> None:
     args = build_parser().parse_args(
         [
             "--model",
@@ -122,45 +143,32 @@ def test_pile_parser_accepts_nondefault_window_size() -> None:
             "out",
             "--layer",
             "1",
-            "--window-size",
+            "--max-span-length",
             "16",
             "--sequence-length",
             "320",
         ]
     )
-    assert args.window_size == 16
-    assert args.train_windows is None
-    assert args.validation_windows is None
-    assert args.shard_windows is None
+    assert args.max_span_length == 16
+    assert args.min_span_length == 2
+    assert args.train_sequences is None
+    assert args.validation_sequences is None
+    assert args.shard_sequences is None
 
 
-def test_position_budget_keeps_window_128_storage_bounded() -> None:
-    train = resolve_window_count(None, DEFAULT_TRAIN_POSITIONS, 128)
-    validation = resolve_window_count(
-        None,
-        DEFAULT_VALIDATION_POSITIONS,
-        128,
-    )
-    shard = resolve_window_count(None, DEFAULT_SHARD_POSITIONS, 128)
-    assert train == 40_960
-    assert validation == 1_280
-    assert shard == 320
-    window_10_bytes = estimate_storage_bytes(
-        524_288 + 16_384,
-        10,
-        4096,
-    )
-    window_128_bytes = estimate_storage_bytes(
-        train + validation,
-        128,
-        4096,
-    )
-    assert abs(window_128_bytes - window_10_bytes) < 2**21
-    assert 40 * 2**30 < window_128_bytes < 45 * 2**30
+def test_position_budget_keeps_storage_bounded() -> None:
+    train = resolve_sequence_count(None, DEFAULT_TRAIN_POSITIONS, 320)
+    validation = resolve_sequence_count(None, DEFAULT_VALIDATION_POSITIONS, 320)
+    shard = resolve_sequence_count(None, DEFAULT_SHARD_POSITIONS, 320)
+    assert train == 16_384
+    assert validation == 512
+    assert shard == 128
+    estimated = estimate_storage_bytes(train + validation, 320, 4096)
+    assert 40 * 2**30 < estimated < 45 * 2**30
 
 
-def test_explicit_window_count_overrides_position_budget() -> None:
-    assert resolve_window_count(123, DEFAULT_TRAIN_POSITIONS, 128) == 123
+def test_explicit_sequence_count_overrides_position_budget() -> None:
+    assert resolve_sequence_count(123, DEFAULT_TRAIN_POSITIONS, 320) == 123
 
 
 def test_shard_write_failure_leaves_no_corrupt_final_file(
@@ -170,8 +178,8 @@ def test_shard_write_failure_leaves_no_corrupt_final_file(
     writer = ShardWriter(
         tmp_path,
         split="train",
-        shard_windows=1,
-        target_windows=1,
+        shard_sequences=1,
+        target_sequences=1,
     )
 
     def fail_after_partial_write(_payload, path) -> None:
@@ -181,8 +189,9 @@ def test_shard_write_failure_leaves_no_corrupt_final_file(
     monkeypatch.setattr(torch, "save", fail_after_partial_write)
     with pytest.raises(RuntimeError, match="disk space and user quota"):
         writer.append(
-            torch.zeros(1, 2, 4),
-            torch.zeros(1, 2, dtype=torch.long),
+            torch.zeros(1, 8, 4),
+            torch.zeros(1, 8, dtype=torch.long),
+            torch.tensor([8]),
             torch.zeros(1, dtype=torch.long),
             ["test"],
         )

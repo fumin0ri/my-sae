@@ -22,7 +22,7 @@ def test_horizon_curve_reports_both_forecast_null_gains() -> None:
     statistics["online_shuffled_context_cosine"].fill_(0.2)
     statistics["ema_code_cosine"].fill_(0.6)
     statistics["ema_shuffled_context_cosine"].fill_(0.25)
-    statistics["position_only_cosine"].fill_(0.3)
+    statistics["horizon_only_cosine"].fill_(0.3)
     statistics["online_context_target_cosine"].fill_(0.4)
     statistics["ema_context_target_cosine"].fill_(0.35)
     statistics["online_residual_error"].fill_(0.25)
@@ -36,7 +36,7 @@ def test_horizon_curve_reports_both_forecast_null_gains() -> None:
     assert [row["horizon"] for row in curve] == [3, 2, 1]
     assert abs(curve[0]["online_gain_over_shuffled"]["mean"] - 0.6) < 1e-6
     assert abs(
-        curve[0]["online_gain_over_position_only"]["mean"] - 0.5
+        curve[0]["online_gain_over_horizon_only"]["mean"] - 0.5
     ) < 1e-6
     assert abs(curve[0]["ema_gain_over_shuffled"]["mean"] - 0.35) < 1e-6
     assert abs(curve[0]["online_minus_ema_cosine"]["mean"] - 0.2) < 1e-6
@@ -52,13 +52,13 @@ def test_standard_sae_quality_compares_online_and_ema_on_same_rows(
             d_in=8,
             d_sae=20,
             k=5,
-            window_size=4,
+            max_span_length=4,
             predictor_width=8,
             high_fraction=0.2,
         )
     )
     model.initialize_from_statistics(torch.zeros(8), 1.0)
-    batch = torch.randn(3, 4, 8)
+    batch = torch.randn(12, 8)
     monkeypatch.setattr(
         eval_module,
         "validation_batches",

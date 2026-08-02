@@ -1,3 +1,3 @@
-"""Fixed-endpoint JEPA-SAE for frozen LLM residual trajectories."""
+"""Random-pair horizon JEPA-SAE for frozen LLM residual trajectories."""
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"

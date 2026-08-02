@@ -1,9 +1,9 @@
-# High/low fixed-endpoint JEPA-SAE protocol
+# High/low random-pair horizon JEPA-SAE protocol
 
 ## Research question
 
 Does the high partition of a sparse residual representation contain
-context-dependent information that forecasts a fixed future endpoint under the
+context-dependent information that forecasts a randomly sampled future endpoint under the
 training-matched online-to-EMA path, while both the online and EMA high/low SAE
 pairs remain competitive conventional autoencoders?
 
@@ -12,7 +12,16 @@ Lipschitz, and multiscale smoothness are therefore not confirmatory endpoints.
 
 ## Model
 
-For a residual window `h_0 ... h_T`, one online SAE is divided into independent
+Frozen LLM residuals are first extracted as long, contiguous sequences. For each
+optimizer sample, draw a span length `L` uniformly from
+`min_span_length ... max_span_length`, draw a valid random endpoint `t`, and
+draw context `k` uniformly from the non-endpoint positions in
+`[t-L+1, t]`. The predictor receives the explicit horizon `h=t-k`.
+Context indices must lie after a prespecified burn-in region. Every span and
+horizon uses the same eligible endpoint range, so `h` cannot identify distance
+from the extracted-sequence boundary.
+
+For each pair `(x_(t-h), x_t, h)`, one online SAE is divided into independent
 high and low Top-K groups. The high group receives both high-only reconstruction
 and endpoint prediction supervision. The low group receives incremental full
 reconstruction supervision. Encoder, decoder, and bias are copied into a full
@@ -23,8 +32,12 @@ comparison.
 The loss is:
 
 ```text
-L_rec = alpha * FVU(D_high(z_T_high), h_T)
-      + (1-alpha) * FVU(D_high(z_T_high)+D_low(z_T_low), h_T)
+z_context = E_online(x_(t-h))
+z_target  = stopgrad(E_EMA(x_t))
+z_hat_t   = P(z_context, h)
+
+L_rec = alpha * FVU(D_high(z_t_high), x_t)
+      + (1-alpha) * FVU(D_high(z_t_high)+D_low(z_t_low), x_t)
 
 L = L_rec + lambda_pred * latent endpoint prediction loss
 ```
@@ -33,7 +46,7 @@ Predicted-residual reconstruction is not a training loss. Decoding the predicted
 code is reserved for evaluation diagnostics and causal interventions.
 
 There is no unsplit architecture, standard-SAE pretraining condition, fixed-SAE
-condition, or separately trained position-only model.
+condition, or separately trained horizon-only model.
 
 ## Data separation
 
@@ -61,11 +74,11 @@ dictionary collapse.
 
 ## Confirmatory evaluation B: forecast validity
 
-For every context position, the primary evaluation exactly matches the trained
+For every explicit token horizon, the primary evaluation exactly matches the trained
 student/teacher path:
 
 ```text
-P(E_online(h_k), k) -> E_EMA(h_T)
+P(E_online(x_(t-h)), h) -> E_EMA(x_t)
 ```
 
 On the question-locked MMLU test compare:
@@ -73,7 +86,7 @@ On the question-locked MMLU test compare:
 1. the learned predictor with the correct context;
 2. the same predictor with a context from another question;
 3. the same predictor with its context projection zeroed, retaining only the
-   position embedding;
+   horizon embedding;
 4. the raw online context-high versus EMA endpoint-high cosine.
 
 Primary paired effects are:
@@ -82,17 +95,17 @@ Primary paired effects are:
 gain_shuffled = cosine(pred(correct context), target)
               - cosine(pred(other question), target)
 
-gain_position = cosine(pred(correct context), target)
-              - cosine(pred(position only), target)
+gain_horizon = cosine(pred(correct context), target)
+             - cosine(pred(horizon only), target)
 ```
 
 Report question-cluster bootstrap 95% confidence intervals at every horizon.
-The primary horizon is the longest (`k=0`). The core forecasting claim passes
+The primary horizon is the longest supported token distance. The core forecasting claim passes
 only if both primary confidence-interval lower bounds exceed zero. Code NRMSE,
 support precision/recall/Jaccard, and predicted-residual FVU are secondary.
 
-Also report `P(E_EMA(h_k), k) -> E_EMA(h_T)` with matching shuffled and
-position-only controls as a secondary compatibility analysis. This path was not
+Also report `P(E_EMA(x_(t-h)), h) -> E_EMA(x_t)` with matching shuffled and
+horizon-only controls as a secondary compatibility analysis. This path was not
 used to train the predictor and cannot replace the Online-matched primary test.
 
 This within-checkpoint design isolates use of context without reintroducing an
@@ -134,7 +147,7 @@ and exceed the norm-matched random control.
 | Question | Required evidence |
 |---|---|
 | Is it a usable SAE? | online and EMA full FVE/cosine, loss recovered, and dead-feature rate on matched residuals |
-| Does prediction use context? | Online-matched longest-horizon gain over shuffled and position-only has CI lower bound above zero |
+| Does prediction use context? | Online-matched longest-horizon gain over shuffled and horizon-only has CI lower bound above zero |
 | What is encoded? | locked MMLU semantics/context/syntax probes, interpreted comparatively across high/low |
 | Is the forecastable component causally relevant? | directional patch/ablation effect beyond matched random direction |
 
@@ -145,5 +158,6 @@ Probe success without null-control or causal success is descriptive only.
 
 Every run stores the code commit, Python environment, GPU/driver information,
 pinned model and dataset revisions, activation-manifest fingerprint, split seed,
-and machine-readable JSON/CSV outputs. `WINDOW_SIZE` is a prespecified variable;
-changing it requires a distinct `RUN_DIR`.
+and machine-readable JSON/CSV outputs. `WINDOW_SIZE` is the prespecified maximum
+span length, not a stored training-window boundary. Changing minimum/maximum
+span, sequence length, or burn-in requires a distinct `RUN_DIR`.

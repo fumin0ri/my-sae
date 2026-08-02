@@ -95,7 +95,7 @@ def select_eligible_pairs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Edit a fixed endpoint using one context-position forecast"
+        description="Edit an endpoint using one explicit-horizon forecast"
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--pairs", required=True)
@@ -121,8 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Distance from context to the fixed endpoint. The default is the "
-            "longest horizon, using context position zero."
+            "Token distance from context to endpoint. The default is the "
+            "maximum horizon supported by the checkpoint."
         ),
     )
     parser.add_argument("--feature-ids", type=parse_feature_ids, default=())
@@ -172,7 +172,7 @@ def main() -> None:
         raise ValueError("--minimum-pairs cannot exceed --max-pairs")
     rows = read_jsonl(args.pairs)
     jepa, checkpoint = load_transition_model(args.checkpoint)
-    width = jepa.cfg.window_size
+    width = jepa.cfg.max_span_length
     horizon = resolve_horizon(args.horizon, width)
     target_position = width - 1
     context_position = target_position - horizon
@@ -275,8 +275,8 @@ def main() -> None:
             0, target_window_start : len(target_prefix_ids)
         ].to(dtype=sae_dtype)
         source_window = source_hidden[0, -width:].to(dtype=sae_dtype)
-        context_positions = torch.as_tensor(
-            [context_position],
+        horizons = torch.as_tensor(
+            [horizon],
             device=hidden_device,
             dtype=torch.long,
         )
@@ -294,12 +294,12 @@ def main() -> None:
             )
             source_prediction = jepa.predict_from_code(
                 source_context,
-                context_positions=context_positions,
+                horizons=horizons,
                 use_context=True,
             )
             target_prediction = jepa.predict_from_code(
                 target_context,
-                context_positions=context_positions,
+                horizons=horizons,
                 use_context=True,
             )
             source_prediction = restrict_features(
@@ -318,7 +318,7 @@ def main() -> None:
             learned_delta = jepa.decode_forecast_ema(
                 code_delta,
                 add_bias=False,
-            )[0, 0]
+            )[0]
             delta = learned_delta
             if args.mode == "random_ablate":
                 generator = torch.Generator(device="cpu").manual_seed(
