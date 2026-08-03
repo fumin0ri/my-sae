@@ -1,297 +1,191 @@
-# High/low random-pair horizon JEPA-SAE
+# Predictor-free Rectified LpJEPA-SAE
 
-LLMの同一系列にあるresidual trajectoryから、endpointを予測できるhigh-level
-sparse featuresと、再構成の細部を補うlow-level sparse featuresを分けて学習します。
+LLM residual streamから、局所系列内で共有されるhigh-level sparse featureと、
+位置固有のlow-level sparse featureを分離して学習する研究パイプラインです。
 
-長い連続residual列からspan長`L`とendpoint `t`を選び、span内の`k<t`を
-contextとしてサンプリングします。predictorへ渡すのは`h=t-k`だけで、固定window
-番号や境界は渡しません。
+予測器、horizon embedding、EMA teacher target、in-batch negativesは使いません。
+同じランダムspanから異なる2位置を交換可能なviewとしてサンプリングし、同じ
+online encoderへ通します。
 
 ```text
-long residual sequence: x_0 ... x_(t-h) ... x_t ...
-
-z_context = E_online(x_(t-h))
-z_target  = stopgrad(E_EMA(x_t))
-z_hat_t   = P(z_context, horizon=h)
+(h_a, h_b) from one random span
+        |          |
+        +-- shared online high/low SAE --+
+                   |
+        high: direct invariance + RDMReg
+        low:  position-specific reconstruction
+        full: residual reconstruction
 ```
 
-predictorはlatent endpoint codeだけで学習します。予測codeをdecoderへ通した
-residual reconstructionは学習損失に含めず、評価・因果介入だけに使います。
+high codeはshifted ReLU、low codeはReLU + Top-Kです。high codeの分布は、
+Rectified Generalized Gaussian (RGG)
 
-predictor出力は比較可能な2条件です。既定の`softplus`は従来どおりdenseな正値codeを
-学習し、評価時にTop-K化します。`relu_topk`は学習時から`ReLU + high-group Top-K`を
-適用します。ReLU条件にSoftplus条件のbias `-4`を流用すると全出力が負になり勾配が
-死ぬため、ReLU条件は`softplus(-4) ≈ 0.01815`の正biasで初期化します。これにより
-初期出力の正値スケールをbaselineへ合わせながら、最初からTop-K経路へ勾配を流します。
+```text
+ReLU(GN_p(mu, sigma))
+```
 
-`relu_topk`では任意にcode-space AuxKを使えます。joint phase中のmain Top-Kに
-一定batch数選ばれなかったpredictor featureをdeadとし、そのfeatureのpre-Top-K
-ReLU出力からAuxKを作ります。補助targetは
-`stopgrad(ReLU(z_target - z_main))`です。したがってAuxKは既存winnerではなく、
-未予測の正target codeをdead featureで説明するようにだけ学習されます。
+の独立な積分布へ、random projection上の二標本sliced 2-Wasserstein distanceで
+整合させます。これがcollapseを防ぎ、high codeの期待active fractionを制御します。
+EMAは損失のteacherではなく、最終的に評価・介入で使うSAE全体の移動平均です。
 
-学習architectureはhigh/low版だけです。unsplit SAE、fixed SAE、horizon-only学習
-モデルはありません。horizon-onlyとshuffled-contextは、同じ学習済みpredictorへ
-入力を変えて作る評価時null controlです。
+## Quick start
 
-## Quickstart
-
-CUDA 12.1、`torch==2.5.1+cu121`、単一RTX 4090向けです。
+対象はCUDA 12.1、PyTorch 2.5.1、単一RTX 4090です。
 
 ```bash
 git clone https://github.com/fumin0ri/my-sae.git
 cd my-sae
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install \
-  torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install --upgrade -e .
-bash scripts/transition_jepa_quickstart.sh
+conda create -n sae python=3.11 -y
+conda activate sae
+pip install --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.5.1 torchvision torchaudio
+pip install -e .
+HF_TOKEN=... bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
-既存cloneでは:
+既定の本実験:
 
-```bash
-git pull origin main
-python -m pip install --upgrade -e .
-bash scripts/transition_jepa_quickstart.sh
-```
-
-既定設定:
-
-| 項目 | 値 |
+| item | value |
 |---|---:|
-| frozen LLM | `EleutherAI/pythia-6.9b-deduped` |
+| LLM | `EleutherAI/pythia-6.9b-deduped` |
 | layer | 16 |
-| maximum sampled span | 32 token（最大horizon 31） |
-| stored residual sequence | 320 token、32 token burn-in |
-| sampled span | `L ~ Uniform(2, WINDOW_SIZE)` |
-| pair batch | 160、各span内でcontextを一様サンプル |
-| dictionary | 32,768 features |
-| total sparsity | Top-K 64 |
-| high / low | 20% / 80% |
-| training | 12,000 steps |
-| SAE-only warm-up | 4,000 steps |
-| MMLU | full 14,042-question test split、question-locked split |
-| arithmetic | BF16 autocast + TF32 + fused AdamW |
+| maximum span | 32 tokens |
+| SAE width | 32768 |
+| high fraction | 0.2 |
+| low Top-K | 64 |
+| RGG | Rectified Laplace (`p=1`) |
+| target high active fraction | 0.025 |
+| RDM random projections | 1024 |
+| training | 12000 optimizer steps |
+| effective pair batch | 320 |
 
-`WINDOW_SIZE`はmaximum span length、`MIN_SPAN_LENGTH`はminimum span lengthです。
-学習時は`L`をこの範囲から選び、span内の非endpoint位置をcontextとして一様に選びます。
-したがってhorizonのsupportは`1..WINDOW_SIZE-1`です。
-この生成過程で短いhorizonが多くなるため、既定ではlatent prediction lossを
-`1 / P(h)`に比例して重み付けし、各horizonの期待寄与を等しくします。
-random span/contextの生成とreconstruction lossは変更しません。
-
-旧来の非補正条件を対照実験として使う場合だけ、`HORIZON_WEIGHTING=none`を指定します。
-
-既存のrandom-span activationを再利用して、補正版を別runとしてstage 2から学習する場合:
-
-```bash
-START_STAGE=2 \
-ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
-RUN_DIR=runs/l16_win8_HF0.5_HW0.25_horizon_balanced \
-WINDOW_SIZE=8 LAYER=16 HIGH_FRACTION=0.5 \
-HIGH_RECONSTRUCTION_WEIGHT=0.25 \
-HORIZON_WEIGHTING=inverse_probability \
-bash scripts/transition_jepa_quickstart.sh
-```
-
-`training_report.json`で実際に使用された補正を確認できます。
-
-```bash
-jq '.horizon_balancing' \
-  runs/l16_win8_HF0.5_HW0.25_horizon_balanced/model/training_report.json
-```
-
-同じactivation、seed、学習条件でReLU + Top-K predictorを比較する場合:
-
-```bash
-START_STAGE=2 \
-ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
-RUN_DIR=runs/l16_win8_HF0.5_HW0.25_horizon_balanced_relu_topk \
-WINDOW_SIZE=8 LAYER=16 HIGH_FRACTION=0.5 \
-HIGH_RECONSTRUCTION_WEIGHT=0.25 \
-HORIZON_WEIGHTING=inverse_probability \
-PREDICTOR_OUTPUT=relu_topk \
-bash scripts/transition_jepa_quickstart.sh
-```
-
-Softplus baselineは`PREDICTOR_OUTPUT=softplus`です。checkpoint、training report、
-`visualization_summary.json`へ使用した出力方式を保存します。学習ログには
-`predictor_output_l0`、`predictor_zero_sample_fraction`、
-`predictor_batch_alive_fraction`も保存するため、ReLU predictorのdead outputを
-直接監視できます。
-
-## Predictor AuxK 3条件比較
-
-次の1コマンドで、同一Pile activation、同一seed、同一MMLU locked split、
-`inverse_probability` horizon weightingを使って3条件を順番に実行します。
-
-1. Softplus
-2. ReLU + Top-K、AuxKなし
-3. ReLU + Top-K、AuxKあり
-
-```bash
-HIGH_FRACTION=0.5 \
-HIGH_RECONSTRUCTION_WEIGHT=0.25 \
-WINDOW_SIZE=8 LAYER=16 \
-RUN_DIR=runs/l16_win8_HF0.5_HW0.25_auxk_comparison \
-bash scripts/predictor_auxk_comparison.sh
-```
-
-Pile residualとMMLU residual/base scoreは一度だけ生成して3条件で共有します。各条件の
-学習、SAE評価、forecast、probe、因果介入は独立に実行します。最後に次の比較reportを
-生成します。
+実行後は次を開きます。
 
 ```text
-runs/l16_win8_HF0.5_HW0.25_auxk_comparison/comparison/index.html
+runs/rectified-lpjepa-pile/report/index.html
 ```
 
-既存のrandom-span activationを再利用する場合:
+## よく変更する設定
 
 ```bash
-ACTIVATION_MANIFEST=runs/l16_win8_HF0.5_HW0.25/pile-activations/manifest.json \
-HIGH_FRACTION=0.5 HIGH_RECONSTRUCTION_WEIGHT=0.25 \
-WINDOW_SIZE=8 LAYER=16 \
-RUN_DIR=runs/l16_win8_HF0.5_HW0.25_auxk_comparison \
-bash scripts/predictor_auxk_comparison.sh
+WINDOW_SIZE=8 \
+LAYER=16 \
+HIGH_FRACTION=0.5 \
+HIGH_RECONSTRUCTION_WEIGHT=0.1 \
+TARGET_ACTIVE_FRACTION=0.025 \
+RUN_DIR=runs/l16-win8-hf05-rgg-laplace \
+bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
-AuxKの既定値は`PREDICTOR_AUXK=512`、`PREDICTOR_AUXK_WEIGHT=0.03125`、
-`PREDICTOR_DEAD_BATCHES=500`です。dead counterはSAE-only warm-up中には更新されず、
-predictorが学習を開始するjoint phaseだけを数えます。
+Rectified Gaussianとの比較:
 
 ```bash
-WINDOW_SIZE=128 RUN_DIR=runs/l16-win128 \
-bash scripts/transition_jepa_quickstart.sh
+RGG_P=2 RUN_DIR=runs/rgg-gaussian \
+bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
-## 8-stage pipeline
-
-1. document-disjointな長いPile train/validation residual sequenceを抽出
-2. random `(context, endpoint, horizon)` pairでhigh/low full-EMA JEPA-SAEを学習
-3. balanced MMLU probeと因果pairを生成
-4. MMLU residual trajectoryを抽出
-5. frozen LLMのzero-shot MMLU accuracyを測定
-6. online/EMA SAE品質、Online-matched forecast null、semantics/context/syntax probeを評価
-7. forecastable high featuresをpatch、ablate、norm-matched random ablate
-8. PNG、PDF、CSV、JSON、HTMLレポートを生成
-
-旧固定window形式のPile activationとcheckpointは新方式とは互換性がないため、最初の
-runはstage 1から実行してください。新形式で学習済みならstage 6から評価だけ再実行できます。
-
-```bash
-START_STAGE=6 RUN_DIR=runs/high-low-jepa-pile \
-bash scripts/transition_jepa_quickstart.sh
-```
-
-因果評価を省略する場合:
-
-```bash
-RUN_CAUSAL=0 START_STAGE=3 \
-bash scripts/transition_jepa_quickstart.sh
-```
-
-小規模確認:
+高速スモーク実験:
 
 ```bash
 MODEL=EleutherAI/pythia-70m-deduped \
-LAYER=3 WINDOW_SIZE=16 D_SAE=2048 K=32 PREDICTOR_WIDTH=64 \
-PILE_TRAIN_POSITIONS=65536 PILE_VALIDATION_POSITIONS=8192 \
-PILE_SHARD_POSITIONS=8192 TRAIN_STEPS=300 SAE_WARMUP_STEPS=100 \
-MMLU_MAX_QUESTIONS=256 PAIRS=8 PAIR_POOL_SIZE=128 \
-LOSS_RECOVERED_INPUTS=2 RUN_DIR=runs/smoke \
-bash scripts/transition_jepa_quickstart.sh
+LAYER=3 WINDOW_SIZE=8 D_SAE=1024 LOW_K=16 \
+PILE_TRAIN_POSITIONS=8192 PILE_VALIDATION_POSITIONS=2048 \
+TRAIN_STEPS=20 SAE_WARMUP_STEPS=5 REGULARIZATION_RAMP_STEPS=5 \
+BATCH_SIZE=16 GRADIENT_ACCUMULATION=1 \
+RDM_PROJECTIONS=32 RDM_PROJECTION_CHUNK_SIZE=16 \
+MMLU_MAX_QUESTIONS=64 PAIRS=8 RUN_LOSS_RECOVERED=0 RUN_CAUSAL=0 \
+RUN_DIR=runs/smoke \
+bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
-## 評価1: 通常のSAE性能
+既存activationを再利用してstage 2から再開できます。
 
-document-disjoint Pile validation residualの同一サンプルについて、online
-encoder/decoderと最終EMA encoder/decoderを並べて評価します。
+```bash
+ACTIVATION_MANIFEST=runs/existing/pile-activations/manifest.json \
+START_STAGE=2 RUN_DIR=runs/new-rgg-run \
+bash scripts/rectified_lpjepa_quickstart.sh
+```
 
-- reconstruction FVU / fraction of variance explained
-- reconstruction cosine、平均L2誤差
-- L1、per-position L0、high/low L0
-- alive/dead feature fraction
-- high-only、low-only、full reconstruction FVE
-- original、online-reconstructed、EMA-reconstructed、zero-ablated LLM loss
-- online/EMAそれぞれのfraction of loss recovered
-- online/EMA code cosine、support Jaccard、FVE差
+## Objective
 
-これにより、予測しやすさのためにSAEがresidual情報を捨てていないかを確認します。
-
-## 評価2: 提案手法は本当にcontextを使うか
-
-主要評価は、学習時と同じOnline-matched経路
-`P(E_online(x_(t-h)), h) -> E_EMA(x_t)`です。距離別に以下を比較します。
-
-- online contextを使うlearned predictor
-- 別MMLU問題のonline context codeを入れるshuffled-context null
-- context projectionをゼロにするhorizon-only null
-- predictorなしのonline context-to-EMA endpoint cosine
-
-`learned - shuffled`と`learned - horizon-only`にはquestion-group bootstrap 95% CIを
-付けます。最長horizonで両方のCI下限が0より大きいことを主要な有効性判定とします。
-`P(E_EMA(x_(t-h)), h) -> E_EMA(x_t)`も、学習時に使っていないEMA-context互換性の
-副次評価として同じグラフに表示します。
-
-## 評価3: MMLU semantics / context / syntax
-
-MMLU option順とprompt templateを決定論的に均衡化し、問題単位でdevelopmentとlocked
-testを分離します。linear probeのaccuracyとbalanced accuracyを次の表現で表示します。
-
-- online context high / online-matched predicted endpoint high
-- EMA context high / EMA-context predicted endpoint high
-- actual EMA endpoint high
-- online context low
-- EMA endpoint low / full
-
-軸は以下です。
-
-- `semantics`: 正解選択肢 A/B/C/D
-- `context`: STEM / humanities / social sciences / other
-- `syntax`: 4種類のprompt template
-
-high表現がcontext/semanticsを保持し、low表現との役割差が生じているかを測ります。
-
-## 評価4: 因果介入
-
-同じcontext category・syntaxで正解だけが異なるMMLU pairを使います。
-
-- `patch`: online contextから予測したsource high codeとtarget予測codeの差をendpointへ追加
-- `ablate`: targetの予測可能high componentを除去
-- `random_ablate`:同じL2 normのランダム方向を除去
-
-patchのsource-vs-target answer log-prob差、ablationのtarget answer log-prob低下、
-norm-matched randomとの差を可視化します。
-
-## Outputs
+2 viewを
 
 ```text
-runs/high-low-jepa-pile/
+(z_a^H, z_a^L) = E_online(h_a)
+(z_b^H, z_b^L) = E_online(h_b)
+```
+
+とすると、損失は
+
+```text
+L = (1-lambda_H) L_full-rec
+  + lambda_H L_high-rec
+  + lambda_inv L_invariance
+  + lambda_rdm L_RDMReg
+```
+
+です。
+
+- `L_full-rec`: high + lowによる両viewのFVU
+- `L_high-rec`: highだけによる両viewのFVU
+- `L_invariance`: high code間のtarget-second-moment正規化MSE
+- `L_RDMReg`: RGG targetへの正規化sliced 2-Wasserstein
+
+high-only reconstructionは、RDMRegを満たすだけでdecoderから無視される「装飾的な
+high code」を防ぎます。low側にはinvarianceもRDMRegも掛けません。
+
+## Evaluation
+
+quickstartは以下を一括で評価・可視化します。
+
+1. 通常のSAE品質
+   - online/EMA FVU、FVE、cosine、L0、dead feature
+   - high-only/low-only reconstruction
+   - next-token loss recovered
+2. shared-view validity
+   - 同一span high cosine
+   - 異なるvalidation sequenceへshuffleしたnull
+   - token distance別のpositive-minus-shuffled marginとbootstrap CI
+3. high/low分解
+   - same-span high codeを交換したswap reconstruction
+   - shuffled high codeを交換したnull
+4. RGG整合
+   - held-out RDMReg
+   - high active fractionと理論target active fraction
+5. MMLU
+   - semantics/context/syntaxのquestion-grouped locked probes
+   - high window mean、endpoint high、low、fullの比較
+6. causal validity
+   - EMA high codeのpatch、ablation、norm-matched random ablation
+
+MMLU表現は二段階で処理し、development splitで分散の大きい最大
+`PROBE_MAX_DIM`次元だけをCPUへ保存します。大きな`WINDOW_SIZE`や`D_SAE`でも、
+全表現を同時にRAMへ置かない設計です。
+
+詳細な事前登録と判定基準は
+[`docs/RECTIFIED_LPJEPA_PROTOCOL.md`](docs/RECTIFIED_LPJEPA_PROTOCOL.md)を参照してください。
+
+## Artifacts
+
+```text
+RUN_DIR/
   pile-activations/
+    manifest.json
+    train/*.pt
+    validation/*.pt
   model/
-    transition_jepa_sae.pt
+    rectified_lpjepa_sae.pt
     ema_sae.pt
     training_report.json
-  evaluation-data/
-    mmlu-prompts.jsonl
-    mmlu-causal-pairs.jsonl
-  activations/
   analysis/
-    transition_jepa_report.json
-    transition_horizon_metrics.csv
+    rectified_lpjepa_report.json
+    distance_metrics.csv
     mmlu_probe_accuracy.csv
-    mmlu_model_accuracy.json
+    evaluation_embeddings.pt
     intervention-*.jsonl
   report/
     index.html
+    visualization_summary.json
     figures/*.png
     figures/*.pdf
 ```
-
-最終レポートは`runs/high-low-jepa-pile/report/index.html`です。
-
-研究プロトコルは[`docs/TRANSITION_JEPA_PROTOCOL.md`](docs/TRANSITION_JEPA_PROTOCOL.md)
-に固定しています。

@@ -700,11 +700,13 @@ def main() -> None:
         "pair_sampling": {
             "performed_online_during_training": True,
             "span_length_distribution": "uniform over min_span_length..max_span_length",
-            "context_distribution": "uniform over non-endpoint positions in the sampled span",
-            "horizon_rule": "h=t-k, so h is uniform over 1..L-1 conditional on L",
-            "endpoint_distribution": "uniform over one horizon-independent eligible range",
-            "context_rule": "k=t-h",
-            "boundary_rule": "k >= burn_in_tokens",
+            "view_distribution": (
+                "ordered sample without replacement from all positions in the span; "
+                "view A and view B are exchangeable"
+            ),
+            "span_end_distribution": "uniform over one span-length-independent eligible range",
+            "distance_rule": "absolute token distance between the two sampled views",
+            "boundary_rule": "both view positions >= burn_in_tokens",
         },
         "normalization": {
             "mean": mean.float().tolist(),

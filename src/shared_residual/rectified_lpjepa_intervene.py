@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .group_sae import topk_relu
 from .intervene import answer_logprob, capture, tokenize_text
 from .io import read_jsonl, torch_load, write_jsonl
 from .modeling import (
@@ -21,46 +20,36 @@ from .intervention_utils import (
     parse_feature_ids,
     restrict_features,
 )
-from .transition_jepa_sae import (
+from .rectified_lpjepa_sae import (
     ARCHITECTURE_ID,
-    TransitionJEPAConfig,
-    TransitionJEPASAE,
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
 )
-def load_transition_model(
+
+
+def load_rectified_model(
     path: str,
-) -> tuple[TransitionJEPASAE, dict[str, Any]]:
+) -> tuple[RectifiedLpJEPASAE, dict[str, Any]]:
     checkpoint = torch_load(path)
     architecture_id = checkpoint.get("architecture_id")
     if architecture_id == ARCHITECTURE_ID:
-        model = TransitionJEPASAE(
-            TransitionJEPAConfig(**checkpoint["config"])
+        model = RectifiedLpJEPASAE(
+            RectifiedLpJEPAConfig(**checkpoint["config"])
         )
     else:
         raise ValueError(
             f"{path} has unsupported architecture_id={architecture_id!r}; "
-            "only the current high/low checkpoint is supported"
+            "only the predictor-free Rectified LpJEPA checkpoint is supported"
         )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model, checkpoint
 
 
-def resolve_horizon(
-    requested: int | None,
-    max_span_length: int,
-) -> int:
-    horizon = max_span_length - 1 if requested is None else requested
-    if not 1 <= horizon < max_span_length:
-        raise ValueError(
-            f"--horizon must lie in [1, {max_span_length - 1}]"
-        )
-    return horizon
-
-
 def select_eligible_pairs(
     rows: list[dict[str, Any]],
     tokenizer: Any,
-    max_span_length: int,
+    minimum_tokens: int,
     source_key: str,
     target_key: str,
     maximum: int,
@@ -84,7 +73,7 @@ def select_eligible_pairs(
             str(row[target_key]),
             add_special_tokens=True,
         )
-        if min(len(source_ids), len(target_ids)) < max_span_length:
+        if min(len(source_ids), len(target_ids)) < minimum_tokens:
             skipped_short += 1
             continue
         selected.append((row_index, row, source_ids, target_ids))
@@ -95,7 +84,7 @@ def select_eligible_pairs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Edit an endpoint using one explicit-horizon forecast"
+        description="Patch or ablate predictor-free Rectified LpJEPA high features"
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--pairs", required=True)
@@ -104,26 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--hook-point", choices=["pre", "post"], default="post")
     parser.add_argument(
-        "--context-encoder",
+        "--sae-variant",
         choices=["online", "ema"],
-        default="online",
-        help=(
-            "online matches predictor training; ema is a secondary compatibility test"
-        ),
+        default="ema",
+        help="EMA is the final SAE; online is retained as a comparison.",
     )
     parser.add_argument(
         "--mode",
         choices=["patch", "ablate", "random_ablate"],
         default="patch",
-    )
-    parser.add_argument(
-        "--horizon",
-        type=int,
-        default=None,
-        help=(
-            "Token distance from context to endpoint. The default is the "
-            "maximum horizon supported by the checkpoint."
-        ),
     )
     parser.add_argument("--feature-ids", type=parse_feature_ids, default=())
     parser.add_argument("--alpha", type=float, default=1.0)
@@ -171,11 +149,7 @@ def main() -> None:
     if args.max_pairs and args.minimum_pairs > args.max_pairs:
         raise ValueError("--minimum-pairs cannot exceed --max-pairs")
     rows = read_jsonl(args.pairs)
-    jepa, checkpoint = load_transition_model(args.checkpoint)
-    width = jepa.cfg.max_span_length
-    horizon = resolve_horizon(args.horizon, width)
-    target_position = width - 1
-    context_position = target_position - horizon
+    jepa, checkpoint = load_rectified_model(args.checkpoint)
     source_cfg = checkpoint.get("source_config", {})
     del checkpoint
     mismatches = []
@@ -225,7 +199,7 @@ def main() -> None:
     eligible, skipped_short, examined = select_eligible_pairs(
         rows,
         tokenizer,
-        width,
+        1,
         args.source_key,
         args.target_key,
         args.max_pairs,
@@ -234,12 +208,12 @@ def main() -> None:
         raise ValueError(
             f"only {len(eligible)} eligible causal pairs were found among "
             f"{examined} candidates; {skipped_short} had a source or target "
-            f"shorter than checkpoint window {width}. Regenerate a larger "
-            "candidate pool, or deliberately reduce --minimum-pairs."
+            "with no tokens. Regenerate a larger candidate pool, or "
+            "deliberately reduce --minimum-pairs."
         )
     print(
         f"selected {len(eligible)} eligible causal pairs from {examined} "
-        f"candidates (skipped_short={skipped_short}, window={width})"
+        f"candidates (skipped_empty={skipped_short})"
     )
     results: list[dict[str, Any]] = []
     for eligible_index, (
@@ -270,54 +244,23 @@ def main() -> None:
         )
         hidden_device = target_hidden.device
         jepa.to(device=hidden_device, dtype=sae_dtype)
-        target_window_start = len(target_prefix_ids) - width
-        target_window = target_hidden[
-            0, target_window_start : len(target_prefix_ids)
+        target_endpoint = target_hidden[
+            0, len(target_prefix_ids) - 1 : len(target_prefix_ids)
         ].to(dtype=sae_dtype)
-        source_window = source_hidden[0, -width:].to(dtype=sae_dtype)
-        horizons = torch.as_tensor(
-            [horizon],
-            device=hidden_device,
-            dtype=torch.long,
-        )
+        source_endpoint = source_hidden[0, -1:].to(dtype=sae_dtype)
         with torch.inference_mode():
-            encode_context = (
-                jepa.encode_forecast_online
-                if args.context_encoder == "online"
-                else jepa.encode_forecast_ema
-            )
-            source_context = encode_context(
-                source_window[context_position : context_position + 1]
-            )
-            target_context = encode_context(
-                target_window[context_position : context_position + 1]
-            )
-            source_prediction = jepa.predict_from_code(
-                source_context,
-                horizons=horizons,
-                use_context=True,
-            )
-            target_prediction = jepa.predict_from_code(
-                target_context,
-                horizons=horizons,
-                use_context=True,
-            )
-            source_prediction = restrict_features(
-                topk_relu(source_prediction, jepa.forecast_k),
-                args.feature_ids,
-            )
-            target_prediction = restrict_features(
-                topk_relu(target_prediction, jepa.forecast_k),
-                args.feature_ids,
-            )
+            encode = jepa.encode if args.sae_variant == "online" else jepa.encode_ema
+            source_high, _ = jepa.split_code(encode(source_endpoint))
+            target_high, _ = jepa.split_code(encode(target_endpoint))
+            source_high = restrict_features(source_high, args.feature_ids)
+            target_high = restrict_features(target_high, args.feature_ids)
             code_delta = (
-                source_prediction - target_prediction
+                source_high - target_high
                 if args.mode == "patch"
-                else -target_prediction
+                else -target_high
             )
-            learned_delta = jepa.decode_forecast_ema(
-                code_delta,
-                add_bias=False,
+            learned_delta = jepa.decode_high(
+                code_delta, ema=args.sae_variant == "ema", add_bias=False
             )[0]
             delta = learned_delta
             if args.mode == "random_ablate":
@@ -332,7 +275,7 @@ def main() -> None:
                 random = random / random.norm().clamp_min(1e-8)
                 delta = random * learned_delta.float().norm()
             delta = (args.alpha * delta).to(target_hidden.dtype)
-        endpoint_position = target_window_start + target_position
+        endpoint_position = len(target_prefix_ids) - 1
 
         def apply_edit(hidden: torch.Tensor) -> torch.Tensor:
             edited = hidden.clone()
@@ -418,11 +361,9 @@ def main() -> None:
                 "row_index": row_index,
                 "eligible_index": eligible_index,
                 "mode": args.mode,
-                "context_encoder": args.context_encoder,
+                "sae_variant": args.sae_variant,
                 "alpha": args.alpha,
-                "context_position": context_position,
-                "target_position": target_position,
-                "horizon": horizon,
+                "target_position": endpoint_position,
                 "feature_ids": list(args.feature_ids),
                 "baseline_answer_logprob": baseline_lp,
                 "edited_answer_logprob": edited_lp,

@@ -117,31 +117,42 @@ def load_sequence_shard(path: Path, sequence_length: int) -> SequenceShard:
     return SequenceShard(activations, valid_lengths.long())
 
 
-def _sample_pairs(
+def _sample_view_pairs(
     sequences: torch.Tensor,
     valid_lengths: torch.Tensor,
     span_lengths: torch.Tensor,
-    horizons: torch.Tensor,
     burn_in_tokens: int,
     max_horizon: int,
     generator: torch.Generator,
     row_indices: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    sample_count = len(horizons)
-    if len(valid_lengths) != sample_count or len(span_lengths) != sample_count:
-        raise ValueError("one span length and horizon are required per sequence")
-    if torch.any(horizons < 1) or torch.any(horizons >= span_lengths):
-        raise ValueError("each horizon must lie in [1, span_length-1]")
-    # The endpoint support is identical for every horizon. This prevents h from
-    # becoming a proxy for proximity to the extracted-sequence boundary.
-    minimum_endpoints = torch.full_like(horizons, burn_in_tokens + max_horizon)
-    if torch.any(minimum_endpoints >= valid_lengths):
+    """Sample two exchangeable positions from each random span.
+
+    The two offsets are an ordered sample without replacement.  Consequently
+    view A and view B have identical marginal position distributions; neither
+    is a privileged endpoint or prediction target.
+    """
+    sample_count = len(span_lengths)
+    if len(valid_lengths) != sample_count:
+        raise ValueError("one span length is required per sequence")
+    if torch.any(span_lengths < 2) or torch.any(span_lengths > max_horizon + 1):
+        raise ValueError("span lengths must lie in [2, max_horizon+1]")
+    minimum_ends = torch.full_like(span_lengths, burn_in_tokens + max_horizon)
+    if torch.any(minimum_ends >= valid_lengths):
         raise ValueError("sequence is too short for sampled horizon and burn-in")
-    spans = valid_lengths - minimum_endpoints
+    spans = valid_lengths - minimum_ends
     uniforms = torch.rand(sample_count, generator=generator)
-    endpoints = minimum_endpoints + torch.floor(uniforms * spans).long()
-    contexts = endpoints - horizons
-    span_starts = endpoints - span_lengths + 1
+    span_ends = minimum_ends + torch.floor(uniforms * spans).long()
+    span_starts = span_ends - span_lengths + 1
+    offsets_a = torch.floor(
+        torch.rand(sample_count, generator=generator) * span_lengths
+    ).long()
+    offsets_b = torch.floor(
+        torch.rand(sample_count, generator=generator) * (span_lengths - 1)
+    ).long()
+    offsets_b = offsets_b + (offsets_b >= offsets_a).long()
+    positions_a = span_starts + offsets_a
+    positions_b = span_starts + offsets_b
     rows = (
         torch.arange(sample_count)
         if row_indices is None
@@ -150,18 +161,19 @@ def _sample_pairs(
     if rows.shape != (sample_count,):
         raise ValueError("row_indices must have one entry per pair")
     return {
-        "context": sequences[rows, contexts],
-        "target": sequences[rows, endpoints],
+        "view_a": sequences[rows, positions_a],
+        "view_b": sequences[rows, positions_b],
         "span_length": span_lengths,
-        "horizon": horizons,
+        "distance": (positions_a - positions_b).abs(),
         "span_start_index": span_starts,
-        "context_index": contexts,
-        "endpoint_index": endpoints,
+        "span_end_index": span_ends,
+        "position_a": positions_a,
+        "position_b": positions_b,
     }
 
 
-class RandomPairShardBatches:
-    """Infinite deterministic residual pairs from random spans and contexts."""
+class RandomViewPairShardBatches:
+    """Infinite deterministic exchangeable view pairs from random spans."""
 
     def __init__(
         self,
@@ -186,7 +198,7 @@ class RandomPairShardBatches:
         self.row_position = 0
         self.epoch = 0
 
-    def __iter__(self) -> RandomPairShardBatches:
+    def __iter__(self) -> RandomViewPairShardBatches:
         return self
 
     def _next_shard(self) -> None:
@@ -211,10 +223,6 @@ class RandomPairShardBatches:
             (self.batch_size,),
             generator=self.generator,
         )
-        horizons = 1 + torch.floor(
-            torch.rand(self.batch_size, generator=self.generator)
-            * (span_lengths - 1)
-        ).long()
         pieces: dict[str, list[torch.Tensor]] = {}
         needed = self.batch_size
         pair_start = 0
@@ -231,11 +239,10 @@ class RandomPairShardBatches:
             indices = self.row_order[self.row_position : self.row_position + take]
             selected_lengths = self.current.valid_lengths.index_select(0, indices)
             pair_end = pair_start + take
-            sampled = _sample_pairs(
+            sampled = _sample_view_pairs(
                 self.current.activations,
                 selected_lengths,
                 span_lengths[pair_start:pair_end],
-                horizons[pair_start:pair_end],
                 self.burn_in_tokens,
                 self.max_horizon,
                 self.generator,
@@ -252,7 +259,7 @@ class RandomPairShardBatches:
         }
 
 
-def validation_pair_batches(
+def validation_view_pair_batches(
     root: Path,
     manifest: dict[str, Any],
     batch_size: int,
@@ -276,15 +283,10 @@ def validation_pair_batches(
                 (len(sequences),),
                 generator=generator,
             )
-            horizons = 1 + torch.floor(
-                torch.rand(len(sequences), generator=generator)
-                * (span_lengths - 1)
-            ).long()
-            yield _sample_pairs(
+            yield _sample_view_pairs(
                 sequences,
                 lengths,
                 span_lengths,
-                horizons,
                 burn_in,
                 max_horizon,
                 generator,

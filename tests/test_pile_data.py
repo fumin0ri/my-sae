@@ -6,11 +6,11 @@ import torch
 
 from shared_residual.activation_store import (
     ACTIVATION_FORMAT,
-    RandomPairShardBatches,
+    RandomViewPairShardBatches,
     load_activation_manifest,
     manifest_fingerprint,
     validation_batches,
-    validation_pair_batches,
+    validation_view_pair_batches,
 )
 from shared_residual.pile_extract import (
     DEFAULT_SHARD_POSITIONS,
@@ -86,23 +86,22 @@ def test_random_pair_batches_follow_random_span_design_and_are_boundary_safe(
     root, manifest = load_activation_manifest(tmp_path)
     assert manifest_fingerprint(manifest) == manifest_fingerprint(expected)
     iterator = iter(
-        RandomPairShardBatches(root, manifest, "train", batch_size=8, seed=9)
+        RandomViewPairShardBatches(root, manifest, "train", batch_size=8, seed=9)
     )
     batch = next(iterator)
-    assert batch["context"].shape == (8, 4)
-    assert batch["target"].shape == (8, 4)
+    assert batch["view_a"].shape == (8, 4)
+    assert batch["view_b"].shape == (8, 4)
     assert torch.equal(
-        batch["endpoint_index"] - batch["context_index"], batch["horizon"]
+        (batch["position_a"] - batch["position_b"]).abs(), batch["distance"]
     )
     assert torch.all(batch["span_length"] >= manifest["min_span_length"])
     assert torch.all(batch["span_length"] <= manifest["max_span_length"])
-    assert torch.all(batch["horizon"] < batch["span_length"])
-    assert torch.all(batch["context_index"] >= batch["span_start_index"])
-    assert torch.all(batch["context_index"] < batch["endpoint_index"])
-    assert int(batch["context_index"].min()) >= manifest["burn_in_tokens"]
-    assert int(batch["endpoint_index"].min()) >= (
-        manifest["burn_in_tokens"] + manifest["max_horizon"]
-    )
+    assert torch.all(batch["distance"] >= 1)
+    assert torch.all(batch["distance"] < batch["span_length"])
+    for key in ("position_a", "position_b"):
+        assert torch.all(batch[key] >= batch["span_start_index"])
+        assert torch.all(batch[key] <= batch["span_end_index"])
+        assert int(batch[key].min()) >= manifest["burn_in_tokens"]
 
 
 def test_validation_pairs_are_deterministic_and_residuals_exclude_padding(
@@ -110,10 +109,11 @@ def test_validation_pairs_are_deterministic_and_residuals_exclude_padding(
 ) -> None:
     make_manifest(tmp_path)
     root, manifest = load_activation_manifest(tmp_path)
-    left = list(validation_pair_batches(root, manifest, 3, 2, seed=11))
-    right = list(validation_pair_batches(root, manifest, 3, 2, seed=11))
+    left = list(validation_view_pair_batches(root, manifest, 3, 2, seed=11))
+    right = list(validation_view_pair_batches(root, manifest, 3, 2, seed=11))
     assert len(left) == len(right) == 2
-    assert torch.equal(left[0]["endpoint_index"], right[0]["endpoint_index"])
+    assert torch.equal(left[0]["position_a"], right[0]["position_a"])
+    assert torch.equal(left[0]["position_b"], right[0]["position_b"])
     held_out = list(validation_batches(root, manifest, 20, 2))
     assert [len(batch) for batch in held_out] == [20, 20]
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.17.0"
-description = "Train high/low forecastable sparse states and test reconstruction, representation, and causal validity"
+version = "0.18.0"
+description = "Train predictor-free high/low Rectified LpJEPA sparse states and test reconstruction, invariance, and causal validity"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",
@@ -35,11 +35,10 @@ sr-sae = "shared_residual.sae_analysis:main"
 sr-intervene = "shared_residual.intervene:main"
 sr-train-group-sae = "shared_residual.group_sae:main"
 sr-visualize = "shared_residual.visualize_results:main"
-sr-train-transition-jepa-sae = "shared_residual.transition_jepa_sae:main"
-sr-evaluate-transition-jepa-sae = "shared_residual.transition_jepa_eval:main"
-sr-intervene-transition-jepa-sae = "shared_residual.transition_jepa_intervene:main"
-sr-visualize-transition-jepa-sae = "shared_residual.transition_jepa_visualize:main"
-sr-compare-transition-predictors = "shared_residual.transition_jepa_compare:main"
+sr-train-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_sae:main"
+sr-evaluate-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_eval:main"
+sr-intervene-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_intervene:main"
+sr-visualize-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_visualize:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
