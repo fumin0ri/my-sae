@@ -241,12 +241,16 @@ def evaluate_view_invariance(
             ema_low_a.float(), ema_low_b.float(), dim=-1
         )
         energy_a = (view_a - model.ema_pre_bias).float().square().mean(dim=-1).clamp_min(1e-8)
-        swapped = model.decode_high(ema_high_b, ema=True) + model.decode_low(
-            ema_low_a, ema=True, add_bias=False
-        )
-        shuffled_swap = model.decode_high(
-            ema_high_b.index_select(0, permutation), ema=True
-        ) + model.decode_low(ema_low_a, ema=True, add_bias=False)
+        # EMA codes are BF16 under CUDA autocast while the stored EMA decoder
+        # remains FP32. Keep swap decoding under the same autocast policy used
+        # by ordinary SAE reconstruction instead of multiplying mixed dtypes.
+        with autocast_context(device, amp_dtype):
+            swapped = model.decode_high(
+                ema_high_b, ema=True
+            ) + model.decode_low(ema_low_a, ema=True, add_bias=False)
+            shuffled_swap = model.decode_high(
+                ema_high_b.index_select(0, permutation), ema=True
+            ) + model.decode_low(ema_low_a, ema=True, add_bias=False)
         swap_fvu = (swapped - view_a).float().square().mean(dim=-1) / energy_a
         shuffled_swap_fvu = (
             (shuffled_swap - view_a).float().square().mean(dim=-1) / energy_a

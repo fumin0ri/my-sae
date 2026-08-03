@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 import shared_residual.rectified_lpjepa_eval as eval_module
@@ -55,6 +56,34 @@ def test_view_invariance_reports_shuffle_null_and_distance_curve(monkeypatch) ->
     assert [row["distance"] for row in result["distance_curve"]] == [1, 2, 3]
     assert "overall_ema_high_margin" in result
     assert "ema_swap_reconstruction_fvu" in result["distance_curve"][0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast regression")
+def test_view_invariance_swap_decode_accepts_bfloat16_codes(monkeypatch) -> None:
+    model = make_model().cuda()
+    batch = {
+        "view_a": torch.randn(4, 8),
+        "view_b": torch.randn(4, 8),
+        "distance": torch.tensor([1, 1, 2, 2]),
+    }
+    monkeypatch.setattr(
+        eval_module,
+        "validation_view_pair_batches",
+        lambda *_args, **_kwargs: iter([batch]),
+    )
+    result = evaluate_view_invariance(
+        model,
+        Path("unused"),
+        {},
+        4,
+        1,
+        torch.device("cuda"),
+        "bfloat16",
+        0,
+    )
+    assert torch.isfinite(
+        torch.tensor(result["distance_curve"][0]["ema_swap_reconstruction_fvu"])
+    )
 
 
 def test_causal_lm_loss_ignores_padded_targets() -> None:
