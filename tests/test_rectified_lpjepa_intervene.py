@@ -3,14 +3,14 @@ import torch
 from shared_residual.rectified_lpjepa_intervene import build_parser, select_eligible_pairs
 
 
-def test_intervention_defaults_to_final_ema_sae() -> None:
+def test_intervention_has_only_one_sae_variant() -> None:
     args = build_parser().parse_args(
         [
             "--model", "model", "--pairs", "pairs.jsonl", "--checkpoint", "sae.pt",
             "--output", "result.jsonl", "--layer", "1",
         ]
     )
-    assert args.sae_variant == "ema"
+    assert not hasattr(args, "sae_variant")
 
 
 def test_causal_pair_selection_skips_empty_prefixes_before_limit() -> None:

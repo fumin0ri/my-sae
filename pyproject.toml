@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.18.0"
-description = "Train predictor-free high/low Rectified LpJEPA sparse states and test reconstruction, invariance, and causal validity"
+version = "0.19.0"
+description = "Train predictor-free high/low Rectified LpJEPA sparse states with random-projection and axis-aligned RDMReg"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=0.30",

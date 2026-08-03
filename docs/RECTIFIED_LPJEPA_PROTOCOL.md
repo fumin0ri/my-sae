@@ -18,14 +18,15 @@ from the same sampled span as exchangeable views and learns a high/low SAE:
 2. Draw span length `L` uniformly from `[L_min, W_max]`.
 3. Draw a valid span end independently of `L`.
 4. Draw two distinct ordered positions uniformly without replacement from the span.
-5. Encode both residuals with the same online high/low SAE.
+5. Encode both residuals with the same high/low SAE.
 6. Apply shifted ReLU to high preactivations and ReLU + Top-K to low preactivations.
 7. Reconstruct each residual with the additive high and low decoder partitions.
-8. Match the two online high codes with squared L2 invariance.
+8. Match the two high codes with squared L2 invariance.
 9. Match each high-code marginal distribution to an i.i.d. Rectified Generalized
-   Gaussian product target using sliced two-sample 2-Wasserstein distance.
-10. Update a full-SAE EMA after each optimizer step. EMA is never a target in the
-    training loss.
+   Gaussian product target using random-projection sliced two-sample
+   2-Wasserstein distance.
+10. Also match randomly sampled high coordinates directly to the target's
+    coordinate marginals with axis-aligned two-sample 2-Wasserstein distance.
 
 There is no predictor, position embedding, horizon embedding, target encoder,
 stop-gradient target, contrastive negative, variance loss, compatibility loss, or
@@ -65,9 +66,12 @@ Primary weights:
 lambda_H   = 0.1
 lambda_inv = 1
 lambda_rdm = 5
+lambda_axis = 1
+axis_coordinates = min(512, d_high)
 ```
 
-Both invariance and RDMReg are normalized by target-distribution scale. RDMReg
+Both invariance and RDMReg are normalized by target-distribution scale. The RDM
+term is random-projection RDM plus `lambda_axis` times axis-aligned RDM. RDMReg
 ramps from the first step. Invariance begins after the SAE warm-up and then ramps.
 
 ## Primary validation claims
@@ -75,15 +79,16 @@ ramps from the first step. Invariance begins after the SAE warm-up and then ramp
 The method passes the representation-validity test only if all of the following
 hold on the document-disjoint Pile validation split:
 
-1. EMA same-span high cosine exceeds shuffled-sequence high cosine with a
+1. Same-span high cosine exceeds shuffled-sequence high cosine with a
    bootstrap 95% CI lower bound above zero.
 2. The positive-minus-shuffled margin remains positive at the longest adequately
    sampled token distance.
 3. Same-span high-code swap reconstruction has lower FVU than shuffled high-code
-   swap reconstruction.
-4. Learned EMA high active fraction is close to the RGG target without excessive
+   swap reconstruction. Each distance-bin FVU is computed as total squared error
+   divided by total centered residual energy, never as a mean of per-row ratios.
+4. Learned high active fraction is close to the RGG target without excessive
    dead features.
-5. Full EMA SAE reconstruction and loss recovered remain usable relative to the
+5. Full SAE reconstruction and loss recovered remain usable relative to the
    reconstruction-only ablation.
 
 ## Ablations
@@ -97,14 +102,15 @@ training budget, and evaluation data.
 4. Full Rectified LpJEPA-SAE.
 5. Rectified Laplace (`p=1`) versus Rectified Gaussian (`p=2`).
 6. Active-fraction sweep `{0.01, 0.025, 0.05}`.
+7. Axis-aligned RDM on versus off (`lambda_axis=1` versus `0`).
 
 ## Secondary evaluations
 
-- Conventional online/EMA SAE FVU, FVE, cosine, L0, and loss recovered.
+- Conventional SAE FVU, FVE, cosine, L0, and loss recovered.
 - High-only and low-only reconstruction.
 - Effective rank and collapse diagnostics on memory-bounded selected dimensions.
 - MMLU semantics, context, and syntax locked probes.
-- EMA high-feature patching, ablation, and norm-matched random ablation.
+- High-feature patching, ablation, and norm-matched random ablation.
 
 MMLU is secondary: the core claim concerns shared representation within held-out
 Pile spans, not task accuracy.
@@ -112,6 +118,7 @@ Pile spans, not task accuracy.
 ## Compute
 
 Primary hardware is one RTX 4090 with 23.5 GiB VRAM, CUDA 12.1, and PyTorch
-2.5.1. The primary run uses 1024 random projections in chunks of 128. A
+2.5.1. The primary run uses 1024 random projections in chunks of 128 and 512
+axis-aligned coordinates sampled without replacement per step. A
 projection-count convergence check uses `{256, 512, 1024, 2048}` on held-out
 checkpoints; it does not tune on the locked MMLU test.

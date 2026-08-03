@@ -50,13 +50,13 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     fig, axes = plt.subplots(2, 3, figsize=(16.0, 8.6))
     axes[0, 0].plot(
         steps,
-        [row["validation"]["ema_reconstruction_fvu"] for row in history],
+        [row["validation"]["full_reconstruction_fvu"] for row in history],
         color=TOTAL,
-        label="Full EMA SAE",
+        label="Full SAE",
     )
     axes[0, 0].plot(
         steps,
-        [row["validation"]["ema_high_reconstruction_fvu"] for row in history],
+        [row["validation"]["high_reconstruction_fvu"] for row in history],
         color=HIGH,
         linestyle="--",
         label="High only",
@@ -70,7 +70,21 @@ def training_plot(run_dir: Path, figures: Path) -> None:
         steps,
         [row["validation"]["rdm_loss"] for row in history],
         color=RDM,
-        label="Normalized RDMReg",
+        label="Combined RDMReg",
+    )
+    axes[0, 2].plot(
+        steps,
+        [row["validation"]["axis_aligned_rdm_loss"] for row in history],
+        color="#db2777",
+        linestyle="--",
+        label="Axis-aligned",
+    )
+    axes[0, 2].plot(
+        steps,
+        [row["validation"]["random_projection_rdm_loss"] for row in history],
+        color="#8b5cf6",
+        linestyle=":",
+        label="Random projection",
     )
     axes[1, 0].plot(
         steps,
@@ -99,12 +113,12 @@ def training_plot(run_dir: Path, figures: Path) -> None:
         [row["validation"]["swap_reconstruction_fvu"] for row in history],
         color="#d97706",
     )
-    axes[0, 0].set_title("EMA reconstruction")
+    axes[0, 0].set_title("SAE reconstruction")
     axes[0, 0].set_ylabel("FVU (lower is better)")
     axes[0, 1].set_title("High-view invariance")
     axes[0, 1].set_ylabel("Normalized MSE")
     axes[0, 2].set_title("Rectified distribution matching")
-    axes[0, 2].set_ylabel("Normalized sliced W2")
+    axes[0, 2].set_ylabel("Normalized W2")
     axes[1, 0].set_title("High-code sparsity control")
     axes[1, 0].set_ylabel("Active fraction")
     axes[1, 1].set_title("Shared-view specificity")
@@ -124,52 +138,30 @@ def training_plot(run_dir: Path, figures: Path) -> None:
 
 def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
     quality = report["standard_sae_quality"]
-    online = quality["online"]
-    ema = quality["ema"]
     recovered = report.get("loss_recovered")
     fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5))
     positions = np.arange(3)
-    width = 0.36
+    width = 0.58
     axes[0].bar(
-        positions - width / 2,
+        positions,
         [
-            online["high_only_fraction_variance_explained"],
-            online["low_only_fraction_variance_explained"],
-            online["fraction_variance_explained"],
+            quality["high_only_fraction_variance_explained"],
+            quality["low_only_fraction_variance_explained"],
+            quality["fraction_variance_explained"],
         ],
         width,
-        color="#0ea5e9",
-        label="Online SAE",
-    )
-    axes[0].bar(
-        positions + width / 2,
-        [
-            ema["high_only_fraction_variance_explained"],
-            ema["low_only_fraction_variance_explained"],
-            ema["fraction_variance_explained"],
-        ],
-        width,
-        color=HIGH,
-        label="EMA SAE",
+        color=[HIGH, LOW, TOTAL],
     )
     axes[0].set_xticks(positions, ["High", "Low", "Full"])
     axes[0].axhline(0, color="#334155", linewidth=1)
-    axes[0].set_title("Online vs EMA variance explained")
+    axes[0].set_title("Variance explained")
     axes[0].set_ylabel("FVE")
     positions2 = np.arange(3)
     axes[1].bar(
-        positions2 - width / 2,
-        [online["reconstruction_cosine"], online["alive_feature_fraction"], online["high_active_fraction"]],
+        positions2,
+        [quality["reconstruction_cosine"], quality["alive_feature_fraction"], quality["high_active_fraction"]],
         width,
-        color="#0ea5e9",
-        label="Online SAE",
-    )
-    axes[1].bar(
-        positions2 + width / 2,
-        [ema["reconstruction_cosine"], ema["alive_feature_fraction"], ema["high_active_fraction"]],
-        width,
-        color=HIGH,
-        label="EMA SAE",
+        color=[TOTAL, HIGH, RDM],
     )
     axes[1].set_xticks(positions2, ["Cosine", "Alive", "High active"])
     axes[1].set_ylim(0, 1)
@@ -179,26 +171,21 @@ def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
         axes[2].set_axis_off()
     else:
         axes[2].bar(
-            ["Original", "Online recon", "EMA recon", "Zero"],
+            ["Original", "SAE recon", "Zero"],
             [
                 recovered["loss_original"],
-                recovered["loss_reconstructed_online"],
-                recovered["loss_reconstructed_ema"],
+                recovered["loss_reconstructed"],
                 recovered["loss_zero"],
             ],
-            color=[TOTAL, "#0ea5e9", HIGH, "#dc2626"],
+            color=[TOTAL, HIGH, "#dc2626"],
         )
         axes[2].set_title(
-            "Loss recovered: "
-            f"online={recovered['fraction_loss_recovered_online']:.3f}, "
-            f"EMA={recovered['fraction_loss_recovered_ema']:.3f}"
+            f"Loss recovered: {recovered['fraction_loss_recovered']:.3f}"
         )
         axes[2].set_ylabel("Next-token cross entropy")
         axes[2].tick_params(axis="x", rotation=20)
     for axis in axes:
         axis.grid(axis="y", alpha=0.2)
-    axes[0].legend(frameon=False)
-    axes[1].legend(frameon=False)
     fig.tight_layout()
     save_figure(fig, figures, "standard-sae-quality")
 
@@ -209,64 +196,56 @@ def invariance_plot(report: dict[str, Any], figures: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.7))
     axes[0].plot(
         distance,
-        [row["ema_high_positive_cosine"] for row in rows],
+        [row["high_positive_cosine"] for row in rows],
         marker="o",
         color=HIGH,
-        label="EMA same span",
+        label="High same span",
     )
     axes[0].plot(
         distance,
-        [row["ema_high_shuffled_cosine"] for row in rows],
+        [row["high_shuffled_cosine"] for row in rows],
         color=NULL,
         linestyle="--",
-        label="EMA shuffled",
+        label="High shuffled",
     )
     axes[0].plot(
         distance,
-        [row["ema_low_positive_cosine"] for row in rows],
+        [row["low_positive_cosine"] for row in rows],
         color=LOW,
         linestyle=":",
-        label="EMA low same span",
+        label="Low same span",
     )
     axes[1].plot(
         distance,
-        [row["online_high_margin"] for row in rows],
-        color="#0ea5e9",
+        [row["high_margin"] for row in rows],
+        color=HIGH,
         marker="o",
-        label="Online",
+        label="Positive - shuffled",
     )
     axes[1].fill_between(
         distance,
-        [row["online_high_margin_ci95_low"] for row in rows],
-        [row["online_high_margin_ci95_high"] for row in rows],
-        color="#0ea5e9",
+        [row["high_margin_ci95_low"] for row in rows],
+        [row["high_margin_ci95_high"] for row in rows],
+        color=HIGH,
         alpha=0.15,
-    )
-    axes[1].plot(
-        distance,
-        [row["ema_high_margin"] for row in rows],
-        color=HIGH,
-        marker="o",
-        label="EMA",
-    )
-    axes[1].fill_between(
-        distance,
-        [row["ema_high_margin_ci95_low"] for row in rows],
-        [row["ema_high_margin_ci95_high"] for row in rows],
-        color=HIGH,
-        alpha=0.12,
     )
     axes[1].axhline(0, color="#334155", linewidth=1)
     axes[2].plot(
         distance,
-        [row["ema_swap_reconstruction_fvu"] for row in rows],
+        [row["reconstruction_fvu"] for row in rows],
+        color=TOTAL,
+        label="Ordinary reconstruction",
+    )
+    axes[2].plot(
+        distance,
+        [row["swap_reconstruction_fvu"] for row in rows],
         marker="o",
         color=HIGH,
         label="Same-span high swap",
     )
     axes[2].plot(
         distance,
-        [row["ema_shuffled_swap_fvu"] for row in rows],
+        [row["shuffled_swap_fvu"] for row in rows],
         color=NULL,
         linestyle="--",
         label="Shuffled high swap",
@@ -288,22 +267,20 @@ def invariance_plot(report: dict[str, Any], figures: Path) -> None:
 def probe_plot(report: dict[str, Any], figures: Path) -> None:
     probes = report["mmlu_probe_accuracy"]
     preferred = [
-        "high_mean_online",
-        "high_mean_ema",
-        "endpoint_high_ema",
-        "low_mean_ema",
-        "endpoint_low_ema",
-        "endpoint_full_ema",
+        "high_mean",
+        "endpoint_high",
+        "low_mean",
+        "endpoint_low",
+        "endpoint_full",
     ]
     labels = {
-        "high_mean_online": "Window high mean (online)",
-        "high_mean_ema": "Window high mean (EMA)",
-        "endpoint_high_ema": "Endpoint high (EMA)",
-        "low_mean_ema": "Window low mean (EMA)",
-        "endpoint_low_ema": "Endpoint low (EMA)",
-        "endpoint_full_ema": "Endpoint full (EMA)",
+        "high_mean": "Window high mean",
+        "endpoint_high": "Endpoint high",
+        "low_mean": "Window low mean",
+        "endpoint_low": "Endpoint low",
+        "endpoint_full": "Endpoint full",
     }
-    colors = ["#0ea5e9", HIGH, "#047857", LOW, "#65a30d", TOTAL]
+    colors = [HIGH, "#047857", LOW, "#65a30d", TOTAL]
     fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.0))
     for axis, (probe_axis, results) in zip(axes, probes.items()):
         names = [name for name in preferred if name in results]
@@ -375,8 +352,6 @@ def write_html(
     causal_summary: dict[str, Any] | None,
 ) -> None:
     quality = report["standard_sae_quality"]
-    online = quality["online"]
-    ema = quality["ema"]
     recovered = report.get("loss_recovered")
     invariant = report["view_invariance"]
     rdm = report["rdm_validation"]
@@ -393,8 +368,7 @@ def write_html(
         f'<section><h2>{html.escape(title)}</h2><img src="{path}" alt="{html.escape(title)}"></section>'
         for title, path in figures
     )
-    online_recovered = "skipped" if recovered is None else fmt(recovered["fraction_loss_recovered_online"])
-    ema_recovered = "skipped" if recovered is None else fmt(recovered["fraction_loss_recovered_ema"])
+    recovered_value = "skipped" if recovered is None else fmt(recovered["fraction_loss_recovered"])
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Rectified LpJEPA-SAE evaluation</title>
@@ -408,13 +382,14 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
 <h1>Predictor-free Rectified LpJEPA-SAE</h1>
-<p class="subtitle">Two exchangeable token positions are encoded by one online SAE. High codes are aligned directly and matched to a sparse Rectified Generalized Gaussian target; the EMA SAE is the final artifact, not a training teacher.</p>
+<p class="subtitle">Two exchangeable token positions are encoded by one SAE. High codes are aligned directly and matched to a sparse Rectified Generalized Gaussian target with random-projection and axis-aligned RDMReg.</p>
 <div class="metrics">
-<div class="metric"><span>Online / EMA full FVE</span><strong>{fmt(online['fraction_variance_explained'])} / {fmt(ema['fraction_variance_explained'])}</strong></div>
-<div class="metric"><span>Online / EMA high active</span><strong>{fmt(online['high_active_fraction'])} / {fmt(ema['high_active_fraction'])}</strong></div>
-<div class="metric"><span>Online / EMA loss recovered</span><strong>{online_recovered} / {ema_recovered}</strong></div>
-<div class="metric"><span>EMA positive-shuffled margin</span><strong>{fmt(invariant['overall_ema_high_margin']['mean'])}</strong></div>
+<div class="metric"><span>Full SAE FVE</span><strong>{fmt(quality['fraction_variance_explained'])}</strong></div>
+<div class="metric"><span>High active fraction</span><strong>{fmt(quality['high_active_fraction'])}</strong></div>
+<div class="metric"><span>Loss recovered</span><strong>{recovered_value}</strong></div>
+<div class="metric"><span>Positive-shuffled margin</span><strong>{fmt(invariant['overall_high_margin']['mean'])}</strong></div>
 <div class="metric"><span>Held-out RDMReg</span><strong>{fmt(rdm['rdm_loss'])}</strong></div>
+<div class="metric"><span>Axis-aligned RDMReg</span><strong>{fmt(rdm['axis_aligned_rdm_loss'])}</strong></div>
 <div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>
 </div>{figure_html}
 <section><h2>Machine-readable artifacts</h2><p><code>analysis/rectified_lpjepa_report.json</code>, <code>distance_metrics.csv</code>, and <code>mmlu_probe_accuracy.csv</code>.</p></section>

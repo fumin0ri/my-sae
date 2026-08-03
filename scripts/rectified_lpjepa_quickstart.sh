@@ -37,6 +37,8 @@ INVARIANCE_WEIGHT="${INVARIANCE_WEIGHT:-1}"
 RDM_WEIGHT="${RDM_WEIGHT:-5}"
 RDM_PROJECTIONS="${RDM_PROJECTIONS:-1024}"
 RDM_PROJECTION_CHUNK_SIZE="${RDM_PROJECTION_CHUNK_SIZE:-128}"
+AXIS_RDM_FEATURES="${AXIS_RDM_FEATURES:-512}"
+AXIS_RDM_WEIGHT="${AXIS_RDM_WEIGHT:-1}"
 
 TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-1000}"
@@ -104,7 +106,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -161,6 +163,8 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --invariance-weight "$INVARIANCE_WEIGHT" --rdm-weight "$RDM_WEIGHT" \
     --rdm-projections "$RDM_PROJECTIONS" \
     --rdm-projection-chunk-size "$RDM_PROJECTION_CHUNK_SIZE" \
+    --axis-rdm-features "$AXIS_RDM_FEATURES" \
+    --axis-rdm-weight "$AXIS_RDM_WEIGHT" \
     --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
     --regularization-ramp-steps "$REGULARIZATION_RAMP_STEPS" \
     --batch-size "$BATCH_SIZE" --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
@@ -223,7 +227,7 @@ fi
 
 if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
   if [[ "$RUN_CAUSAL" == "1" ]]; then
-    echo "[7/8] Patch, ablate, and norm-match EMA high features"
+    echo "[7/8] Patch, ablate, and norm-match high features"
     for MODE in patch ablate random_ablate; do
       OUTPUT_MODE="$MODE"
       if [[ "$MODE" == "random_ablate" ]]; then OUTPUT_MODE="random"; fi
@@ -231,7 +235,7 @@ if (( START_STAGE <= 7 && END_STAGE >= 7 )); then
         "${MODEL_LOAD_ARGS[@]}" --pairs "$CAUSAL_PAIRS" \
         --checkpoint "$CHECKPOINT" \
         --output "$RUN_DIR/analysis/intervention-$OUTPUT_MODE.jsonl" \
-        --layer "$LAYER" --hook-point post --mode "$MODE" --sae-variant ema \
+        --layer "$LAYER" --hook-point post --mode "$MODE" \
         --max-pairs "$PAIRS" --minimum-pairs "$PAIRS" --seed "$SEED"
     done
   else

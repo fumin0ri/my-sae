@@ -93,12 +93,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--hook-point", choices=["pre", "post"], default="post")
     parser.add_argument(
-        "--sae-variant",
-        choices=["online", "ema"],
-        default="ema",
-        help="EMA is the final SAE; online is retained as a comparison.",
-    )
-    parser.add_argument(
         "--mode",
         choices=["patch", "ablate", "random_ablate"],
         default="patch",
@@ -249,9 +243,8 @@ def main() -> None:
         ].to(dtype=sae_dtype)
         source_endpoint = source_hidden[0, -1:].to(dtype=sae_dtype)
         with torch.inference_mode():
-            encode = jepa.encode if args.sae_variant == "online" else jepa.encode_ema
-            source_high, _ = jepa.split_code(encode(source_endpoint))
-            target_high, _ = jepa.split_code(encode(target_endpoint))
+            source_high, _ = jepa.split_code(jepa.encode(source_endpoint))
+            target_high, _ = jepa.split_code(jepa.encode(target_endpoint))
             source_high = restrict_features(source_high, args.feature_ids)
             target_high = restrict_features(target_high, args.feature_ids)
             code_delta = (
@@ -259,9 +252,7 @@ def main() -> None:
                 if args.mode == "patch"
                 else -target_high
             )
-            learned_delta = jepa.decode_high(
-                code_delta, ema=args.sae_variant == "ema", add_bias=False
-            )[0]
+            learned_delta = jepa.decode_high(code_delta, add_bias=False)[0]
             delta = learned_delta
             if args.mode == "random_ablate":
                 generator = torch.Generator(device="cpu").manual_seed(
@@ -361,7 +352,6 @@ def main() -> None:
                 "row_index": row_index,
                 "eligible_index": eligible_index,
                 "mode": args.mode,
-                "sae_variant": args.sae_variant,
                 "alpha": args.alpha,
                 "target_position": endpoint_position,
                 "feature_ids": list(args.feature_ids),

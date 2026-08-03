@@ -64,16 +64,9 @@ def evaluate_sae_quality(
     device: torch.device,
     amp_dtype: str,
 ) -> dict[str, Any]:
-    """Compare online and EMA SAE quality on exactly the same residuals."""
-    totals: dict[str, dict[str, float]] = {
-        "online": defaultdict(float),
-        "ema": defaultdict(float),
-    }
-    active_features = {
-        "online": torch.zeros(model.cfg.d_sae, dtype=torch.float32),
-        "ema": torch.zeros(model.cfg.d_sae, dtype=torch.float32),
-    }
-    alignment: dict[str, float] = defaultdict(float)
+    """Evaluate the single trained SAE on held-out residuals."""
+    totals: dict[str, float] = defaultdict(float)
+    active_features = torch.zeros(model.cfg.d_sae, dtype=torch.float32)
     positions = 0
     residual_batch_size = batch_size * model.cfg.max_span_length
     for x in tqdm(
@@ -82,94 +75,66 @@ def evaluate_sae_quality(
     ):
         x = x.to(device, dtype=model.pre_bias.dtype, non_blocking=True)
         with autocast_context(device, amp_dtype):
-            online_code = model.encode(x)
-            ema_code = model.encode_ema(x)
-            variants = {
-                "online": (online_code, model.decode(online_code), model.pre_bias, False),
-                "ema": (ema_code, model.decode_ema(ema_code), model.ema_pre_bias, True),
-            }
-        x32 = x.float()
-        for name, (code, reconstruction, bias, use_ema) in variants.items():
+            code = model.encode(x)
+            reconstruction = model.decode(code)
             high, low = model.split_code(code)
-            with autocast_context(device, amp_dtype):
-                high_reconstruction = model.decode_high(high, ema=use_ema)
-                low_reconstruction = bias + model.decode_low(
-                    low, ema=use_ema, add_bias=False
-                )
-            local = totals[name]
-            local["centered_energy"] += float((x32 - bias.float()).square().sum())
-            local["full_squared_error"] += float(
-                (x32 - reconstruction.float()).square().sum()
+            high_reconstruction = model.decode_high(high)
+            low_reconstruction = model.pre_bias + model.decode_low(
+                low, add_bias=False
             )
-            local["high_squared_error"] += float(
-                (x32 - high_reconstruction.float()).square().sum()
-            )
-            local["low_squared_error"] += float(
-                (x32 - low_reconstruction.float()).square().sum()
-            )
-            local["l2_loss_sum"] += float(
-                torch.linalg.vector_norm(x32 - reconstruction.float(), dim=-1).sum()
-            )
-            local["cosine_sum"] += float(
-                F.cosine_similarity(x32, reconstruction.float(), dim=-1).sum()
-            )
-            local["l1_sum"] += float(code.float().abs().sum())
-            local["l0_sum"] += float((code != 0).float().sum())
-            local["high_l0_sum"] += float((high != 0).float().sum())
-            local["low_l0_sum"] += float((low != 0).float().sum())
-            active_features[name] += (code != 0).reshape(-1, model.cfg.d_sae).any(
-                dim=0
-            ).float().cpu()
-        online_active = online_code > 0
-        ema_active = ema_code > 0
-        intersection = (online_active & ema_active).sum(dim=-1).float()
-        union = (online_active | ema_active).sum(dim=-1).float().clamp_min(1)
-        alignment["code_cosine_sum"] += float(
-            F.cosine_similarity(online_code.float(), ema_code.float(), dim=-1).sum()
+        x32 = x.float()
+        totals["centered_energy"] += float(
+            (x32 - model.pre_bias.float()).square().sum()
         )
-        alignment["support_jaccard_sum"] += float((intersection / union).sum())
+        totals["full_squared_error"] += float(
+            (x32 - reconstruction.float()).square().sum()
+        )
+        totals["high_squared_error"] += float(
+            (x32 - high_reconstruction.float()).square().sum()
+        )
+        totals["low_squared_error"] += float(
+            (x32 - low_reconstruction.float()).square().sum()
+        )
+        totals["l2_loss_sum"] += float(
+            torch.linalg.vector_norm(x32 - reconstruction.float(), dim=-1).sum()
+        )
+        totals["cosine_sum"] += float(
+            F.cosine_similarity(x32, reconstruction.float(), dim=-1).sum()
+        )
+        totals["l1_sum"] += float(code.float().abs().sum())
+        totals["l0_sum"] += float((code != 0).float().sum())
+        totals["high_l0_sum"] += float((high != 0).float().sum())
+        totals["low_l0_sum"] += float((low != 0).float().sum())
+        active_features += (code != 0).reshape(-1, model.cfg.d_sae).any(
+            dim=0
+        ).float().cpu()
         positions += x.numel() // model.cfg.d_in
     if positions == 0:
         raise ValueError("no Pile validation activations were evaluated")
 
-    def finalize(name: str) -> dict[str, float | int]:
-        local = totals[name]
-        scale = max(local["centered_energy"], 1e-12)
-        full_fvu = local["full_squared_error"] / scale
-        high_fvu = local["high_squared_error"] / scale
-        low_fvu = local["low_squared_error"] / scale
-        alive = active_features[name] != 0
-        return {
-            "l2_loss": local["l2_loss_sum"] / positions,
-            "l1": local["l1_sum"] / positions,
-            "l0": local["l0_sum"] / positions,
-            "high_l0": local["high_l0_sum"] / positions,
-            "low_l0": local["low_l0_sum"] / positions,
-            "high_active_fraction": local["high_l0_sum"]
-            / (positions * model.cfg.d_high),
-            "reconstruction_cosine": local["cosine_sum"] / positions,
-            "reconstruction_fvu": full_fvu,
-            "fraction_variance_explained": 1.0 - full_fvu,
-            "high_only_fvu": high_fvu,
-            "high_only_fraction_variance_explained": 1.0 - high_fvu,
-            "low_only_fvu": low_fvu,
-            "low_only_fraction_variance_explained": 1.0 - low_fvu,
-            "alive_feature_fraction": float(alive.float().mean()),
-            "dead_feature_fraction": float((~alive).float().mean()),
-            "n_positions": positions,
-        }
-
-    online = finalize("online")
-    ema = finalize("ema")
+    scale = max(totals["centered_energy"], 1e-12)
+    full_fvu = totals["full_squared_error"] / scale
+    high_fvu = totals["high_squared_error"] / scale
+    low_fvu = totals["low_squared_error"] / scale
+    alive = active_features != 0
     return {
-        "online": online,
-        "ema": ema,
-        "online_ema_alignment": {
-            "code_cosine": alignment["code_cosine_sum"] / positions,
-            "support_jaccard": alignment["support_jaccard_sum"] / positions,
-            "fve_online_minus_ema": online["fraction_variance_explained"]
-            - ema["fraction_variance_explained"],
-        },
+        "l2_loss": totals["l2_loss_sum"] / positions,
+        "l1": totals["l1_sum"] / positions,
+        "l0": totals["l0_sum"] / positions,
+        "high_l0": totals["high_l0_sum"] / positions,
+        "low_l0": totals["low_l0_sum"] / positions,
+        "high_active_fraction": totals["high_l0_sum"]
+        / (positions * model.cfg.d_high),
+        "reconstruction_cosine": totals["cosine_sum"] / positions,
+        "reconstruction_fvu": full_fvu,
+        "fraction_variance_explained": 1.0 - full_fvu,
+        "high_only_fvu": high_fvu,
+        "high_only_fraction_variance_explained": 1.0 - high_fvu,
+        "low_only_fvu": low_fvu,
+        "low_only_fraction_variance_explained": 1.0 - low_fvu,
+        "alive_feature_fraction": float(alive.float().mean()),
+        "dead_feature_fraction": float((~alive).float().mean()),
+        "n_positions": positions,
     }
 
 
@@ -214,61 +179,51 @@ def evaluate_view_invariance(
         view_b = batch["view_b"].to(device, dtype=model.pre_bias.dtype)
         distance = batch["distance"].tolist()
         with autocast_context(device, amp_dtype):
-            online_a = model.encode(view_a)
-            online_b = model.encode(view_b)
-            ema_a = model.encode_ema(view_a)
-            ema_b = model.encode_ema(view_b)
-        online_high_a, online_low_a = model.split_code(online_a)
-        online_high_b, online_low_b = model.split_code(online_b)
-        ema_high_a, ema_low_a = model.split_code(ema_a)
-        ema_high_b, ema_low_b = model.split_code(ema_b)
+            code_a = model.encode(view_a)
+            code_b = model.encode(view_b)
+        high_a, low_a = model.split_code(code_a)
+        high_b, low_b = model.split_code(code_b)
         permutation = torch.roll(torch.arange(len(view_a), device=device), 1)
-        online_positive = F.cosine_similarity(
-            online_high_a.float(), online_high_b.float(), dim=-1
+        high_positive = F.cosine_similarity(
+            high_a.float(), high_b.float(), dim=-1
         )
-        online_shuffled = F.cosine_similarity(
-            online_high_a.float(),
-            online_high_b.index_select(0, permutation).float(),
+        high_shuffled = F.cosine_similarity(
+            high_a.float(),
+            high_b.index_select(0, permutation).float(),
             dim=-1,
         )
-        ema_positive = F.cosine_similarity(
-            ema_high_a.float(), ema_high_b.float(), dim=-1
-        )
-        ema_shuffled = F.cosine_similarity(
-            ema_high_a.float(), ema_high_b.index_select(0, permutation).float(), dim=-1
-        )
         low_positive = F.cosine_similarity(
-            ema_low_a.float(), ema_low_b.float(), dim=-1
+            low_a.float(), low_b.float(), dim=-1
         )
-        energy_a = (view_a - model.ema_pre_bias).float().square().mean(dim=-1).clamp_min(1e-8)
-        # EMA codes are BF16 under CUDA autocast while the stored EMA decoder
-        # remains FP32. Keep swap decoding under the same autocast policy used
-        # by ordinary SAE reconstruction instead of multiplying mixed dtypes.
+        residual_energy = (view_a - model.pre_bias).float().square().sum(dim=-1)
         with autocast_context(device, amp_dtype):
-            swapped = model.decode_high(
-                ema_high_b, ema=True
-            ) + model.decode_low(ema_low_a, ema=True, add_bias=False)
+            reconstruction = model.decode(code_a)
+            swapped = model.decode_high(high_b) + model.decode_low(
+                low_a, add_bias=False
+            )
             shuffled_swap = model.decode_high(
-                ema_high_b.index_select(0, permutation), ema=True
-            ) + model.decode_low(ema_low_a, ema=True, add_bias=False)
-        swap_fvu = (swapped - view_a).float().square().mean(dim=-1) / energy_a
-        shuffled_swap_fvu = (
-            (shuffled_swap - view_a).float().square().mean(dim=-1) / energy_a
-        )
+                high_b.index_select(0, permutation)
+            ) + model.decode_low(low_a, add_bias=False)
+        reconstruction_squared_error = (
+            reconstruction - view_a
+        ).float().square().sum(dim=-1)
+        swap_squared_error = (swapped - view_a).float().square().sum(dim=-1)
+        shuffled_swap_squared_error = (
+            shuffled_swap - view_a
+        ).float().square().sum(dim=-1)
         high_nrmse = torch.linalg.vector_norm(
-            ema_high_a.float() - ema_high_b.float(), dim=-1
-        ) / torch.linalg.vector_norm(ema_high_b.float(), dim=-1).clamp_min(1e-8)
+            high_a.float() - high_b.float(), dim=-1
+        ) / torch.linalg.vector_norm(high_b.float(), dim=-1).clamp_min(1e-8)
         tensors = {
-            "online_high_positive_cosine": online_positive,
-            "online_high_shuffled_cosine": online_shuffled,
-            "online_high_margin": online_positive - online_shuffled,
-            "ema_high_positive_cosine": ema_positive,
-            "ema_high_shuffled_cosine": ema_shuffled,
-            "ema_high_margin": ema_positive - ema_shuffled,
-            "ema_low_positive_cosine": low_positive,
-            "ema_high_nrmse": high_nrmse,
-            "ema_swap_reconstruction_fvu": swap_fvu,
-            "ema_shuffled_swap_fvu": shuffled_swap_fvu,
+            "high_positive_cosine": high_positive,
+            "high_shuffled_cosine": high_shuffled,
+            "high_margin": high_positive - high_shuffled,
+            "low_positive_cosine": low_positive,
+            "high_nrmse": high_nrmse,
+            "residual_energy": residual_energy,
+            "reconstruction_squared_error": reconstruction_squared_error,
+            "swap_squared_error": swap_squared_error,
+            "shuffled_swap_squared_error": shuffled_swap_squared_error,
         }
         for row, horizon in enumerate(distance):
             for name, values in tensors.items():
@@ -276,31 +231,43 @@ def evaluate_view_invariance(
     curve: list[dict[str, Any]] = []
     for distance, values in sorted(by_distance.items()):
         row: dict[str, Any] = {"distance": distance, "n": len(next(iter(values.values())))}
-        for metric_index, (name, samples) in enumerate(values.items()):
+        reported = {
+            name: samples
+            for name, samples in values.items()
+            if not name.endswith("_squared_error") and name != "residual_energy"
+        }
+        for metric_index, (name, samples) in enumerate(reported.items()):
             summary = _mean_ci(samples, seed + distance * 100 + metric_index)
             row[name] = summary["mean"]
             if name.endswith("margin"):
                 row[f"{name}_ci95_low"] = summary["ci95_low"]
                 row[f"{name}_ci95_high"] = summary["ci95_high"]
+        energy = max(sum(values["residual_energy"]), 1e-12)
+        row["reconstruction_fvu"] = sum(
+            values["reconstruction_squared_error"]
+        ) / energy
+        row["swap_reconstruction_fvu"] = sum(
+            values["swap_squared_error"]
+        ) / energy
+        row["shuffled_swap_fvu"] = sum(
+            values["shuffled_swap_squared_error"]
+        ) / energy
+        row["swap_penalty_fvu"] = (
+            row["swap_reconstruction_fvu"] - row["reconstruction_fvu"]
+        )
+        row["shuffled_swap_penalty_fvu"] = (
+            row["shuffled_swap_fvu"] - row["reconstruction_fvu"]
+        )
         curve.append(row)
-    all_online_margin = [
-        value for metrics in by_distance.values() for value in metrics["online_high_margin"]
+    all_margin = [
+        value for metrics in by_distance.values() for value in metrics["high_margin"]
     ]
-    all_ema_margin = [
-        value for metrics in by_distance.values() for value in metrics["ema_high_margin"]
-    ]
+    margin_summary = _mean_ci(all_margin, seed + 1)
     return {
         "distance_curve": curve,
-        "overall_online_high_margin": _mean_ci(all_online_margin, seed + 1),
-        "overall_ema_high_margin": _mean_ci(all_ema_margin, seed + 2),
-        "online_positive_over_shuffled": _mean_ci(all_online_margin, seed + 1)[
-            "ci95_low"
-        ]
-        > 0,
-        "ema_positive_over_shuffled": _mean_ci(all_ema_margin, seed + 2)[
-            "ci95_low"
-        ]
-        > 0,
+        "overall_high_margin": margin_summary,
+        "positive_over_shuffled": margin_summary["ci95_low"] > 0,
+        "swap_fvu_aggregation": "sum squared error divided by sum centered residual energy",
     }
 
 
@@ -388,33 +355,22 @@ def evaluate_loss_recovered(
         attention_mask = encoded.get("attention_mask", torch.ones_like(encoded["input_ids"]))
         original = llm(**encoded, use_cache=False).logits
 
-        def reconstruct_online(hidden: torch.Tensor) -> torch.Tensor:
+        def reconstruct(hidden: torch.Tensor) -> torch.Tensor:
             value = hidden.to(sae.pre_bias.dtype)
             return sae.decode(sae.encode(value)).to(hidden.dtype)
 
-        def reconstruct_ema(hidden: torch.Tensor) -> torch.Tensor:
-            value = hidden.to(sae.pre_bias.dtype)
-            return sae.decode_ema(sae.encode_ema(value)).to(hidden.dtype)
-
-        with edit_residual(layer, hook_point, reconstruct_online):
-            reconstructed_online = llm(**encoded, use_cache=False).logits
-        with edit_residual(layer, hook_point, reconstruct_ema):
-            reconstructed_ema = llm(**encoded, use_cache=False).logits
+        with edit_residual(layer, hook_point, reconstruct):
+            reconstructed = llm(**encoded, use_cache=False).logits
         with edit_residual(layer, hook_point, torch.zeros_like):
             zero = llm(**encoded, use_cache=False).logits
         losses = {
             "loss_original": causal_lm_loss(original, encoded["input_ids"], attention_mask),
-            "loss_reconstructed_online": causal_lm_loss(reconstructed_online, encoded["input_ids"], attention_mask),
-            "loss_reconstructed_ema": causal_lm_loss(reconstructed_ema, encoded["input_ids"], attention_mask),
+            "loss_reconstructed": causal_lm_loss(reconstructed, encoded["input_ids"], attention_mask),
             "loss_zero": causal_lm_loss(zero, encoded["input_ids"], attention_mask),
         }
         denominator = losses["loss_original"] - losses["loss_zero"]
-        totals["fraction_loss_recovered_online"] += float(
-            (losses["loss_reconstructed_online"] - losses["loss_zero"])
-            / denominator.clamp_max(-1e-8)
-        )
-        totals["fraction_loss_recovered_ema"] += float(
-            (losses["loss_reconstructed_ema"] - losses["loss_zero"])
+        totals["fraction_loss_recovered"] += float(
+            (losses["loss_reconstructed"] - losses["loss_zero"])
             / denominator.clamp_max(-1e-8)
         )
         for key, value in losses.items():
@@ -436,17 +392,14 @@ def _representation_batch(
 ) -> dict[str, torch.Tensor]:
     batch_size, width, _ = batch.shape
     flat = batch.reshape(-1, model.cfg.d_in)
-    online = model.encode(flat).reshape(batch_size, width, model.cfg.d_sae)
-    ema = model.encode_ema(flat).reshape(batch_size, width, model.cfg.d_sae)
-    online_high, _ = model.split_code(online)
-    ema_high, ema_low = model.split_code(ema)
+    code = model.encode(flat).reshape(batch_size, width, model.cfg.d_sae)
+    high, low = model.split_code(code)
     return {
-        "high_mean_online": online_high.mean(dim=1),
-        "high_mean_ema": ema_high.mean(dim=1),
-        "endpoint_high_ema": ema_high[:, -1],
-        "low_mean_ema": ema_low.mean(dim=1),
-        "endpoint_low_ema": ema_low[:, -1],
-        "endpoint_full_ema": ema[:, -1],
+        "high_mean": high.mean(dim=1),
+        "endpoint_high": high[:, -1],
+        "low_mean": low.mean(dim=1),
+        "endpoint_low": low[:, -1],
+        "endpoint_full": code[:, -1],
     }
 
 
@@ -607,6 +560,8 @@ def main() -> None:
         float(train_args.get("rdm_weight", 5.0)),
         min(256, int(train_args.get("rdm_projections", 1024))),
         min(128, int(train_args.get("rdm_projection_chunk_size", 128))),
+        min(512, int(train_args.get("axis_rdm_features", 512))),
+        float(train_args.get("axis_rdm_weight", 1.0)),
     )
     model.eval()
 
@@ -758,9 +713,9 @@ def main() -> None:
     test_tensor = torch.as_tensor(test_indices, dtype=torch.long)
     torch.save(
         {
-            "high_mean_ema": pca_embedding(representations["high_mean_ema"].index_select(0, test_tensor)),
-            "endpoint_high_ema": pca_embedding(representations["endpoint_high_ema"].index_select(0, test_tensor)),
-            "endpoint_low_ema": pca_embedding(representations["endpoint_low_ema"].index_select(0, test_tensor)),
+            "high_mean": pca_embedding(representations["high_mean"].index_select(0, test_tensor)),
+            "endpoint_high": pca_embedding(representations["endpoint_high"].index_select(0, test_tensor)),
+            "endpoint_low": pca_embedding(representations["endpoint_low"].index_select(0, test_tensor)),
             "semantic_labels": [str(metadata[index][PROBE_LABELS["semantics"]]) for index in test_indices],
             "context_labels": [str(metadata[index][PROBE_LABELS["context"]]) for index in test_indices],
             "syntax_labels": [str(metadata[index][PROBE_LABELS["syntax"]]) for index in test_indices],

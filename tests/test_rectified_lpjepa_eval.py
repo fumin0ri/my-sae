@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,16 +27,16 @@ def make_model() -> RectifiedLpJEPASAE:
     return model
 
 
-def test_standard_sae_quality_compares_online_and_ema_on_same_rows(monkeypatch) -> None:
+def test_standard_sae_quality_reports_single_sae(monkeypatch) -> None:
     model = make_model()
     batch = torch.randn(12, 8)
     monkeypatch.setattr(eval_module, "validation_batches", lambda *_args, **_kwargs: iter([batch]))
     result = evaluate_sae_quality(
         model, Path("unused"), {}, 3, 1, torch.device("cpu"), "none"
     )
-    assert set(result) == {"online", "ema", "online_ema_alignment"}
-    assert result["online"]["n_positions"] == 12
-    assert "high_active_fraction" in result["ema"]
+    assert result["n_positions"] == 12
+    assert "high_active_fraction" in result
+    assert "ema" not in result
 
 
 def test_view_invariance_reports_shuffle_null_and_distance_curve(monkeypatch) -> None:
@@ -54,8 +55,51 @@ def test_view_invariance_reports_shuffle_null_and_distance_curve(monkeypatch) ->
         model, Path("unused"), {}, 6, 1, torch.device("cpu"), "none", 0
     )
     assert [row["distance"] for row in result["distance_curve"]] == [1, 2, 3]
-    assert "overall_ema_high_margin" in result
-    assert "ema_swap_reconstruction_fvu" in result["distance_curve"][0]
+    assert "overall_high_margin" in result
+    assert "swap_reconstruction_fvu" in result["distance_curve"][0]
+    assert "swap_penalty_fvu" in result["distance_curve"][0]
+
+
+def test_swap_fvu_uses_ratio_of_aggregate_sums(monkeypatch) -> None:
+    class ScalarSwapModel:
+        cfg = SimpleNamespace(d_in=1, d_sae=2, d_high=1, max_span_length=2)
+        pre_bias = torch.zeros(1)
+
+        def eval(self):
+            return self
+
+        def encode(self, x):
+            return torch.cat((x, torch.zeros_like(x)), dim=-1)
+
+        def split_code(self, code):
+            return code[..., :1], code[..., 1:]
+
+        def decode(self, code):
+            return code[..., :1]
+
+        def decode_high(self, high, *, add_bias=True):
+            return high + self.pre_bias if add_bias else high
+
+        def decode_low(self, low, *, add_bias=False):
+            value = torch.zeros((*low.shape[:-1], 1), dtype=low.dtype)
+            return value + self.pre_bias if add_bias else value
+
+    batch = {
+        "view_a": torch.tensor([[1.0], [10.0]]),
+        "view_b": torch.tensor([[2.0], [11.0]]),
+        "distance": torch.tensor([1, 1]),
+    }
+    monkeypatch.setattr(
+        eval_module,
+        "validation_view_pair_batches",
+        lambda *_args, **_kwargs: iter([batch]),
+    )
+    result = evaluate_view_invariance(
+        ScalarSwapModel(), Path("unused"), {}, 2, 1, torch.device("cpu"), "none", 0
+    )
+    row = result["distance_curve"][0]
+    assert row["swap_reconstruction_fvu"] == pytest.approx(2.0 / 101.0)
+    assert row["reconstruction_fvu"] == pytest.approx(0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast regression")
@@ -82,7 +126,7 @@ def test_view_invariance_swap_decode_accepts_bfloat16_codes(monkeypatch) -> None
         0,
     )
     assert torch.isfinite(
-        torch.tensor(result["distance_curve"][0]["ema_swap_reconstruction_fvu"])
+        torch.tensor(result["distance_curve"][0]["swap_reconstruction_fvu"])
     )
 
 

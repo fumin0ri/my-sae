@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,7 +22,7 @@ from .io import write_json
 from .training import autocast_context, configure_accelerator, cosine_learning_rate
 
 
-ARCHITECTURE_ID = "high_low_rectified_lpjepa_sae_v1"
+ARCHITECTURE_ID = "high_low_rectified_lpjepa_sae_v2_axis_rdm"
 SUPPORTED_RGG_P = (1.0, 2.0)
 
 
@@ -85,7 +84,6 @@ class RectifiedLpJEPAConfig:
     d_sae: int = 2048
     low_k: int = 32
     max_span_length: int = 10
-    ema_decay: float = 0.996
     high_fraction: float = 0.2
     high_reconstruction_weight: float = 0.1
     rgg_p: float = 1.0
@@ -165,13 +163,6 @@ class RectifiedLpJEPASAE(nn.Module):
         self.encoder = HierarchicalRectifiedEncoder(cfg)
         self.decoder = nn.Parameter(torch.empty(cfg.d_sae, cfg.d_in))
         nn.init.kaiming_uniform_(self.decoder, a=math.sqrt(5))
-        self.ema_encoder = copy.deepcopy(self.encoder)
-        for parameter in self.ema_encoder.parameters():
-            parameter.requires_grad_(False)
-        self.ema_decoder = nn.Parameter(
-            self.decoder.detach().clone(), requires_grad=False
-        )
-        self.register_buffer("ema_pre_bias", self.pre_bias.detach().clone())
 
     @torch.no_grad()
     def initialize_from_statistics(
@@ -187,40 +178,11 @@ class RectifiedLpJEPASAE(nn.Module):
         self.encoder.linear.weight.copy_(self.decoder)
         self.encoder.linear.bias.zero_()
         self.encoder.linear.bias[: self.cfg.d_high].fill_(self.cfg.target_mu)
-        self.sync_ema_sae()
-
-    @torch.no_grad()
-    def sync_ema_sae(self) -> None:
-        self.ema_encoder.load_state_dict(self.encoder.state_dict())
-        self.ema_decoder.copy_(self.decoder)
-        self.ema_pre_bias.copy_(self.pre_bias)
-        self.normalize_ema_decoder()
-
-    @torch.no_grad()
-    def update_ema_sae(self, decay: float | None = None) -> None:
-        rate = self.cfg.ema_decay if decay is None else decay
-        for target, online in zip(
-            self.ema_encoder.parameters(), self.encoder.parameters()
-        ):
-            target.mul_(rate).add_(online.detach(), alpha=1.0 - rate)
-        self.ema_pre_bias.mul_(rate).add_(
-            self.pre_bias.detach(), alpha=1.0 - rate
-        )
-        self.ema_decoder.mul_(rate).add_(
-            self.decoder.detach(), alpha=1.0 - rate
-        )
-        self.normalize_ema_decoder()
 
     @torch.no_grad()
     def normalize_decoder(self) -> None:
         self.decoder.div_(
             self.decoder.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        )
-
-    @torch.no_grad()
-    def normalize_ema_decoder(self) -> None:
-        self.ema_decoder.div_(
-            self.ema_decoder.norm(dim=1, keepdim=True).clamp_min(1e-8)
         )
 
     def split_code(self, code: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,34 +191,21 @@ class RectifiedLpJEPASAE(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder((x - self.pre_bias) / self.pre_scale)
 
-    @torch.no_grad()
-    def encode_ema(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ema_encoder((x - self.ema_pre_bias) / self.pre_scale)
-
     def decode(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
         value = self.pre_scale * (z @ self.decoder)
         return value + self.pre_bias if add_bias else value
 
-    @torch.no_grad()
-    def decode_ema(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
-        value = self.pre_scale * (z @ self.ema_decoder)
-        return value + self.ema_pre_bias if add_bias else value
-
     def decode_high(
-        self, z: torch.Tensor, *, ema: bool, add_bias: bool = True
+        self, z: torch.Tensor, *, add_bias: bool = True
     ) -> torch.Tensor:
-        decoder = self.ema_decoder if ema else self.decoder
-        bias = self.ema_pre_bias if ema else self.pre_bias
-        value = self.pre_scale * (z @ decoder[: self.cfg.d_high])
-        return value + bias if add_bias else value
+        value = self.pre_scale * (z @ self.decoder[: self.cfg.d_high])
+        return value + self.pre_bias if add_bias else value
 
     def decode_low(
-        self, z: torch.Tensor, *, ema: bool, add_bias: bool = False
+        self, z: torch.Tensor, *, add_bias: bool = False
     ) -> torch.Tensor:
-        decoder = self.ema_decoder if ema else self.decoder
-        bias = self.ema_pre_bias if ema else self.pre_bias
-        value = self.pre_scale * (z @ decoder[self.cfg.d_high :])
-        return value + bias if add_bias else value
+        value = self.pre_scale * (z @ self.decoder[self.cfg.d_high :])
+        return value + self.pre_bias if add_bias else value
 
     def forward(
         self, view_a: torch.Tensor, view_b: torch.Tensor
@@ -269,13 +218,13 @@ class RectifiedLpJEPASAE(nn.Module):
         code_b = self.encode(view_b)
         high_a, low_a = self.split_code(code_a)
         high_b, low_b = self.split_code(code_b)
-        high_reconstruction_a = self.decode_high(high_a, ema=False)
-        high_reconstruction_b = self.decode_high(high_b, ema=False)
+        high_reconstruction_a = self.decode_high(high_a)
+        high_reconstruction_b = self.decode_high(high_b)
         full_reconstruction_a = high_reconstruction_a + self.decode_low(
-            low_a, ema=False, add_bias=False
+            low_a, add_bias=False
         )
         full_reconstruction_b = high_reconstruction_b + self.decode_low(
-            low_b, ema=False, add_bias=False
+            low_b, add_bias=False
         )
         return {
             "code_a": code_a,
@@ -290,15 +239,36 @@ class RectifiedLpJEPASAE(nn.Module):
             "full_reconstruction_b": full_reconstruction_b,
         }
 
-    @torch.no_grad()
-    def final_ema_sae_state_dict(self) -> dict[str, torch.Tensor]:
-        return {
-            "pre_bias": self.ema_pre_bias.detach(),
-            "pre_scale": self.pre_scale.detach(),
-            "encoder.linear.weight": self.ema_encoder.linear.weight.detach(),
-            "encoder.linear.bias": self.ema_encoder.linear.bias.detach(),
-            "decoder": self.ema_decoder.detach(),
-        }
+def axis_aligned_distribution_matching_loss(
+    views: tuple[torch.Tensor, ...],
+    target: torch.Tensor,
+    features: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match coordinate marginals to the RGG target with axis-aligned 1D OT."""
+    if not views or any(view.ndim != 2 for view in views):
+        raise ValueError("views must be non-empty matrices")
+    if target.ndim != 2 or any(view.shape != target.shape for view in views):
+        raise ValueError("axis RDM views and target must have the same shape")
+    if features < 0:
+        raise ValueError("axis RDM feature count must be non-negative")
+    zero = views[0].float().sum() * 0.0
+    if features == 0:
+        return zero, torch.zeros((), device=target.device, dtype=torch.long)
+    dimension = target.shape[-1]
+    count = min(features, dimension)
+    indices = torch.randperm(dimension, device=target.device)[:count]
+    target_axes = torch.sort(target.index_select(-1, indices), dim=0).values
+    raw = sum(
+        (
+            torch.sort(view.float().index_select(-1, indices), dim=0).values
+            - target_axes
+        )
+        .square()
+        .mean()
+        for view in views
+    ) / len(views)
+    target_energy = target_axes.square().mean().clamp_min(1e-8)
+    return raw / target_energy, torch.as_tensor(count, device=target.device)
 
 
 def rectified_distribution_matching_loss(
@@ -306,8 +276,10 @@ def rectified_distribution_matching_loss(
     cfg: RectifiedLpJEPAConfig,
     projections: int,
     projection_chunk_size: int,
+    axis_features: int = 0,
+    axis_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Sliced 2-Wasserstein matching to an i.i.d. RGG product target."""
+    """Random-projection and axis-aligned 2-Wasserstein RGG matching."""
     if not views or any(view.ndim != 2 for view in views):
         raise ValueError("views must be non-empty [batch, d_high] matrices")
     if any(view.shape != views[0].shape for view in views):
@@ -316,6 +288,8 @@ def rectified_distribution_matching_loss(
         raise ValueError("RDM views must contain only the high code")
     if projections < 1 or projection_chunk_size < 1:
         raise ValueError("projection counts must be positive")
+    if axis_features < 0 or axis_weight < 0:
+        raise ValueError("axis RDM feature count and weight must be non-negative")
     batch, dimension = views[0].shape
     target = sample_rectified_generalized_gaussian(
         (batch, dimension),
@@ -353,8 +327,16 @@ def rectified_distribution_matching_loss(
         total = total + width * chunk_raw / target_energy
         raw_total = raw_total + width * chunk_raw
         completed += width
-    return total / projections, {
-        "raw": raw_total / projections,
+    random_projection = total / projections
+    axis_aligned, sampled_axes = axis_aligned_distribution_matching_loss(
+        views, target, axis_features
+    )
+    combined = random_projection + axis_weight * axis_aligned
+    return combined, {
+        "random_projection": random_projection,
+        "random_projection_raw": raw_total / projections,
+        "axis_aligned": axis_aligned,
+        "axis_sampled_features": sampled_axes,
         "target_active_fraction": (target > 0).float().mean(),
         "target_l0": (target > 0).sum(dim=-1).float().mean(),
         "target_second_moment": target.square().mean(),
@@ -400,6 +382,8 @@ def rectified_lpjepa_loss(
     rdm_weight: float,
     rdm_projections: int,
     rdm_projection_chunk_size: int,
+    axis_rdm_features: int = 0,
+    axis_rdm_weight: float = 1.0,
     distance: torch.Tensor | None = None,
     collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -416,6 +400,8 @@ def rectified_lpjepa_loss(
             model.cfg,
             rdm_projections,
             rdm_projection_chunk_size,
+            axis_rdm_features,
+            axis_rdm_weight,
         )
     else:
         target = sample_rectified_generalized_gaussian(
@@ -427,7 +413,12 @@ def rectified_lpjepa_loss(
         )
         rdm = outputs["high_a"].float().sum() * 0.0
         rdm_metrics = {
-            "raw": rdm,
+            "random_projection": rdm,
+            "random_projection_raw": rdm,
+            "axis_aligned": rdm,
+            "axis_sampled_features": torch.zeros(
+                (), device=rdm.device, dtype=torch.long
+            ),
             "target_active_fraction": (target > 0).float().mean(),
             "target_l0": (target > 0).sum(dim=-1).float().mean(),
             "target_second_moment": target.square().mean(),
@@ -455,12 +446,12 @@ def rectified_lpjepa_loss(
         low_positive = F.cosine_similarity(
             outputs["low_a"].float(), outputs["low_b"].float(), dim=-1
         )
-        swap_a = model.decode_high(
-            outputs["high_b"], ema=False
-        ) + model.decode_low(outputs["low_a"], ema=False, add_bias=False)
-        swap_b = model.decode_high(
-            outputs["high_a"], ema=False
-        ) + model.decode_low(outputs["low_b"], ema=False, add_bias=False)
+        swap_a = model.decode_high(outputs["high_b"]) + model.decode_low(
+            outputs["low_a"], add_bias=False
+        )
+        swap_b = model.decode_high(outputs["high_a"]) + model.decode_low(
+            outputs["low_b"], add_bias=False
+        )
         energy = (
             torch.cat(
                 (view_a - model.pre_bias, view_b - model.pre_bias), dim=0
@@ -482,7 +473,14 @@ def rectified_lpjepa_loss(
         "invariance_loss": float(invariance.detach()),
         "invariance_raw_mse": float(invariance_raw.detach()),
         "rdm_loss": float(rdm.detach()),
-        "rdm_raw_swd": float(rdm_metrics["raw"].detach()),
+        "random_projection_rdm_loss": float(
+            rdm_metrics["random_projection"].detach()
+        ),
+        "random_projection_rdm_raw": float(
+            rdm_metrics["random_projection_raw"].detach()
+        ),
+        "axis_aligned_rdm_loss": float(rdm_metrics["axis_aligned"].detach()),
+        "axis_sampled_features": float(rdm_metrics["axis_sampled_features"]),
         "high_positive_cosine": float(high_positive.mean()),
         "high_shuffled_cosine": float(high_shuffled.mean()),
         "high_positive_margin": float((high_positive - high_shuffled).mean()),
@@ -518,66 +516,6 @@ def rectified_lpjepa_loss(
 
 
 @torch.no_grad()
-def _ema_metrics(
-    model: RectifiedLpJEPASAE,
-    view_a: torch.Tensor,
-    view_b: torch.Tensor,
-) -> dict[str, float]:
-    code_a = model.encode_ema(view_a)
-    code_b = model.encode_ema(view_b)
-    high_a, low_a = model.split_code(code_a)
-    high_b, low_b = model.split_code(code_b)
-    reconstruction_a = model.decode_ema(code_a)
-    reconstruction_b = model.decode_ema(code_b)
-    high_reconstruction_a = model.decode_high(high_a, ema=True)
-    high_reconstruction_b = model.decode_high(high_b, ema=True)
-    energy = (
-        torch.cat(
-            (view_a - model.ema_pre_bias, view_b - model.ema_pre_bias), dim=0
-        )
-        .float()
-        .square()
-        .mean()
-        .clamp_min(1e-8)
-    )
-    return {
-        "ema_reconstruction_fvu": float(
-            0.5
-            * (
-                (reconstruction_a - view_a).float().square().mean()
-                + (reconstruction_b - view_b).float().square().mean()
-            )
-            / energy
-        ),
-        "ema_high_reconstruction_fvu": float(
-            0.5
-            * (
-                (high_reconstruction_a - view_a).float().square().mean()
-                + (high_reconstruction_b - view_b).float().square().mean()
-            )
-            / energy
-        ),
-        "ema_high_positive_cosine": float(
-            F.cosine_similarity(high_a.float(), high_b.float(), dim=-1).mean()
-        ),
-        "ema_high_l0": float(
-            0.5
-            * (
-                (high_a > 0).sum(dim=-1).float().mean()
-                + (high_b > 0).sum(dim=-1).float().mean()
-            )
-        ),
-        "ema_low_l0": float(
-            0.5
-            * (
-                (low_a > 0).sum(dim=-1).float().mean()
-                + (low_b > 0).sum(dim=-1).float().mean()
-            )
-        ),
-    }
-
-
-@torch.no_grad()
 def evaluate_losses(
     model: RectifiedLpJEPASAE,
     root: Path,
@@ -591,6 +529,8 @@ def evaluate_losses(
     rdm_weight: float,
     rdm_projections: int,
     rdm_projection_chunk_size: int,
+    axis_rdm_features: int,
+    axis_rdm_weight: float,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
@@ -614,10 +554,9 @@ def evaluate_losses(
                     rdm_weight=rdm_weight,
                     rdm_projections=rdm_projections,
                     rdm_projection_chunk_size=rdm_projection_chunk_size,
+                    axis_rdm_features=axis_rdm_features,
+                    axis_rdm_weight=axis_rdm_weight,
                     distance=batch["distance"],
-                )
-                metrics.update(
-                    _ema_metrics(model, batch["view_a"], batch["view_b"])
                 )
             n = len(batch["view_a"])
             count += n
@@ -653,7 +592,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rdm-weight", type=float, default=5.0)
     parser.add_argument("--rdm-projections", type=int, default=1024)
     parser.add_argument("--rdm-projection-chunk-size", type=int, default=128)
-    parser.add_argument("--ema-decay", type=float, default=0.996)
+    parser.add_argument(
+        "--axis-rdm-features",
+        type=int,
+        default=512,
+        help="High-code coordinates sampled without replacement per step (zero disables).",
+    )
+    parser.add_argument(
+        "--axis-rdm-weight",
+        type=float,
+        default=1.0,
+        help="Axis-aligned RDMReg weight inside the combined RDM term.",
+    )
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--sae-warmup-steps", type=int, default=1000)
     parser.add_argument("--regularization-ramp-steps", type=int, default=1000)
@@ -684,6 +634,8 @@ def main() -> None:
         raise ValueError("invariance and RDM weights must be non-negative")
     if args.rdm_projections < 1 or args.rdm_projection_chunk_size < 1:
         raise ValueError("RDM projection counts must be positive")
+    if args.axis_rdm_features < 0 or args.axis_rdm_weight < 0:
+        raise ValueError("axis RDM feature count and weight must be non-negative")
     torch.manual_seed(args.seed)
     device = torch.device(
         args.device
@@ -700,7 +652,6 @@ def main() -> None:
         d_sae=args.d_sae,
         low_k=args.low_k,
         max_span_length=int(manifest["max_span_length"]),
-        ema_decay=args.ema_decay,
         high_fraction=args.high_fraction,
         high_reconstruction_weight=args.high_reconstruction_weight,
         rgg_p=args.rgg_p,
@@ -763,6 +714,8 @@ def main() -> None:
                     rdm_weight=active_rdm_weight,
                     rdm_projections=args.rdm_projections,
                     rdm_projection_chunk_size=args.rdm_projection_chunk_size,
+                    axis_rdm_features=args.axis_rdm_features,
+                    axis_rdm_weight=args.axis_rdm_weight,
                     distance=batch["distance"],
                     collect_metrics=should_log,
                 )
@@ -782,7 +735,6 @@ def main() -> None:
                 metrics["gradient_norm"] = float(norm)
         optimizer.step()
         model.normalize_decoder()
-        model.update_ema_sae()
         if should_log:
             metrics["active_invariance_weight"] = active_invariance_weight
             metrics["active_rdm_weight"] = active_rdm_weight
@@ -799,6 +751,8 @@ def main() -> None:
                 args.rdm_weight,
                 args.rdm_projections,
                 args.rdm_projection_chunk_size,
+                args.axis_rdm_features,
+                args.axis_rdm_weight,
             )
             history.append(
                 {
@@ -834,20 +788,6 @@ def main() -> None:
         },
         output_dir / checkpoint_name,
     )
-    torch.save(
-        {
-            "architecture_id": ARCHITECTURE_ID,
-            "state_dict": {
-                key: value.cpu()
-                for key, value in model.final_ema_sae_state_dict().items()
-            },
-            "config": asdict(cfg),
-            "source_rectified_checkpoint": checkpoint_name,
-            "data_fingerprint": fingerprint,
-            "source_config": source_config,
-        },
-        output_dir / "ema_sae.pt",
-    )
     write_json(
         output_dir / "training_report.json",
         {
@@ -861,11 +801,11 @@ def main() -> None:
                 "view_sampling": "two exchangeable positions from one random span",
                 "high_activation": "shifted ReLU; no Top-K",
                 "low_activation": "ReLU plus Top-K",
-                "high_role": "high-only reconstruction, view invariance, and RDMReg",
+                "high_role": "high-only reconstruction, view invariance, random-projection and axis-aligned RDMReg",
                 "low_role": "position-specific incremental reconstruction",
                 "predictor": None,
                 "teacher_in_loss": None,
-                "final_sae": "full EMA high/low encoder-decoder pair",
+                "final_sae": "single trained high/low encoder-decoder pair",
             },
             "rgg_target": {
                 "p": cfg.rgg_p,
@@ -882,8 +822,10 @@ def main() -> None:
                 "rdm_weight": args.rdm_weight,
                 "rdm_projections": args.rdm_projections,
                 "rdm_projection_chunk_size": args.rdm_projection_chunk_size,
-                "invariance": "normalized squared L2 between online high codes",
-                "rdm": "normalized sliced two-sample 2-Wasserstein",
+                "axis_rdm_features": min(args.axis_rdm_features, cfg.d_high),
+                "axis_rdm_weight": args.axis_rdm_weight,
+                "invariance": "normalized squared L2 between paired high codes",
+                "rdm": "normalized random-projection plus weighted axis-aligned two-sample 2-Wasserstein",
             },
             "data": {
                 "dataset": manifest["dataset"],

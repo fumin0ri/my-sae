@@ -4,6 +4,7 @@ import torch
 from shared_residual.rectified_lpjepa_sae import (
     RectifiedLpJEPAConfig,
     RectifiedLpJEPASAE,
+    axis_aligned_distribution_matching_loss,
     rectified_distribution_matching_loss,
     rectified_lpjepa_loss,
     rgg_mean_for_active_fraction,
@@ -62,7 +63,7 @@ def test_model_has_no_predictor_or_horizon_conditioning() -> None:
     assert not hasattr(model, "transition_predictor")
     assert outputs["high_a"].shape == (2, model.cfg.d_high)
     expected = outputs["high_reconstruction_a"] + model.decode_low(
-        outputs["low_a"], ema=False, add_bias=False
+        outputs["low_a"], add_bias=False
     )
     assert torch.allclose(outputs["full_reconstruction_a"], expected)
 
@@ -82,7 +83,7 @@ def test_identical_views_have_zero_invariance_error() -> None:
     assert metrics["invariance_raw_mse"] == pytest.approx(0.0, abs=1e-8)
 
 
-def test_loss_updates_online_sae_but_not_ema() -> None:
+def test_loss_updates_the_single_sae() -> None:
     model = make_model()
     loss, metrics = rectified_lpjepa_loss(
         model,
@@ -92,12 +93,14 @@ def test_loss_updates_online_sae_but_not_ema() -> None:
         rdm_weight=2.0,
         rdm_projections=8,
         rdm_projection_chunk_size=4,
+        axis_rdm_features=3,
+        axis_rdm_weight=1.0,
     )
     loss.backward()
     assert model.encoder.linear.weight.grad is not None
     assert model.decoder.grad is not None
-    assert all(parameter.grad is None for parameter in model.ema_encoder.parameters())
-    assert model.ema_decoder.grad is None
+    assert not hasattr(model, "ema_encoder")
+    assert not hasattr(model, "ema_decoder")
     assert metrics["low_l0"] <= model.cfg.low_k
     assert "rdm_loss" in metrics
     assert "high_positive_margin" in metrics
@@ -108,15 +111,18 @@ def test_rdm_loss_is_finite_and_differentiable() -> None:
     first = torch.rand(12, model.cfg.d_high, requires_grad=True)
     second = torch.rand(12, model.cfg.d_high, requires_grad=True)
     loss, metrics = rectified_distribution_matching_loss(
-        (first, second), model.cfg, projections=12, projection_chunk_size=5
+        (first, second), model.cfg, projections=12, projection_chunk_size=5,
+        axis_features=3, axis_weight=1.0,
     )
     loss.backward()
     assert torch.isfinite(loss)
-    assert torch.isfinite(metrics["raw"])
+    assert torch.isfinite(metrics["random_projection"])
+    assert torch.isfinite(metrics["axis_aligned"])
+    assert int(metrics["axis_sampled_features"]) == 3
     assert first.grad is not None and second.grad is not None
 
 
-def test_initialization_and_ema_cover_full_high_low_sae() -> None:
+def test_initialization_covers_full_high_low_sae() -> None:
     model = make_model()
     assert torch.allclose(
         model.encoder.linear.bias[: model.cfg.d_high],
@@ -126,12 +132,30 @@ def test_initialization_and_ema_cover_full_high_low_sae() -> None:
             dtype=model.encoder.linear.bias.dtype,
         ),
     )
-    before = model.ema_decoder.clone()
-    with torch.no_grad():
-        model.decoder.add_(0.1)
-        model.encoder.linear.weight.add_(0.2)
-    model.update_ema_sae(decay=0.5)
-    assert not torch.equal(before, model.ema_decoder)
     assert torch.allclose(
-        model.ema_decoder.norm(dim=1), torch.ones(model.cfg.d_sae), atol=1e-5
+        model.decoder.norm(dim=1), torch.ones(model.cfg.d_sae), atol=1e-5
     )
+
+
+def test_axis_rdm_is_zero_for_identical_coordinate_distributions() -> None:
+    target = torch.tensor([[0.0, 1.0], [2.0, 0.0], [1.0, 3.0]])
+    permuted = target.index_select(0, torch.tensor([2, 0, 1])).requires_grad_()
+    loss, sampled = axis_aligned_distribution_matching_loss(
+        (permuted,), target, features=2
+    )
+    loss.backward()
+    assert float(loss) == pytest.approx(0.0, abs=1e-8)
+    assert int(sampled) == 2
+    assert permuted.grad is not None
+
+
+def test_axis_rdm_zero_features_is_an_exact_ablation() -> None:
+    target = torch.rand(4, 3)
+    view = torch.rand(4, 3, requires_grad=True)
+    loss, sampled = axis_aligned_distribution_matching_loss(
+        (view,), target, features=0
+    )
+    loss.backward()
+    assert float(loss) == 0.0
+    assert int(sampled) == 0
+    assert view.grad is not None
