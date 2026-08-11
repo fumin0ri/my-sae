@@ -75,7 +75,7 @@ def evaluate_sae_quality(
     ):
         x = x.to(device, dtype=model.pre_bias.dtype, non_blocking=True)
         with autocast_context(device, amp_dtype):
-            code = model.encode(x)
+            code, dense_high = model.encode_with_dense_high(x)
             reconstruction = model.decode(code)
             high, low = model.split_code(code)
             high_reconstruction = model.decode_high(high)
@@ -104,7 +104,16 @@ def evaluate_sae_quality(
         totals["l1_sum"] += float(code.float().abs().sum())
         totals["l0_sum"] += float((code != 0).float().sum())
         totals["high_l0_sum"] += float((high != 0).float().sum())
+        totals["dense_high_l0_sum"] += float((dense_high != 0).float().sum())
         totals["low_l0_sum"] += float((low != 0).float().sum())
+        totals["high_topk_saturated_sum"] += float(
+            ((high != 0).sum(dim=-1) == model.cfg.high_k).float().sum()
+        )
+        totals["dense_high_energy"] += float(dense_high.float().square().sum())
+        totals["sparse_high_energy"] += float(high.float().square().sum())
+        totals["dense_sparse_high_cosine_sum"] += float(
+            F.cosine_similarity(dense_high.float(), high.float(), dim=-1).sum()
+        )
         active_features += (code != 0).reshape(-1, model.cfg.d_sae).any(
             dim=0
         ).float().cpu()
@@ -122,9 +131,18 @@ def evaluate_sae_quality(
         "l1": totals["l1_sum"] / positions,
         "l0": totals["l0_sum"] / positions,
         "high_l0": totals["high_l0_sum"] / positions,
+        "dense_high_l0": totals["dense_high_l0_sum"] / positions,
         "low_l0": totals["low_l0_sum"] / positions,
         "high_active_fraction": totals["high_l0_sum"]
         / (positions * model.cfg.d_high),
+        "dense_high_active_fraction": totals["dense_high_l0_sum"]
+        / (positions * model.cfg.d_high),
+        "high_topk_saturation_fraction": totals["high_topk_saturated_sum"]
+        / positions,
+        "dense_to_sparse_high_energy_retained": totals["sparse_high_energy"]
+        / max(totals["dense_high_energy"], 1e-12),
+        "dense_sparse_high_cosine": totals["dense_sparse_high_cosine_sum"]
+        / positions,
         "reconstruction_cosine": totals["cosine_sum"] / positions,
         "reconstruction_fvu": full_fvu,
         "fraction_variance_explained": 1.0 - full_fvu,
@@ -179,8 +197,8 @@ def evaluate_view_invariance(
         view_b = batch["view_b"].to(device, dtype=model.pre_bias.dtype)
         distance = batch["distance"].tolist()
         with autocast_context(device, amp_dtype):
-            code_a = model.encode(view_a)
-            code_b = model.encode(view_b)
+            code_a, dense_high_a = model.encode_with_dense_high(view_a)
+            code_b, dense_high_b = model.encode_with_dense_high(view_b)
         high_a, low_a = model.split_code(code_a)
         high_b, low_b = model.split_code(code_b)
         permutation = torch.roll(torch.arange(len(view_a), device=device), 1)
@@ -190,6 +208,14 @@ def evaluate_view_invariance(
         high_shuffled = F.cosine_similarity(
             high_a.float(),
             high_b.index_select(0, permutation).float(),
+            dim=-1,
+        )
+        dense_high_positive = F.cosine_similarity(
+            dense_high_a.float(), dense_high_b.float(), dim=-1
+        )
+        dense_high_shuffled = F.cosine_similarity(
+            dense_high_a.float(),
+            dense_high_b.index_select(0, permutation).float(),
             dim=-1,
         )
         low_positive = F.cosine_similarity(
@@ -218,6 +244,9 @@ def evaluate_view_invariance(
             "high_positive_cosine": high_positive,
             "high_shuffled_cosine": high_shuffled,
             "high_margin": high_positive - high_shuffled,
+            "dense_high_positive_cosine": dense_high_positive,
+            "dense_high_shuffled_cosine": dense_high_shuffled,
+            "dense_high_margin": dense_high_positive - dense_high_shuffled,
             "low_positive_cosine": low_positive,
             "high_nrmse": high_nrmse,
             "residual_energy": residual_energy,
@@ -263,9 +292,16 @@ def evaluate_view_invariance(
         value for metrics in by_distance.values() for value in metrics["high_margin"]
     ]
     margin_summary = _mean_ci(all_margin, seed + 1)
+    all_dense_margin = [
+        value
+        for metrics in by_distance.values()
+        for value in metrics["dense_high_margin"]
+    ]
+    dense_margin_summary = _mean_ci(all_dense_margin, seed + 2)
     return {
         "distance_curve": curve,
         "overall_high_margin": margin_summary,
+        "overall_dense_high_margin": dense_margin_summary,
         "positive_over_shuffled": margin_summary["ci95_low"] > 0,
         "swap_fvu_aggregation": "sum squared error divided by sum centered residual energy",
     }
@@ -654,8 +690,10 @@ def main() -> None:
         "evaluation_protocol": {
             "goal": "standard SAE quality plus predictor-free shared-view validity",
             "positive_pair": "two exchangeable positions from the same random span",
-            "null": "high code from a different validation sequence in the batch",
-            "causal_decomposition_test": "swap same-span high code while retaining position-specific low code",
+            "jepa_code": "dense ReLU high candidates",
+            "sae_evaluation_code": "ReLU plus Top-K sparse high code",
+            "null": "sparse high code from a different validation sequence in the batch",
+            "causal_decomposition_test": "swap same-span sparse high code while retaining position-specific low code",
             "mmlu_split": "question-grouped development/locked test",
             "predictor": None,
         },

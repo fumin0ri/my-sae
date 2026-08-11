@@ -47,6 +47,9 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     history = report["history"]
     steps = [row["step"] for row in history]
     target_fraction = report["rgg_target"]["active_fraction"]
+    sparse_target_fraction = (
+        report["architecture"]["high_k"] / report["architecture"]["d_high"]
+    )
     fig, axes = plt.subplots(2, 3, figsize=(16.0, 8.6))
     axes[0, 0].plot(
         steps,
@@ -90,16 +93,28 @@ def training_plot(run_dir: Path, figures: Path) -> None:
         steps,
         [row["validation"]["high_active_fraction"] for row in history],
         color=HIGH,
-        label="Learned high",
+        label="Sparse Top-K high",
+    )
+    axes[1, 0].plot(
+        steps,
+        [row["validation"]["dense_high_active_fraction"] for row in history],
+        color="#db2777",
+        label="Dense JEPA high",
     )
     axes[1, 0].axhline(
-        target_fraction, color=RDM, linestyle="--", label="RGG target"
+        target_fraction, color=RDM, linestyle="--", label="Dense RGG target"
+    )
+    axes[1, 0].axhline(
+        sparse_target_fraction,
+        color=HIGH,
+        linestyle=":",
+        label="Top-K target",
     )
     axes[1, 1].plot(
         steps,
         [row["validation"]["high_positive_cosine"] for row in history],
         color=HIGH,
-        label="Same span",
+        label="Sparse same span",
     )
     axes[1, 1].plot(
         steps,
@@ -107,6 +122,13 @@ def training_plot(run_dir: Path, figures: Path) -> None:
         color=NULL,
         linestyle="--",
         label="Shuffled sequence",
+    )
+    axes[1, 1].plot(
+        steps,
+        [row["validation"]["dense_high_positive_cosine"] for row in history],
+        color="#db2777",
+        linestyle=":",
+        label="Dense same span",
     )
     axes[1, 2].plot(
         steps,
@@ -119,9 +141,9 @@ def training_plot(run_dir: Path, figures: Path) -> None:
     axes[0, 1].set_ylabel("Normalized MSE")
     axes[0, 2].set_title("Rectified distribution matching")
     axes[0, 2].set_ylabel("Normalized W2")
-    axes[1, 0].set_title("High-code sparsity control")
+    axes[1, 0].set_title("Dense candidates vs final Top-K")
     axes[1, 0].set_ylabel("Active fraction")
-    axes[1, 1].set_title("Shared-view specificity")
+    axes[1, 1].set_title("Sparse evaluation vs dense training view")
     axes[1, 1].set_ylabel("High-code cosine")
     axes[1, 2].set_title("Same-span high-code swap")
     axes[1, 2].set_ylabel("FVU (lower is better)")
@@ -159,11 +181,11 @@ def sae_quality_plot(report: dict[str, Any], figures: Path) -> None:
     positions2 = np.arange(3)
     axes[1].bar(
         positions2,
-        [quality["reconstruction_cosine"], quality["alive_feature_fraction"], quality["high_active_fraction"]],
+        [quality["reconstruction_cosine"], quality["alive_feature_fraction"], quality["high_topk_saturation_fraction"]],
         width,
         color=[TOTAL, HIGH, RDM],
     )
-    axes[1].set_xticks(positions2, ["Cosine", "Alive", "High active"])
+    axes[1].set_xticks(positions2, ["Cosine", "Alive", "Top-K exact"])
     axes[1].set_ylim(0, 1)
     axes[1].set_title("Reconstruction and dictionary use")
     if recovered is None:
@@ -215,12 +237,26 @@ def invariance_plot(report: dict[str, Any], figures: Path) -> None:
         linestyle=":",
         label="Low same span",
     )
+    axes[0].plot(
+        distance,
+        [row["dense_high_positive_cosine"] for row in rows],
+        color="#db2777",
+        linestyle="-.",
+        label="Dense high same span",
+    )
     axes[1].plot(
         distance,
         [row["high_margin"] for row in rows],
         color=HIGH,
         marker="o",
         label="Positive - shuffled",
+    )
+    axes[1].plot(
+        distance,
+        [row["dense_high_margin"] for row in rows],
+        color="#db2777",
+        linestyle=":",
+        label="Dense training margin",
     )
     axes[1].fill_between(
         distance,
@@ -382,12 +418,13 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
 <h1>Predictor-free Rectified LpJEPA-SAE</h1>
-<p class="subtitle">Two exchangeable token positions are encoded by one SAE. High codes are aligned directly and matched to a sparse Rectified Generalized Gaussian target with random-projection and axis-aligned RDMReg.</p>
+<p class="subtitle">Dense ReLU high candidates learn view invariance and RDMReg. ReLU+Top-K high codes are the only codes used for reconstruction, evaluation, and intervention.</p>
 <div class="metrics">
 <div class="metric"><span>Full SAE FVE</span><strong>{fmt(quality['fraction_variance_explained'])}</strong></div>
-<div class="metric"><span>High active fraction</span><strong>{fmt(quality['high_active_fraction'])}</strong></div>
+<div class="metric"><span>Sparse high L0 / target</span><strong>{fmt(quality['high_l0'])} / {fmt(report['checkpoint']['config']['high_k'])}</strong></div>
+<div class="metric"><span>Top-K exact fraction</span><strong>{fmt(quality['high_topk_saturation_fraction'])}</strong></div>
+<div class="metric"><span>Dense / sparse high margin</span><strong>{fmt(invariant['overall_dense_high_margin']['mean'])} / {fmt(invariant['overall_high_margin']['mean'])}</strong></div>
 <div class="metric"><span>Loss recovered</span><strong>{recovered_value}</strong></div>
-<div class="metric"><span>Positive-shuffled margin</span><strong>{fmt(invariant['overall_high_margin']['mean'])}</strong></div>
 <div class="metric"><span>Held-out RDMReg</span><strong>{fmt(rdm['rdm_loss'])}</strong></div>
 <div class="metric"><span>Axis-aligned RDMReg</span><strong>{fmt(rdm['axis_aligned_rdm_loss'])}</strong></div>
 <div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>

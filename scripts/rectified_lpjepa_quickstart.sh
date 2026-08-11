@@ -27,6 +27,7 @@ fi
 BURN_IN_TOKENS="${BURN_IN_TOKENS:-$WINDOW_SIZE}"
 
 D_SAE="${D_SAE:-32768}"
+HIGH_K="${HIGH_K:-128}"
 LOW_K="${LOW_K:-64}"
 HIGH_FRACTION="${HIGH_FRACTION:-0.2}"
 HIGH_RECONSTRUCTION_WEIGHT="${HIGH_RECONSTRUCTION_WEIGHT:-0.1}"
@@ -41,7 +42,6 @@ AXIS_RDM_FEATURES="${AXIS_RDM_FEATURES:-512}"
 AXIS_RDM_WEIGHT="${AXIS_RDM_WEIGHT:-1}"
 
 TRAIN_STEPS="${TRAIN_STEPS:-12000}"
-SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-1000}"
 REGULARIZATION_RAMP_STEPS="${REGULARIZATION_RAMP_STEPS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-160}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
@@ -106,7 +106,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, high_k=$HIGH_K, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -156,7 +156,8 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
   echo "[2/8] Train the predictor-free high/low Rectified LpJEPA-SAE"
   sr-train-rectified-lpjepa-sae \
     --activation-manifest "$ACTIVATION_MANIFEST" --output-dir "$RUN_DIR/model" \
-    --d-sae "$D_SAE" --low-k "$LOW_K" --high-fraction "$HIGH_FRACTION" \
+    --d-sae "$D_SAE" --high-k "$HIGH_K" --low-k "$LOW_K" \
+    --high-fraction "$HIGH_FRACTION" \
     --high-reconstruction-weight "$HIGH_RECONSTRUCTION_WEIGHT" \
     --rgg-p "$RGG_P" --target-active-fraction "$TARGET_ACTIVE_FRACTION" \
     --target-sigma "$TARGET_SIGMA" \
@@ -165,7 +166,7 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --rdm-projection-chunk-size "$RDM_PROJECTION_CHUNK_SIZE" \
     --axis-rdm-features "$AXIS_RDM_FEATURES" \
     --axis-rdm-weight "$AXIS_RDM_WEIGHT" \
-    --steps "$TRAIN_STEPS" --sae-warmup-steps "$SAE_WARMUP_STEPS" \
+    --steps "$TRAIN_STEPS" \
     --regularization-ramp-steps "$REGULARIZATION_RAMP_STEPS" \
     --batch-size "$BATCH_SIZE" --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
     --amp-dtype bfloat16 --sae-lr 0.0002 --warmup-steps 500 \

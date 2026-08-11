@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,7 +23,7 @@ from .io import write_json
 from .training import autocast_context, configure_accelerator, cosine_learning_rate
 
 
-ARCHITECTURE_ID = "high_low_rectified_lpjepa_sae_v2_axis_rdm"
+ARCHITECTURE_ID = "high_low_rectified_lpjepa_sae_v3_dense_jepa_sparse_reconstruction"
 SUPPORTED_RGG_P = (1.0, 2.0)
 
 
@@ -82,6 +83,7 @@ def sample_rectified_generalized_gaussian(
 class RectifiedLpJEPAConfig:
     d_in: int
     d_sae: int = 2048
+    high_k: int = 128
     low_k: int = 32
     max_span_length: int = 10
     high_fraction: float = 0.2
@@ -101,6 +103,8 @@ class RectifiedLpJEPAConfig:
             raise ValueError("high_reconstruction_weight must lie in [0, 1]")
         if self.d_high < 1 or self.d_low < 1:
             raise ValueError("both high and low dictionaries must be non-empty")
+        if not 1 <= self.high_k <= self.d_high:
+            raise ValueError("high_k must lie in [1, d_high]")
         if not 1 <= self.low_k <= self.d_low:
             raise ValueError("low_k must lie in [1, d_low]")
         if self.rgg_p not in SUPPORTED_RGG_P:
@@ -133,23 +137,37 @@ class RectifiedLpJEPAConfig:
         )
 
     @property
-    def expected_high_l0(self) -> float:
+    def expected_dense_high_l0(self) -> float:
         return self.d_high * self.target_active_fraction
+
+    @property
+    def sparse_high_active_fraction(self) -> float:
+        return self.high_k / self.d_high
 
 
 class HierarchicalRectifiedEncoder(nn.Module):
-    """Shifted-ReLU high codes and an independent Top-K low dictionary."""
+    """Dense high candidates plus Top-K high/low reconstruction codes."""
 
     def __init__(self, cfg: RectifiedLpJEPAConfig):
         super().__init__()
         self.cfg = cfg
         self.linear = nn.Linear(cfg.d_in, cfg.d_sae)
 
+    def components(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        preactivations = self.linear(x)
+        high_preactivations = preactivations[..., : self.cfg.d_high]
+        dense_high = torch.relu(high_preactivations)
+        sparse_high = topk_relu(high_preactivations, self.cfg.high_k)
+        low = topk_relu(
+            preactivations[..., self.cfg.d_high :], self.cfg.low_k
+        )
+        return dense_high, sparse_high, low
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dense = self.linear(x)
-        high = torch.relu(dense[..., : self.cfg.d_high])
-        low = topk_relu(dense[..., self.cfg.d_high :], self.cfg.low_k)
-        return torch.cat((high, low), dim=-1)
+        _, sparse_high, low = self.components(x)
+        return torch.cat((sparse_high, low), dim=-1)
 
 
 class RectifiedLpJEPASAE(nn.Module):
@@ -191,6 +209,14 @@ class RectifiedLpJEPASAE(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder((x - self.pre_bias) / self.pre_scale)
 
+    def encode_with_dense_high(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dense_high, sparse_high, low = self.encoder.components(
+            (x - self.pre_bias) / self.pre_scale
+        )
+        return torch.cat((sparse_high, low), dim=-1), dense_high
+
     def decode(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
         value = self.pre_scale * (z @ self.decoder)
         return value + self.pre_bias if add_bias else value
@@ -214,12 +240,12 @@ class RectifiedLpJEPASAE(nn.Module):
             raise ValueError("view_a must have shape [batch, d_in]")
         if view_b.shape != view_a.shape:
             raise ValueError("view_b must match view_a")
-        code_a = self.encode(view_a)
-        code_b = self.encode(view_b)
-        high_a, low_a = self.split_code(code_a)
-        high_b, low_b = self.split_code(code_b)
-        high_reconstruction_a = self.decode_high(high_a)
-        high_reconstruction_b = self.decode_high(high_b)
+        code_a, dense_high_a = self.encode_with_dense_high(view_a)
+        code_b, dense_high_b = self.encode_with_dense_high(view_b)
+        sparse_high_a, low_a = self.split_code(code_a)
+        sparse_high_b, low_b = self.split_code(code_b)
+        high_reconstruction_a = self.decode_high(sparse_high_a)
+        high_reconstruction_b = self.decode_high(sparse_high_b)
         full_reconstruction_a = high_reconstruction_a + self.decode_low(
             low_a, add_bias=False
         )
@@ -229,8 +255,10 @@ class RectifiedLpJEPASAE(nn.Module):
         return {
             "code_a": code_a,
             "code_b": code_b,
-            "high_a": high_a,
-            "high_b": high_b,
+            "dense_high_a": dense_high_a,
+            "dense_high_b": dense_high_b,
+            "sparse_high_a": sparse_high_a,
+            "sparse_high_b": sparse_high_b,
             "low_a": low_a,
             "low_b": low_b,
             "high_reconstruction_a": high_reconstruction_a,
@@ -392,11 +420,11 @@ def rectified_lpjepa_loss(
         model, outputs, view_a, view_b
     )
     invariance_raw = (
-        outputs["high_a"].float() - outputs["high_b"].float()
+        outputs["dense_high_a"].float() - outputs["dense_high_b"].float()
     ).square().mean()
     if rdm_weight > 0 or collect_metrics:
         rdm, rdm_metrics = rectified_distribution_matching_loss(
-            (outputs["high_a"], outputs["high_b"]),
+            (outputs["dense_high_a"], outputs["dense_high_b"]),
             model.cfg,
             rdm_projections,
             rdm_projection_chunk_size,
@@ -405,13 +433,13 @@ def rectified_lpjepa_loss(
         )
     else:
         target = sample_rectified_generalized_gaussian(
-            outputs["high_a"].shape,
+            outputs["dense_high_a"].shape,
             p=model.cfg.rgg_p,
             mu=model.cfg.target_mu,
             sigma=model.cfg.resolved_target_sigma,
-            device=outputs["high_a"].device,
+            device=outputs["dense_high_a"].device,
         )
-        rdm = outputs["high_a"].float().sum() * 0.0
+        rdm = outputs["dense_high_a"].float().sum() * 0.0
         rdm_metrics = {
             "random_projection": rdm,
             "random_projection_raw": rdm,
@@ -435,22 +463,54 @@ def rectified_lpjepa_loss(
         permutation = torch.roll(
             torch.arange(batch, device=view_a.device), shifts=1
         )
-        high_positive = F.cosine_similarity(
-            outputs["high_a"].float(), outputs["high_b"].float(), dim=-1
+        sparse_high_positive = F.cosine_similarity(
+            outputs["sparse_high_a"].float(),
+            outputs["sparse_high_b"].float(),
+            dim=-1,
         )
-        high_shuffled = F.cosine_similarity(
-            outputs["high_a"].float(),
-            outputs["high_b"].index_select(0, permutation).float(),
+        sparse_high_shuffled = F.cosine_similarity(
+            outputs["sparse_high_a"].float(),
+            outputs["sparse_high_b"].index_select(0, permutation).float(),
+            dim=-1,
+        )
+        dense_high_positive = F.cosine_similarity(
+            outputs["dense_high_a"].float(),
+            outputs["dense_high_b"].float(),
+            dim=-1,
+        )
+        dense_high_shuffled = F.cosine_similarity(
+            outputs["dense_high_a"].float(),
+            outputs["dense_high_b"].index_select(0, permutation).float(),
             dim=-1,
         )
         low_positive = F.cosine_similarity(
             outputs["low_a"].float(), outputs["low_b"].float(), dim=-1
         )
-        swap_a = model.decode_high(outputs["high_b"]) + model.decode_low(
+        swap_a = model.decode_high(outputs["sparse_high_b"]) + model.decode_low(
             outputs["low_a"], add_bias=False
         )
-        swap_b = model.decode_high(outputs["high_a"]) + model.decode_low(
+        swap_b = model.decode_high(outputs["sparse_high_a"]) + model.decode_low(
             outputs["low_b"], add_bias=False
+        )
+        dense_high_energy = 0.5 * (
+            outputs["dense_high_a"].float().square().sum(dim=-1).mean()
+            + outputs["dense_high_b"].float().square().sum(dim=-1).mean()
+        ).clamp_min(1e-8)
+        sparse_high_energy = 0.5 * (
+            outputs["sparse_high_a"].float().square().sum(dim=-1).mean()
+            + outputs["sparse_high_b"].float().square().sum(dim=-1).mean()
+        )
+        dense_sparse_cosine = 0.5 * (
+            F.cosine_similarity(
+                outputs["dense_high_a"].float(),
+                outputs["sparse_high_a"].float(),
+                dim=-1,
+            ).mean()
+            + F.cosine_similarity(
+                outputs["dense_high_b"].float(),
+                outputs["sparse_high_b"].float(),
+                dim=-1,
+            ).mean()
         )
         energy = (
             torch.cat(
@@ -481,16 +541,30 @@ def rectified_lpjepa_loss(
         ),
         "axis_aligned_rdm_loss": float(rdm_metrics["axis_aligned"].detach()),
         "axis_sampled_features": float(rdm_metrics["axis_sampled_features"]),
-        "high_positive_cosine": float(high_positive.mean()),
-        "high_shuffled_cosine": float(high_shuffled.mean()),
-        "high_positive_margin": float((high_positive - high_shuffled).mean()),
+        "high_positive_cosine": float(sparse_high_positive.mean()),
+        "high_shuffled_cosine": float(sparse_high_shuffled.mean()),
+        "high_positive_margin": float(
+            (sparse_high_positive - sparse_high_shuffled).mean()
+        ),
+        "dense_high_positive_cosine": float(dense_high_positive.mean()),
+        "dense_high_shuffled_cosine": float(dense_high_shuffled.mean()),
+        "dense_high_positive_margin": float(
+            (dense_high_positive - dense_high_shuffled).mean()
+        ),
         "low_positive_cosine": float(low_positive.mean()),
         "swap_reconstruction_fvu": float(swap_fvu),
         "high_l0": float(
             0.5
             * (
-                (outputs["high_a"] > 0).sum(dim=-1).float().mean()
-                + (outputs["high_b"] > 0).sum(dim=-1).float().mean()
+                (outputs["sparse_high_a"] > 0).sum(dim=-1).float().mean()
+                + (outputs["sparse_high_b"] > 0).sum(dim=-1).float().mean()
+            )
+        ),
+        "dense_high_l0": float(
+            0.5
+            * (
+                (outputs["dense_high_a"] > 0).sum(dim=-1).float().mean()
+                + (outputs["dense_high_b"] > 0).sum(dim=-1).float().mean()
             )
         ),
         "low_l0": float(
@@ -503,10 +577,34 @@ def rectified_lpjepa_loss(
         "high_active_fraction": float(
             0.5
             * (
-                (outputs["high_a"] > 0).float().mean()
-                + (outputs["high_b"] > 0).float().mean()
+                (outputs["sparse_high_a"] > 0).float().mean()
+                + (outputs["sparse_high_b"] > 0).float().mean()
             )
         ),
+        "dense_high_active_fraction": float(
+            0.5
+            * (
+                (outputs["dense_high_a"] > 0).float().mean()
+                + (outputs["dense_high_b"] > 0).float().mean()
+            )
+        ),
+        "high_topk_saturation_fraction": float(
+            0.5
+            * (
+                (
+                    (outputs["sparse_high_a"] > 0).sum(dim=-1)
+                    == model.cfg.high_k
+                ).float().mean()
+                + (
+                    (outputs["sparse_high_b"] > 0).sum(dim=-1)
+                    == model.cfg.high_k
+                ).float().mean()
+            )
+        ),
+        "dense_to_sparse_high_energy_retained": float(
+            sparse_high_energy / dense_high_energy
+        ),
+        "dense_sparse_high_cosine": float(dense_sparse_cosine),
         "sampled_target_active_fraction": float(
             rdm_metrics["target_active_fraction"]
         ),
@@ -577,6 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--activation-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--d-sae", type=int, default=2048)
+    parser.add_argument("--high-k", type=int, default=128)
     parser.add_argument("--low-k", type=int, default=32)
     parser.add_argument("--high-fraction", type=float, default=0.2)
     parser.add_argument("--high-reconstruction-weight", type=float, default=0.1)
@@ -605,7 +704,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Axis-aligned RDMReg weight inside the combined RDM term.",
     )
     parser.add_argument("--steps", type=int, default=12000)
-    parser.add_argument("--sae-warmup-steps", type=int, default=1000)
     parser.add_argument("--regularization-ramp-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=160)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
@@ -624,8 +722,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.steps < 2 or not 0 <= args.sae_warmup_steps < args.steps:
-        raise ValueError("sae_warmup_steps must lie in [0, steps)")
+    if args.steps < 2:
+        raise ValueError("steps must be at least two")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient accumulation must be positive")
     if args.batch_size < 2:
@@ -650,6 +748,7 @@ def main() -> None:
     cfg = RectifiedLpJEPAConfig(
         d_in=int(manifest["d_in"]),
         d_sae=args.d_sae,
+        high_k=args.high_k,
         low_k=args.low_k,
         max_span_length=int(manifest["max_span_length"]),
         high_fraction=args.high_fraction,
@@ -658,6 +757,13 @@ def main() -> None:
         target_active_fraction=args.target_active_fraction,
         target_sigma=args.target_sigma,
     )
+    if cfg.expected_dense_high_l0 < cfg.high_k:
+        warnings.warn(
+            "RGG target has fewer expected positive dense high candidates "
+            f"({cfg.expected_dense_high_l0:.1f}) than high_k={cfg.high_k}; "
+            "increase target_active_fraction or reduce high_k to obtain exact L0.",
+            stacklevel=1,
+        )
     model = RectifiedLpJEPASAE(cfg).to(device)
     normalization = manifest["normalization"]
     model.initialize_from_statistics(
@@ -689,14 +795,12 @@ def main() -> None:
             min(args.warmup_steps, max(1, args.steps // 10)),
             args.min_lr_ratio,
         )
-        rdm_ramp = min(1.0, step / max(args.regularization_ramp_steps, 1))
-        joint_step = max(0, step - args.sae_warmup_steps)
-        invariance_ramp = min(
-            1.0, joint_step / max(args.regularization_ramp_steps, 1)
+        regularization_ramp = min(
+            1.0, step / max(args.regularization_ramp_steps, 1)
         )
-        active_rdm_weight = args.rdm_weight * rdm_ramp
-        active_invariance_weight = args.invariance_weight * invariance_ramp
-        phase = "distribution_warmup" if joint_step == 0 else "joint"
+        active_rdm_weight = args.rdm_weight * regularization_ramp
+        active_invariance_weight = args.invariance_weight * regularization_ramp
+        phase = "joint"
         should_log = step == 1 or step % args.log_every == 0 or step == args.steps
         optimizer.zero_grad(set_to_none=True)
         metric_sums: dict[str, float] = {}
@@ -796,12 +900,14 @@ def main() -> None:
                 "id": ARCHITECTURE_ID,
                 "d_high": cfg.d_high,
                 "d_low": cfg.d_low,
+                "high_k": cfg.high_k,
                 "low_k": cfg.low_k,
                 "max_span_length": cfg.max_span_length,
                 "view_sampling": "two exchangeable positions from one random span",
-                "high_activation": "shifted ReLU; no Top-K",
+                "dense_high_activation": "shifted ReLU for invariance and RDMReg only",
+                "sparse_high_activation": "shifted ReLU plus Top-K for reconstruction, evaluation, and intervention",
                 "low_activation": "ReLU plus Top-K",
-                "high_role": "high-only reconstruction, view invariance, random-projection and axis-aligned RDMReg",
+                "high_role": "dense candidates learn view invariance and RDMReg; sparse Top-K codes reconstruct residuals",
                 "low_role": "position-specific incremental reconstruction",
                 "predictor": None,
                 "teacher_in_loss": None,
@@ -812,7 +918,8 @@ def main() -> None:
                 "mu": cfg.target_mu,
                 "sigma": cfg.resolved_target_sigma,
                 "active_fraction": cfg.target_active_fraction,
-                "expected_high_l0": cfg.expected_high_l0,
+                "expected_dense_high_l0": cfg.expected_dense_high_l0,
+                "sparse_high_l0_target": cfg.high_k,
                 "distribution": "ReLU(GN_p(mu, sigma)) independently per coordinate",
             },
             "objective": {
@@ -824,8 +931,10 @@ def main() -> None:
                 "rdm_projection_chunk_size": args.rdm_projection_chunk_size,
                 "axis_rdm_features": min(args.axis_rdm_features, cfg.d_high),
                 "axis_rdm_weight": args.axis_rdm_weight,
-                "invariance": "normalized squared L2 between paired high codes",
+                "invariance": "normalized squared L2 between paired dense ReLU high codes",
                 "rdm": "normalized random-projection plus weighted axis-aligned two-sample 2-Wasserstein",
+                "reconstruction_code": "ReLU plus Top-K high code",
+                "sae_warmup_steps": 0,
             },
             "data": {
                 "dataset": manifest["dataset"],

@@ -9,7 +9,8 @@ position-specific information?
 The primary object is not future prediction. The experiment treats two positions
 from the same sampled span as exchangeable views and learns a high/low SAE:
 
-- high: directly view-invariant, non-negative, sparse, and high-entropy;
+- high: dense ReLU candidates learn view invariance and distribution matching,
+  while a Top-K subset is the final sparse SAE code;
 - low: position-specific reconstruction increment.
 
 ## Prespecified architecture
@@ -19,10 +20,11 @@ from the same sampled span as exchangeable views and learns a high/low SAE:
 3. Draw a valid span end independently of `L`.
 4. Draw two distinct ordered positions uniformly without replacement from the span.
 5. Encode both residuals with the same high/low SAE.
-6. Apply shifted ReLU to high preactivations and ReLU + Top-K to low preactivations.
-7. Reconstruct each residual with the additive high and low decoder partitions.
-8. Match the two high codes with squared L2 invariance.
-9. Match each high-code marginal distribution to an i.i.d. Rectified Generalized
+6. Apply shifted ReLU to obtain dense high candidates, then Top-K those candidates
+   for the reconstruction high code. Apply ReLU + Top-K to low preactivations.
+7. Reconstruct each residual using only the sparse high and low codes.
+8. Match the two dense high candidate codes with squared L2 invariance.
+9. Match each dense high marginal distribution to an i.i.d. Rectified Generalized
    Gaussian product target using random-projection sliced two-sample
    2-Wasserstein distance.
 10. Also match randomly sampled high coordinates directly to the target's
@@ -68,26 +70,29 @@ lambda_inv = 1
 lambda_rdm = 5
 lambda_axis = 1
 axis_coordinates = min(512, d_high)
+K_high = 128  # default for high_fraction=0.2; use 256 for high_fraction=0.5
+K_low = 64
 ```
 
 Both invariance and RDMReg are normalized by target-distribution scale. The RDM
-term is random-projection RDM plus `lambda_axis` times axis-aligned RDM. RDMReg
-ramps from the first step. Invariance begins after the SAE warm-up and then ramps.
+term is random-projection RDM plus `lambda_axis` times axis-aligned RDM. There is
+no SAE warm-up: both terms ramp from the first step with the same regularization
+ramp. Learning-rate warm-up remains independent.
 
 ## Primary validation claims
 
 The method passes the representation-validity test only if all of the following
 hold on the document-disjoint Pile validation split:
 
-1. Same-span high cosine exceeds shuffled-sequence high cosine with a
+1. Sparse Top-K same-span high cosine exceeds shuffled-sequence high cosine with a
    bootstrap 95% CI lower bound above zero.
 2. The positive-minus-shuffled margin remains positive at the longest adequately
    sampled token distance.
 3. Same-span high-code swap reconstruction has lower FVU than shuffled high-code
    swap reconstruction. Each distance-bin FVU is computed as total squared error
    divided by total centered residual energy, never as a mean of per-row ratios.
-4. Learned high active fraction is close to the RGG target without excessive
-   dead features.
+4. Sparse high L0 equals `K_high` on nearly every evaluated position. Dense high
+   active fraction is monitored separately against the RGG target.
 5. Full SAE reconstruction and loss recovered remain usable relative to the
    reconstruction-only ablation.
 
@@ -107,6 +112,7 @@ training budget, and evaluation data.
 ## Secondary evaluations
 
 - Conventional SAE FVU, FVE, cosine, L0, and loss recovered.
+- Dense versus sparse high margin, energy retention, cosine, and Top-K saturation.
 - High-only and low-only reconstruction.
 - Effective rank and collapse diagnostics on memory-bounded selected dimensions.
 - MMLU semantics, context, and syntax locked probes.

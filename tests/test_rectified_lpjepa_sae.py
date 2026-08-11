@@ -18,10 +18,11 @@ def make_model() -> RectifiedLpJEPASAE:
         RectifiedLpJEPAConfig(
             d_in=8,
             d_sae=20,
+            high_k=2,
             low_k=4,
             max_span_length=6,
             high_fraction=0.2,
-            target_active_fraction=0.1,
+            target_active_fraction=0.75,
         )
     )
     model.initialize_from_statistics(torch.zeros(8), 1.0)
@@ -43,16 +44,17 @@ def test_rgg_parameterization_controls_empirical_active_fraction(p: float) -> No
     assert abs(float((samples > 0).float().mean()) - 0.1) < 0.005
 
 
-def test_high_is_shifted_relu_and_only_low_is_topk() -> None:
+def test_dense_high_is_relu_and_reconstruction_high_is_topk() -> None:
     model = make_model()
     assert model.cfg.d_high == 4
     assert model.cfg.d_low == 16
     with torch.no_grad():
         model.encoder.linear.weight.zero_()
         model.encoder.linear.bias.fill_(1.0)
-    code = model.encode(torch.randn(3, 8))
-    high, low = model.split_code(code)
-    assert torch.all(high > 0)
+    code, dense_high = model.encode_with_dense_high(torch.randn(3, 8))
+    sparse_high, low = model.split_code(code)
+    assert torch.all(dense_high > 0)
+    assert torch.all((sparse_high > 0).sum(dim=-1) == model.cfg.high_k)
     assert torch.all((low > 0).sum(dim=-1) == model.cfg.low_k)
 
 
@@ -61,7 +63,8 @@ def test_model_has_no_predictor_or_horizon_conditioning() -> None:
     outputs = model(torch.randn(2, 8), torch.randn(2, 8))
     assert "predicted_codes" not in outputs
     assert not hasattr(model, "transition_predictor")
-    assert outputs["high_a"].shape == (2, model.cfg.d_high)
+    assert outputs["dense_high_a"].shape == (2, model.cfg.d_high)
+    assert outputs["sparse_high_a"].shape == (2, model.cfg.d_high)
     expected = outputs["high_reconstruction_a"] + model.decode_low(
         outputs["low_a"], add_bias=False
     )
@@ -104,6 +107,9 @@ def test_loss_updates_the_single_sae() -> None:
     assert metrics["low_l0"] <= model.cfg.low_k
     assert "rdm_loss" in metrics
     assert "high_positive_margin" in metrics
+    assert "dense_high_positive_margin" in metrics
+    assert metrics["high_l0"] <= model.cfg.high_k
+    assert metrics["dense_high_l0"] >= metrics["high_l0"]
 
 
 def test_rdm_loss_is_finite_and_differentiable() -> None:

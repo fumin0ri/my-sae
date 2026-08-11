@@ -18,9 +18,11 @@ def make_model() -> RectifiedLpJEPASAE:
         RectifiedLpJEPAConfig(
             d_in=8,
             d_sae=20,
+            high_k=2,
             low_k=4,
             max_span_length=4,
             high_fraction=0.2,
+            target_active_fraction=0.75,
         )
     )
     model.initialize_from_statistics(torch.zeros(8), 1.0)
@@ -36,6 +38,8 @@ def test_standard_sae_quality_reports_single_sae(monkeypatch) -> None:
     )
     assert result["n_positions"] == 12
     assert "high_active_fraction" in result
+    assert "dense_high_active_fraction" in result
+    assert result["high_l0"] <= model.cfg.high_k
     assert "ema" not in result
 
 
@@ -62,7 +66,9 @@ def test_view_invariance_reports_shuffle_null_and_distance_curve(monkeypatch) ->
 
 def test_swap_fvu_uses_ratio_of_aggregate_sums(monkeypatch) -> None:
     class ScalarSwapModel:
-        cfg = SimpleNamespace(d_in=1, d_sae=2, d_high=1, max_span_length=2)
+        cfg = SimpleNamespace(
+            d_in=1, d_sae=2, d_high=1, high_k=1, max_span_length=2
+        )
         pre_bias = torch.zeros(1)
 
         def eval(self):
@@ -70,6 +76,9 @@ def test_swap_fvu_uses_ratio_of_aggregate_sums(monkeypatch) -> None:
 
         def encode(self, x):
             return torch.cat((x, torch.zeros_like(x)), dim=-1)
+
+        def encode_with_dense_high(self, x):
+            return self.encode(x), x
 
         def split_code(self, code):
             return code[..., :1], code[..., 1:]

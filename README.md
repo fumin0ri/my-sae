@@ -2,22 +2,22 @@
 
 LLMのresidual streamから、近接token位置で共有されるhigh-level sparse
 featureと、位置固有のlow-level sparse featureを分けて学習する研究用pipelineです。
-predictor、horizon embedding、teacher encoder、in-batch negativesは使いません。
+predictor、teacher encoder、in-batch negativesは使いません。
 
 ```text
 (h_a, h_b) from one random span
         |          |
-        +-- shared high/low SAE --+
+        +-- shared high/low encoder --+
                    |
-        high: direct invariance + random/axis RDMReg
-        low:  position-specific reconstruction
-        full: residual reconstruction
+        dense high:  ReLU + invariance + random/axis RDMReg
+        sparse high: ReLU + Top-K + reconstruction/evaluation
+        sparse low:  ReLU + Top-K + reconstruction
 ```
 
-high codeはshifted ReLU、low codeはReLU + Top-Kです。high codeの経験分布を
-Rectified Generalized Gaussian (RGG) targetへ合わせます。既存のrandom-projection
-sliced 2-Wassersteinに加え、座標軸上の分布を直接合わせるaxis-aligned RDMRegを
-使用します。
+Dense highはLpJEPA損失専用の候補表現です。decoder、通常SAE評価、MMLU、
+swap、介入では常にTop-K後のsparse highを使用するため、最終SAEのhigh L0は
+`HIGH_K`で制御できます。SAE warmupはなく、invarianceとRDMRegは同じ
+regularization rampで最初から立ち上がります。
 
 ## Quick start
 
@@ -35,8 +35,8 @@ HF_TOKEN=... bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
 主な既定値はPythia 6.9B、layer 16、maximum span 32、SAE width 32768、
-high fraction 0.2、low Top-K 64、1024 random projections、512 axis coordinates、
-12000 optimizer stepsです。実行後は次を開きます。
+high fraction 0.2、high Top-K 128、low Top-K 64、1024 random projections、
+512 axis coordinates、12000 optimizer stepsです。実行後は次を開きます。
 
 ```text
 runs/rectified-lpjepa-pile/report/index.html
@@ -45,26 +45,30 @@ runs/rectified-lpjepa-pile/report/index.html
 主要設定の変更例:
 
 ```bash
-WINDOW_SIZE=8 \
+WINDOW_SIZE=4 \
 LAYER=16 \
 HIGH_FRACTION=0.5 \
-HIGH_RECONSTRUCTION_WEIGHT=0.1 \
+HIGH_K=256 \
+LOW_K=64 \
+HIGH_RECONSTRUCTION_WEIGHT=0.5 \
 TARGET_ACTIVE_FRACTION=0.025 \
 AXIS_RDM_FEATURES=512 \
 AXIS_RDM_WEIGHT=1 \
-RUN_DIR=runs/l16-win8-hf05-rgg-laplace \
+RUN_DIR=runs/l16-win4-dual-high \
 bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
-`AXIS_RDM_WEIGHT=0`でaxis-aligned項だけを無効化できます。
+`TARGET_ACTIVE_FRACTION * d_high`はdense候補の期待L0です。Top-Kを安定して
+満たすには、この値を`HIGH_K`より十分大きくしてください。既定の
+`d_high=16384, target=0.025, HIGH_K=256`では期待候補数は約410です。
 
 軽量smoke test:
 
 ```bash
 MODEL=EleutherAI/pythia-70m-deduped \
-LAYER=3 WINDOW_SIZE=8 D_SAE=1024 LOW_K=16 \
+LAYER=3 WINDOW_SIZE=8 D_SAE=1024 HIGH_K=4 LOW_K=16 \
 PILE_TRAIN_POSITIONS=8192 PILE_VALIDATION_POSITIONS=2048 \
-TRAIN_STEPS=20 SAE_WARMUP_STEPS=5 REGULARIZATION_RAMP_STEPS=5 \
+TRAIN_STEPS=20 REGULARIZATION_RAMP_STEPS=5 TARGET_ACTIVE_FRACTION=0.05 \
 BATCH_SIZE=16 GRADIENT_ACCUMULATION=1 \
 RDM_PROJECTIONS=32 RDM_PROJECTION_CHUNK_SIZE=16 AXIS_RDM_FEATURES=32 \
 MMLU_MAX_QUESTIONS=64 PAIRS=8 RUN_LOSS_RECOVERED=0 RUN_CAUSAL=0 \
@@ -76,41 +80,36 @@ bash scripts/rectified_lpjepa_quickstart.sh
 
 ```bash
 ACTIVATION_MANIFEST=runs/existing/pile-activations/manifest.json \
-START_STAGE=2 RUN_DIR=runs/new-rgg-run \
+START_STAGE=2 RUN_DIR=runs/new-dual-code-run \
 bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
 ## Objective
 
 ```text
-(z_a^H, z_a^L) = E(h_a)
-(z_b^H, z_b^L) = E(h_b)
+a_i^H = ReLU(E_H(h_i))
+z_i^H = TopK(a_i^H, K_high)
+z_i^L = TopK(ReLU(E_L(h_i)), K_low)
 
-L = (1-lambda_H) L_full-rec
-  + lambda_H L_high-rec
-  + lambda_inv L_invariance
-  + lambda_rdm (L_random-RDM + lambda_axis L_axis-RDM)
+L = (1-lambda_H) L_full-rec(z^H, z^L)
+  + lambda_H L_high-rec(z^H)
+  + lambda_inv L_invariance(a_a^H, a_b^H)
+  + lambda_rdm (L_random-RDM(a^H) + lambda_axis L_axis-RDM(a^H))
 ```
-
-- `L_full-rec`: high + lowによる両viewのFVU
-- `L_high-rec`: highだけによる両viewのFVU
-- `L_invariance`: high code間のtarget-second-moment正規化MSE
-- `L_random-RDM`: random projections上の正規化sliced 2-Wasserstein
-- `L_axis-RDM`: サンプルしたhigh座標上の正規化1次元2-Wasserstein
 
 ## Evaluation
 
 quickstartは以下を一括で評価・可視化します。
 
-1. 通常のSAE指標: FVU、FVE、cosine、L0、dead feature、loss recovered
-2. shared-view validity: same-span cosine、shuffled null、距離別marginとCI
-3. high/low分解: ordinary reconstruction、same-span swap、shuffled swap
-4. RGG整合: random-projection RDM、axis-aligned RDM、active fraction
-5. MMLU: semantics/context/syntaxのquestion-grouped locked probes
-6. causal validity: high codeのpatch、ablation、norm-matched random ablation
+1. Top-K SAE指標: FVU、FVE、cosine、L0、dead feature、loss recovered
+2. sparse/dense shared-view validity: same-span cosine、shuffled null、距離別margin
+3. dense-to-sparse保持率: energy retained、cosine、Top-K saturation fraction
+4. high/low分解: ordinary reconstruction、same-span swap、shuffled swap
+5. RGG整合: random-projection RDM、axis-aligned RDM、dense active fraction
+6. MMLU semantics/context/syntax probesとsparse high feature介入
 
 swap FVUは距離ごとに `sum(squared error) / sum(centered residual energy)` で
-集計します。詳細な事前登録と判定基準は
+集計します。詳細は
 [`docs/RECTIFIED_LPJEPA_PROTOCOL.md`](docs/RECTIFIED_LPJEPA_PROTOCOL.md)を参照してください。
 
 ## Artifacts
@@ -118,18 +117,11 @@ swap FVUは距離ごとに `sum(squared error) / sum(centered residual energy)` 
 ```text
 RUN_DIR/
   pile-activations/manifest.json
-  model/
-    rectified_lpjepa_sae.pt
-    training_report.json
-  analysis/
-    rectified_lpjepa_report.json
-    distance_metrics.csv
-    mmlu_probe_accuracy.csv
-    evaluation_embeddings.pt
-    intervention-*.jsonl
-  report/
-    index.html
-    visualization_summary.json
-    figures/*.png
-    figures/*.pdf
+  model/rectified_lpjepa_sae.pt
+  model/training_report.json
+  analysis/rectified_lpjepa_report.json
+  analysis/distance_metrics.csv
+  analysis/mmlu_probe_accuracy.csv
+  report/index.html
+  report/visualization_summary.json
 ```
