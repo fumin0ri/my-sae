@@ -45,6 +45,9 @@ TRAIN_STEPS="${TRAIN_STEPS:-12000}"
 REGULARIZATION_RAMP_STEPS="${REGULARIZATION_RAMP_STEPS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-160}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
+PAIRS_PER_SEQUENCE="${PAIRS_PER_SEQUENCE:-8}"
+MAX_PAIRS_PER_SEQUENCE_PER_BATCH="${MAX_PAIRS_PER_SEQUENCE_PER_BATCH:-2}"
+PAIR_SHUFFLE_BUFFER_PAIRS="${PAIR_SHUFFLE_BUFFER_PAIRS:-4096}"
 PILE_EXTRACT_BATCH_SIZE="${PILE_EXTRACT_BATCH_SIZE:-8}"
 PILE_SEQUENCE_LENGTH="${PILE_SEQUENCE_LENGTH:-320}"
 if (( PILE_SEQUENCE_LENGTH < BURN_IN_TOKENS + WINDOW_SIZE )); then
@@ -106,7 +109,7 @@ fi
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
 python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
-echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, high_k=$HIGH_K, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, MMLU=$MMLU_MAX_QUESTIONS"
+echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, high_k=$HIGH_K, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, pairs/sequence=$PAIRS_PER_SEQUENCE, per-batch cap=$MAX_PAIRS_PER_SEQUENCE_PER_BATCH, pair buffer=$PAIR_SHUFFLE_BUFFER_PAIRS, MMLU=$MMLU_MAX_QUESTIONS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
 if [[ -n "$REVISION" ]]; then MODEL_LOAD_ARGS+=(--revision "$REVISION"); fi
@@ -169,6 +172,9 @@ if (( START_STAGE <= 2 && END_STAGE >= 2 )); then
     --steps "$TRAIN_STEPS" \
     --regularization-ramp-steps "$REGULARIZATION_RAMP_STEPS" \
     --batch-size "$BATCH_SIZE" --gradient-accumulation-steps "$GRADIENT_ACCUMULATION" \
+    --pairs-per-sequence "$PAIRS_PER_SEQUENCE" \
+    --max-pairs-per-sequence-per-batch "$MAX_PAIRS_PER_SEQUENCE_PER_BATCH" \
+    --pair-shuffle-buffer-pairs "$PAIR_SHUFFLE_BUFFER_PAIRS" \
     --amp-dtype bfloat16 --sae-lr 0.0002 --warmup-steps 500 \
     --log-every 400 --device "$TRAIN_DEVICE" --seed "$SEED"
 fi

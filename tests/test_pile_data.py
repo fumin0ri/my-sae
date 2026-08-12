@@ -104,6 +104,68 @@ def test_random_pair_batches_follow_random_span_design_and_are_boundary_safe(
         assert int(batch[key].min()) >= manifest["burn_in_tokens"]
 
 
+def test_training_pair_buffer_reuses_io_but_keeps_batches_sequence_diverse(
+    tmp_path, monkeypatch
+) -> None:
+    make_manifest(tmp_path)
+    root, manifest = load_activation_manifest(tmp_path)
+    from shared_residual import activation_store
+
+    real_load = activation_store.load_sequence_shard
+    loads = 0
+
+    def counted_load(path, sequence_length):
+        nonlocal loads
+        loads += 1
+        return real_load(path, sequence_length)
+
+    monkeypatch.setattr(activation_store, "load_sequence_shard", counted_load)
+    iterator = iter(
+        RandomViewPairShardBatches(
+            root,
+            manifest,
+            "train",
+            batch_size=8,
+            seed=19,
+            pairs_per_sequence=4,
+            max_pairs_per_sequence_per_batch=2,
+            shuffle_buffer_pairs=24,
+        )
+    )
+    first = next(iterator)
+    second = next(iterator)
+    assert loads == 1
+    for batch in (first, second):
+        _, counts = torch.unique(batch["sequence_id"], return_counts=True)
+        assert len(counts) >= 4
+        assert int(counts.max()) <= 2
+
+
+def test_training_pair_buffer_is_seed_deterministic(tmp_path) -> None:
+    make_manifest(tmp_path)
+    root, manifest = load_activation_manifest(tmp_path)
+
+    def first_batch():
+        return next(
+            iter(
+                RandomViewPairShardBatches(
+                    root,
+                    manifest,
+                    "train",
+                    batch_size=8,
+                    seed=23,
+                    pairs_per_sequence=3,
+                    shuffle_buffer_pairs=21,
+                )
+            )
+        )
+
+    left = first_batch()
+    right = first_batch()
+    for key in left:
+        assert torch.equal(left[key], right[key])
+
+
 def test_validation_pairs_are_deterministic_and_residuals_exclude_padding(
     tmp_path,
 ) -> None:

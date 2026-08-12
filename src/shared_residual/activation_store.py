@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -173,7 +174,15 @@ def _sample_view_pairs(
 
 
 class RandomViewPairShardBatches:
-    """Infinite deterministic exchangeable view pairs from random spans."""
+    """Infinite deterministic batches with shard-I/O-amortized view pairs.
+
+    Several independently sampled pairs are materialized while a sequence shard
+    is resident in host memory.  A bounded CPU buffer then mixes those pairs and
+    preferentially places at most one pair from a sequence in a batch (falling
+    back to ``max_pairs_per_sequence_per_batch`` only near buffer exhaustion).
+    This preserves sequence diversity for the batch-distribution RDM objective
+    without rereading a full residual trajectory for every single pair.
+    """
 
     def __init__(
         self,
@@ -182,6 +191,9 @@ class RandomViewPairShardBatches:
         split: str,
         batch_size: int,
         seed: int,
+        pairs_per_sequence: int = 8,
+        max_pairs_per_sequence_per_batch: int = 2,
+        shuffle_buffer_pairs: int = 4096,
     ):
         self.paths = shard_paths(root, manifest, split)
         self.sequence_length = int(manifest["sequence_length"])
@@ -190,73 +202,176 @@ class RandomViewPairShardBatches:
         self.max_horizon = int(manifest["max_horizon"])
         self.burn_in_tokens = int(manifest["burn_in_tokens"])
         self.batch_size = batch_size
+        self.pairs_per_sequence = pairs_per_sequence
+        self.max_pairs_per_sequence_per_batch = (
+            max_pairs_per_sequence_per_batch
+        )
+        pairs_per_epoch = int(manifest[split]["sequences"]) * pairs_per_sequence
+        self.shuffle_buffer_pairs = max(
+            batch_size, min(shuffle_buffer_pairs, pairs_per_epoch)
+        )
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if pairs_per_sequence < 1:
+            raise ValueError("pairs_per_sequence must be positive")
+        if max_pairs_per_sequence_per_batch < 1:
+            raise ValueError(
+                "max_pairs_per_sequence_per_batch must be positive"
+            )
+        if shuffle_buffer_pairs < 1:
+            raise ValueError("shuffle_buffer_pairs must be positive")
+        minimum_sequences = math.ceil(
+            batch_size / max_pairs_per_sequence_per_batch
+        )
+        if int(manifest[split]["sequences"]) < minimum_sequences:
+            raise ValueError(
+                f"{split} needs at least {minimum_sequences} sequences for "
+                "the requested per-batch sequence cap"
+            )
         self.generator = torch.Generator().manual_seed(seed)
         self.path_order: list[int] = []
         self.path_position = 0
-        self.current: SequenceShard | None = None
-        self.row_order: torch.Tensor | None = None
-        self.row_position = 0
         self.epoch = 0
+        self.pending_chunks: list[dict[str, torch.Tensor]] = []
+        self.pending_count = 0
+        self.ready_batches: list[dict[str, torch.Tensor]] = []
 
     def __iter__(self) -> RandomViewPairShardBatches:
         return self
 
-    def _next_shard(self) -> None:
+    def _next_path_index(self) -> int:
         if self.path_position >= len(self.path_order):
             self.path_order = torch.randperm(
                 len(self.paths), generator=self.generator
             ).tolist()
             self.path_position = 0
             self.epoch += 1
-        path = self.paths[self.path_order[self.path_position]]
+        path_index = self.path_order[self.path_position]
         self.path_position += 1
-        self.current = load_sequence_shard(path, self.sequence_length)
-        self.row_order = torch.randperm(
-            len(self.current.activations), generator=self.generator
-        )
-        self.row_position = 0
+        return path_index
 
-    def __next__(self) -> dict[str, torch.Tensor]:
+    def _sample_next_shard(self) -> dict[str, torch.Tensor]:
+        path_index = self._next_path_index()
+        shard = load_sequence_shard(
+            self.paths[path_index], self.sequence_length
+        )
+        sequence_count = len(shard.activations)
+        row_indices = torch.arange(sequence_count).repeat_interleave(
+            self.pairs_per_sequence
+        )
+        sample_count = len(row_indices)
         span_lengths = torch.randint(
             self.min_span_length,
             self.max_span_length + 1,
-            (self.batch_size,),
+            (sample_count,),
             generator=self.generator,
         )
-        pieces: dict[str, list[torch.Tensor]] = {}
-        needed = self.batch_size
-        pair_start = 0
-        while needed:
-            if (
-                self.current is None
-                or self.row_order is None
-                or self.row_position >= len(self.current.activations)
-            ):
-                self._next_shard()
-            assert self.current is not None
-            assert self.row_order is not None
-            take = min(needed, len(self.current.activations) - self.row_position)
-            indices = self.row_order[self.row_position : self.row_position + take]
-            selected_lengths = self.current.valid_lengths.index_select(0, indices)
-            pair_end = pair_start + take
-            sampled = _sample_view_pairs(
-                self.current.activations,
-                selected_lengths,
-                span_lengths[pair_start:pair_end],
-                self.burn_in_tokens,
-                self.max_horizon,
-                self.generator,
-                row_indices=indices,
-            )
-            for key, value in sampled.items():
-                pieces.setdefault(key, []).append(value)
-            self.row_position += take
-            pair_start = pair_end
-            needed -= take
+        sampled = _sample_view_pairs(
+            shard.activations,
+            shard.valid_lengths.index_select(0, row_indices),
+            span_lengths,
+            self.burn_in_tokens,
+            self.max_horizon,
+            self.generator,
+            row_indices=row_indices,
+        )
+        # Shard index and row uniquely identify a physical training sequence.
+        # Keeping this identifier in batches also makes sequence diversity
+        # directly auditable in tests and training diagnostics.
+        sampled["sequence_id"] = (
+            path_index * (1 << 32) + row_indices.to(torch.int64)
+        )
+        permutation = torch.randperm(sample_count, generator=self.generator)
         return {
-            key: torch.cat(values) if len(values) > 1 else values[0]
-            for key, values in pieces.items()
+            key: value.index_select(0, permutation)
+            for key, value in sampled.items()
         }
+
+    def _append_until_buffer_full(self) -> None:
+        while self.pending_count < self.shuffle_buffer_pairs:
+            chunk = self._sample_next_shard()
+            self.pending_chunks.append(chunk)
+            self.pending_count += len(chunk["view_a"])
+
+    def _build_ready_batches(self) -> None:
+        self._append_until_buffer_full()
+        pool = {
+            key: torch.cat([chunk[key] for chunk in self.pending_chunks])
+            for key in self.pending_chunks[0]
+        }
+        sequence_ids = pool["sequence_id"].tolist()
+        grouped: dict[int, list[int]] = {}
+        for index, sequence_id in enumerate(sequence_ids):
+            grouped.setdefault(sequence_id, []).append(index)
+        for indices in grouped.values():
+            order = torch.randperm(len(indices), generator=self.generator).tolist()
+            indices[:] = [indices[index] for index in order]
+
+        ready_indices: list[list[int]] = []
+        while sum(
+            min(len(indices), self.max_pairs_per_sequence_per_batch)
+            for indices in grouped.values()
+        ) >= self.batch_size:
+            selected: list[int] = []
+            for _ in range(self.max_pairs_per_sequence_per_batch):
+                available = [
+                    sequence_id
+                    for sequence_id, indices in grouped.items()
+                    if indices
+                ]
+                if not available:
+                    break
+                order = torch.randperm(
+                    len(available), generator=self.generator
+                ).tolist()
+                for offset in order:
+                    selected.append(grouped[available[offset]].pop())
+                    if len(selected) == self.batch_size:
+                        break
+                if len(selected) == self.batch_size:
+                    break
+            if len(selected) != self.batch_size:
+                break
+            ready_indices.append(selected)
+
+        if not ready_indices:
+            raise RuntimeError(
+                "pair shuffle buffer could not form a sequence-diverse batch; "
+                "increase shuffle_buffer_pairs or the per-batch sequence cap"
+            )
+        self.ready_batches = [
+            {
+                key: value.index_select(
+                    0, torch.tensor(indices, dtype=torch.long)
+                )
+                for key, value in pool.items()
+            }
+            for indices in ready_indices
+        ]
+        # __next__ uses pop(), so reverse once to preserve construction order:
+        # high-diversity batches are emitted before the buffer tail that may
+        # require the configured second pair from a sequence.
+        self.ready_batches.reverse()
+        remaining = [
+            index for indices in grouped.values() for index in indices
+        ]
+        if remaining:
+            remaining_indices = torch.tensor(remaining, dtype=torch.long)
+            self.pending_chunks = [
+                {
+                    key: value.index_select(0, remaining_indices)
+                    for key, value in pool.items()
+                }
+            ]
+            self.pending_count = len(remaining)
+        else:
+            self.pending_chunks = []
+            self.pending_count = 0
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        if not self.ready_batches:
+            self._build_ready_batches()
+        return self.ready_batches.pop()
 
 
 def validation_view_pair_batches(

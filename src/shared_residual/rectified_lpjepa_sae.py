@@ -707,6 +707,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regularization-ramp-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=160)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument(
+        "--pairs-per-sequence",
+        type=int,
+        default=8,
+        help="Independent random pairs generated per sequence load to amortize I/O.",
+    )
+    parser.add_argument(
+        "--max-pairs-per-sequence-per-batch",
+        type=int,
+        default=2,
+        help="Hard cap on pairs from one physical sequence in a training batch.",
+    )
+    parser.add_argument(
+        "--pair-shuffle-buffer-pairs",
+        type=int,
+        default=4096,
+        help="CPU pair buffer used to mix sequences before batch construction.",
+    )
     parser.add_argument("--sae-lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
@@ -728,6 +746,12 @@ def main() -> None:
         raise ValueError("gradient accumulation must be positive")
     if args.batch_size < 2:
         raise ValueError("batch_size must be at least two for two-sample RDMReg")
+    if min(
+        args.pairs_per_sequence,
+        args.max_pairs_per_sequence_per_batch,
+        args.pair_shuffle_buffer_pairs,
+    ) < 1:
+        raise ValueError("pair reuse and shuffle-buffer settings must be positive")
     if args.invariance_weight < 0 or args.rdm_weight < 0:
         raise ValueError("invariance and RDM weights must be non-negative")
     if args.rdm_projections < 1 or args.rdm_projection_chunk_size < 1:
@@ -772,7 +796,16 @@ def main() -> None:
     )
     iterator = iter(
         RandomViewPairShardBatches(
-            root, manifest, "train", args.batch_size, args.seed
+            root,
+            manifest,
+            "train",
+            args.batch_size,
+            args.seed,
+            pairs_per_sequence=args.pairs_per_sequence,
+            max_pairs_per_sequence_per_batch=(
+                args.max_pairs_per_sequence_per_batch
+            ),
+            shuffle_buffer_pairs=args.pair_shuffle_buffer_pairs,
         )
     )
     optimizer = torch.optim.AdamW(
@@ -805,9 +838,25 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         metric_sums: dict[str, float] = {}
         for _ in range(args.gradient_accumulation_steps):
+            host_batch = next(iterator)
+            if should_log:
+                _, sequence_counts = torch.unique(
+                    host_batch["sequence_id"], return_counts=True
+                )
+                metric_sums["unique_sequences_per_batch"] = (
+                    metric_sums.get("unique_sequences_per_batch", 0.0)
+                    + float(len(sequence_counts))
+                )
+                metric_sums["maximum_pairs_per_sequence_in_batch"] = (
+                    metric_sums.get(
+                        "maximum_pairs_per_sequence_in_batch", 0.0
+                    )
+                    + float(sequence_counts.max())
+                )
             batch = {
                 key: value.to(device, non_blocking=True)
-                for key, value in next(iterator).items()
+                for key, value in host_batch.items()
+                if key != "sequence_id"
             }
             with autocast_context(device, args.amp_dtype):
                 loss, metrics = rectified_lpjepa_loss(
@@ -940,6 +989,16 @@ def main() -> None:
                 "dataset": manifest["dataset"],
                 "fingerprint": fingerprint,
                 "sampling": "random span and two exchangeable positions without replacement",
+                "pairs_per_sequence_load": args.pairs_per_sequence,
+                "maximum_pairs_per_sequence_per_batch": (
+                    args.max_pairs_per_sequence_per_batch
+                ),
+                "pair_shuffle_buffer_pairs": args.pair_shuffle_buffer_pairs,
+                "validation_pairs_per_sequence": 1,
+                "io_amortization": (
+                    "sample multiple independent pairs while each residual "
+                    "sequence shard is resident, then sequence-balance batches"
+                ),
                 "min_span_length": manifest["min_span_length"],
                 "max_span_length": manifest["max_span_length"],
                 "sequence_length": manifest["sequence_length"],

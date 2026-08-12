@@ -30,6 +30,26 @@ from the same sampled span as exchangeable views and learns a high/low SAE:
 10. Also match randomly sampled high coordinates directly to the target's
     coordinate marginals with axis-aligned two-sample 2-Wasserstein distance.
 
+## I/O-amortized training sampling
+
+Training materializes multiple independent random-span pairs while each long
+residual sequence shard is resident in CPU memory. The primary settings are:
+
+```text
+pairs_per_sequence = 8
+pair_shuffle_buffer_pairs = 4096
+max_pairs_per_sequence_per_batch = 2
+validation_pairs_per_sequence = 1
+```
+
+Pairs enter a bounded CPU shuffle buffer. Batch construction takes one pair per
+physical sequence first and uses a second pair only when the buffer tail cannot
+fill the batch otherwise. Thus a normal batch contains close to `batch_size`
+distinct sequences, while each expensive long-sequence shard read supplies up to
+eight independently sampled training pairs per sequence. Training logs record the
+number of unique sequences and maximum within-batch multiplicity. Validation
+retains exactly one pair per sequence and remains document-disjoint.
+
 There is no predictor, position embedding, horizon embedding, target encoder,
 stop-gradient target, contrastive negative, variance loss, compatibility loss, or
 predicted-residual loss.
