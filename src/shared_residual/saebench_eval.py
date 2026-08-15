@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from dataclasses import asdict, is_dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -37,6 +39,31 @@ def _parse_csv(value: str) -> list[str]:
     if not values:
         raise ValueError("comma-separated selection cannot be empty")
     return values
+
+
+def _isolated_eval_command(evaluation: str, argv: list[str]) -> list[str]:
+    """Replace the eval selection while preserving every other CLI option."""
+    child_args = list(argv)
+    replaced = False
+    for index, value in enumerate(child_args):
+        if value == "--evals":
+            if index + 1 >= len(child_args):
+                raise ValueError("--evals requires a value")
+            child_args[index + 1] = evaluation
+            replaced = True
+            break
+        if value.startswith("--evals="):
+            child_args[index] = f"--evals={evaluation}"
+            replaced = True
+            break
+    if not replaced:
+        child_args.extend(("--evals", evaluation))
+    return [
+        sys.executable,
+        "-m",
+        "shared_residual.saebench_eval",
+        *child_args,
+    ]
 
 
 def _density_only_misc_metrics(
@@ -184,6 +211,24 @@ def main() -> None:
             f"{saebench_version}. Run: bash scripts/install_cuda121.sh"
         )
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "saebench_summary.json"
+    if len(evals) > 1:
+        # Pythia-6.9B cannot be loaded twice on a 24 GiB GPU. Separate
+        # processes make model/hook cleanup deterministic between eval suites.
+        for evaluation in evals:
+            print(f"Running SAEBench {evaluation} in an isolated process")
+            subprocess.run(
+                _isolated_eval_command(evaluation, sys.argv[1:]), check=True
+            )
+        merged = json.loads(summary_path.read_text(encoding="utf-8"))
+        merged["settings"] = vars(args)
+        merged["isolated_eval_processes"] = evals
+        write_json(summary_path, _jsonable(merged))
+        print(f"wrote {summary_path}")
+        return
+
     dtype = getattr(torch, args.dtype)
     selected_saes: list[tuple[str, Any]] = []
     checkpoint_metadata: dict[str, Any] | None = None
@@ -200,8 +245,14 @@ def main() -> None:
         selected_saes.append((f"rectified-lpjepa-{component}", adapter))
         checkpoint_metadata = checkpoint
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    previous_evals: dict[str, Any] = {}
+    if summary_path.exists():
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (
+            previous.get("checkpoint") == str(Path(args.checkpoint))
+            and previous.get("components") == components
+        ):
+            previous_evals = previous.get("evals", {})
     summary: dict[str, Any] = {
         "saebench_version": saebench_version,
         "checkpoint": str(Path(args.checkpoint)),
@@ -209,7 +260,7 @@ def main() -> None:
         if checkpoint_metadata
         else None,
         "components": components,
-        "evals": {},
+        "evals": previous_evals,
         "settings": vars(args),
         "comparability_note": (
             "Compare checkpoints at matched L0; SAEBench metrics are often "
@@ -302,8 +353,8 @@ def main() -> None:
             output_dir / "sparse_probing", selected_saes
         )
 
-    write_json(output_dir / "saebench_summary.json", _jsonable(summary))
-    print(f"wrote {output_dir / 'saebench_summary.json'}")
+    write_json(summary_path, _jsonable(summary))
+    print(f"wrote {summary_path}")
 
 
 if __name__ == "__main__":

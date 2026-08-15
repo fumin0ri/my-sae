@@ -15,6 +15,7 @@ from shared_residual.saebench_adapter import (
 )
 from shared_residual.saebench_eval import (
     _density_only_misc_metrics,
+    _isolated_eval_command,
     _load_official_core_outputs,
 )
 
@@ -139,3 +140,23 @@ def test_density_only_misc_metrics_marks_weight_metrics_unavailable() -> None:
         "max_encoder_cosine_sim",
     ):
         assert feature_metrics[name] == [-1.0] * 4
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--checkpoint", "model.pt", "--evals", "core,sparse_probing"],
+        ["--checkpoint", "model.pt", "--evals=core,sparse_probing"],
+    ],
+)
+def test_isolated_eval_command_replaces_only_eval_selection(argv) -> None:
+    command = _isolated_eval_command("sparse_probing", argv)
+    assert command[:3] == [
+        command[0],
+        "-m",
+        "shared_residual.saebench_eval",
+    ]
+    assert "--checkpoint" in command
+    assert "model.pt" in command
+    assert not any("core,sparse_probing" in value for value in command)
+    assert any("sparse_probing" in value for value in command)

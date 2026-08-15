@@ -133,6 +133,11 @@ quickstartは以下を一括で評価・可視化します。
 6. SAEBench Core: explained variance、L0、KL/CE preservation、feature density
 7. 任意のSAEBench Sparse Probing（`SAEBENCH_EVALS=core,sparse_probing`）
 
+複数のSAEBench評価は評価ごとに独立したPython processで実行します。これにより、
+Pythia-6.9BのCore評価後にGPU上へモデル参照が残っても、次のSparse Probing
+開始前にprocess終了によって確実にVRAMを解放します。保存済みの公式結果は
+再利用されます。
+
 SAEBench公式の推奨どおり、`HIGH_K=64,128,256`など複数のL0で学習した
 checkpointを同一設定で比較してください。辞書幅32768で二乗計算量になる
 weight-based類似度は既定で無効です。必要な場合のみ
