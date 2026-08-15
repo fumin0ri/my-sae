@@ -136,7 +136,9 @@ quickstartは以下を一括で評価・可視化します。
 SAEBench公式の推奨どおり、`HIGH_K=64,128,256`など複数のL0で学習した
 checkpointを同一設定で比較してください。辞書幅32768で二乗計算量になる
 weight-based類似度は既定で無効です。必要な場合のみ
-`SAEBENCH_COMPUTE_WEIGHT_METRICS=1`を使用します。
+`SAEBENCH_COMPUTE_WEIGHT_METRICS=1`を使用します。無効時の公式出力では、
+未計算の`average_max_{encoder,decoder}_cosine_sim`を`-1`と記録し、
+feature density、alive fraction、L0などは通常どおり集計します。
 
 swap FVUは距離ごとに `sum(squared error) / sum(centered residual energy)` で
 集計します。詳細は

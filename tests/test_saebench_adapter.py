@@ -13,7 +13,10 @@ from shared_residual.saebench_adapter import (
     load_saebench_adapter,
     transformer_lens_model_name,
 )
-from shared_residual.saebench_eval import _load_official_core_outputs
+from shared_residual.saebench_eval import (
+    _density_only_misc_metrics,
+    _load_official_core_outputs,
+)
 
 
 def write_checkpoint(tmp_path):
@@ -110,3 +113,29 @@ def test_cached_official_core_output_is_loaded(tmp_path) -> None:
     )
     assert rows[0]["metrics"]["sparsity"]["l0"] == 6.0
     assert rows[0]["official_result"] == str(path)
+
+
+def test_density_only_misc_metrics_marks_weight_metrics_unavailable() -> None:
+    feature_metrics = {
+        "feature_density": torch.tensor([0.0, 0.005, 0.02, 0.2])
+    }
+    metrics = _density_only_misc_metrics(feature_metrics)
+    assert metrics["average_max_encoder_cosine_sim"] == -1.0
+    assert metrics["average_max_decoder_cosine_sim"] == -1.0
+    assert metrics["frac_alive"] == pytest.approx(0.75)
+    assert metrics["freq_over_1_percent"] == pytest.approx(0.5)
+    assert metrics["freq_over_10_percent"] == pytest.approx(0.25)
+    assert metrics["normalized_freq_over_1_percent"] == pytest.approx(
+        0.22 / 0.225
+    )
+    assert metrics["normalized_freq_over_10_percent"] == pytest.approx(
+        0.2 / 0.225
+    )
+    for name in (
+        "encoder_bias",
+        "encoder_decoder_cosine_sim",
+        "encoder_norm",
+        "max_decoder_cosine_sim",
+        "max_encoder_cosine_sim",
+    ):
+        assert feature_metrics[name] == [-1.0] * 4

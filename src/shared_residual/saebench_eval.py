@@ -39,6 +39,50 @@ def _parse_csv(value: str) -> list[str]:
     return values
 
 
+def _density_only_misc_metrics(
+    feature_metrics: dict[str, Any],
+) -> dict[str, float]:
+    """SAEBench 0.5 compatibility for density without O(d_sae^2) metrics.
+
+    Upstream calls its combined misc aggregator whenever density *or* weight
+    metrics are enabled, but that aggregator unconditionally indexes the two
+    weight-metric arrays.  ``-1`` is SAEBench's own unavailable/NaN sentinel.
+    """
+    densities = torch.as_tensor(
+        feature_metrics["feature_density"], dtype=torch.float32
+    )
+    if densities.ndim != 1 or densities.numel() == 0:
+        raise ValueError("SAEBench feature_density must be a non-empty vector")
+    # Its per-feature JSON converter has the same unconditional accesses as
+    # the misc aggregator. Mutating this upstream-owned dictionary is
+    # intentional: it is serialized immediately after this function returns.
+    unavailable = [-1.0] * densities.numel()
+    for name in (
+        "encoder_bias",
+        "encoder_decoder_cosine_sim",
+        "encoder_norm",
+        "max_decoder_cosine_sim",
+        "max_encoder_cosine_sim",
+    ):
+        feature_metrics.setdefault(name, unavailable.copy())
+    total = densities.sum()
+
+    def normalized_mass(threshold: float) -> float:
+        if float(total) <= 0:
+            return 0.0
+        return float(densities[densities > threshold].sum() / total)
+
+    return {
+        "average_max_encoder_cosine_sim": -1.0,
+        "average_max_decoder_cosine_sim": -1.0,
+        "frac_alive": float((densities > 0).float().mean()),
+        "freq_over_1_percent": float((densities > 0.01).float().mean()),
+        "freq_over_10_percent": float((densities > 0.1).float().mean()),
+        "normalized_freq_over_1_percent": normalized_mass(0.01),
+        "normalized_freq_over_10_percent": normalized_mass(0.1),
+    }
+
+
 def _load_official_outputs(
     evaluation_dir: Path, selected_saes: list[tuple[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -175,24 +219,30 @@ def main() -> None:
     }
 
     if "core" in evals:
-        from sae_bench.evals.core.main import multiple_evals
+        import sae_bench.evals.core.main as core_main
 
-        multiple_evals(
-            selected_saes=selected_saes,
-            n_eval_reconstruction_batches=args.core_reconstruction_batches,
-            n_eval_sparsity_variance_batches=args.core_sparsity_batches,
-            eval_batch_size_prompts=args.llm_batch_size,
-            compute_featurewise_density_statistics=True,
-            compute_featurewise_weight_based_metrics=args.compute_weight_metrics,
-            exclude_special_tokens_from_reconstruction=True,
-            dataset=args.core_dataset,
-            context_size=args.context_size,
-            output_folder=str(output_dir / "core"),
-            verbose=True,
-            dtype=args.dtype,
-            device=args.device,
-            force_rerun=args.force_rerun,
-        )
+        upstream_misc_aggregator = core_main.calculate_misc_metrics
+        if not args.compute_weight_metrics:
+            core_main.calculate_misc_metrics = _density_only_misc_metrics
+        try:
+            core_main.multiple_evals(
+                selected_saes=selected_saes,
+                n_eval_reconstruction_batches=args.core_reconstruction_batches,
+                n_eval_sparsity_variance_batches=args.core_sparsity_batches,
+                eval_batch_size_prompts=args.llm_batch_size,
+                compute_featurewise_density_statistics=True,
+                compute_featurewise_weight_based_metrics=args.compute_weight_metrics,
+                exclude_special_tokens_from_reconstruction=True,
+                dataset=args.core_dataset,
+                context_size=args.context_size,
+                output_folder=str(output_dir / "core"),
+                verbose=True,
+                dtype=args.dtype,
+                device=args.device,
+                force_rerun=args.force_rerun,
+            )
+        finally:
+            core_main.calculate_misc_metrics = upstream_misc_aggregator
         summary["evals"]["core"] = _load_official_core_outputs(
             output_dir, selected_saes
         )
