@@ -14,8 +14,8 @@ predictor、teacher encoder、in-batch negativesは使いません。
         sparse low:  ReLU + Top-K + reconstruction
 ```
 
-Dense highはLpJEPA損失専用の候補表現です。decoder、通常SAE評価、MMLU、
-swap、介入では常にTop-K後のsparse highを使用するため、最終SAEのhigh L0は
+Dense highはLpJEPA損失専用の候補表現です。decoder、通常SAE評価、SAEBench、
+swapでは常にTop-K後のsparse highを使用するため、最終SAEのhigh L0は
 `HIGH_K`で制御できます。SAE warmupはなく、invarianceとRDMRegは同じ
 regularization rampで最初から立ち上がります。
 
@@ -30,7 +30,7 @@ conda create -n sae python=3.11 -y
 conda activate sae
 pip install --index-url https://download.pytorch.org/whl/cu121 \
   torch==2.5.1 torchvision torchaudio
-pip install -e .
+pip install -e ".[saebench]"
 HF_TOKEN=... bash scripts/rectified_lpjepa_quickstart.sh
 ```
 
@@ -71,7 +71,8 @@ PILE_TRAIN_POSITIONS=8192 PILE_VALIDATION_POSITIONS=2048 \
 TRAIN_STEPS=20 REGULARIZATION_RAMP_STEPS=5 TARGET_ACTIVE_FRACTION=0.05 \
 BATCH_SIZE=16 GRADIENT_ACCUMULATION=1 \
 RDM_PROJECTIONS=32 RDM_PROJECTION_CHUNK_SIZE=16 AXIS_RDM_FEATURES=32 \
-MMLU_MAX_QUESTIONS=64 PAIRS=8 RUN_LOSS_RECOVERED=0 RUN_CAUSAL=0 \
+RUN_LOSS_RECOVERED=0 SAEBENCH_CORE_RECONSTRUCTION_BATCHES=2 \
+SAEBENCH_CORE_SPARSITY_BATCHES=4 \
 RUN_DIR=runs/smoke \
 bash scripts/rectified_lpjepa_quickstart.sh
 ```
@@ -83,6 +84,16 @@ ACTIVATION_MANIFEST=runs/existing/pile-activations/manifest.json \
 START_STAGE=2 RUN_DIR=runs/new-dual-code-run \
 bash scripts/rectified_lpjepa_quickstart.sh
 ```
+
+既に学習済みの`RUN_DIR`へSAEBenchと可視化だけを追加する場合:
+
+```bash
+START_STAGE=4 END_STAGE=5 RUN_DIR=runs/l16-win4-dual-high \
+bash scripts/rectified_lpjepa_quickstart.sh
+```
+
+同じ設定の公式Core結果が存在すれば再利用します。評価条件を変更して再計算する
+場合は`SAEBENCH_FORCE_RERUN=1`を付けてください。
 
 ## Objective
 
@@ -106,7 +117,13 @@ quickstartは以下を一括で評価・可視化します。
 3. dense-to-sparse保持率: energy retained、cosine、Top-K saturation fraction
 4. high/low分解: ordinary reconstruction、same-span swap、shuffled swap
 5. RGG整合: random-projection RDM、axis-aligned RDM、dense active fraction
-6. MMLU semantics/context/syntax probesとsparse high feature介入
+6. SAEBench Core: explained variance、L0、KL/CE preservation、feature density
+7. 任意のSAEBench Sparse Probing（`SAEBENCH_EVALS=core,sparse_probing`）
+
+SAEBench公式の推奨どおり、`HIGH_K=64,128,256`など複数のL0で学習した
+checkpointを同一設定で比較してください。辞書幅32768で二乗計算量になる
+weight-based類似度は既定で無効です。必要な場合のみ
+`SAEBENCH_COMPUTE_WEIGHT_METRICS=1`を使用します。
 
 swap FVUは距離ごとに `sum(squared error) / sum(centered residual energy)` で
 集計します。詳細は
@@ -121,7 +138,8 @@ RUN_DIR/
   model/training_report.json
   analysis/rectified_lpjepa_report.json
   analysis/distance_metrics.csv
-  analysis/mmlu_probe_accuracy.csv
+  saebench/saebench_summary.json
+  saebench/core/*.json
   report/index.html
   report/visualization_summary.json
 ```

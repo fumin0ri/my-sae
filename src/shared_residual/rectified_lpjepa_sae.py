@@ -954,7 +954,7 @@ def main() -> None:
                 "max_span_length": cfg.max_span_length,
                 "view_sampling": "two exchangeable positions from one random span",
                 "dense_high_activation": "shifted ReLU for invariance and RDMReg only",
-                "sparse_high_activation": "shifted ReLU plus Top-K for reconstruction, evaluation, and intervention",
+                "sparse_high_activation": "shifted ReLU plus Top-K for reconstruction and evaluation",
                 "low_activation": "ReLU plus Top-K",
                 "high_role": "dense candidates learn view invariance and RDMReg; sparse Top-K codes reconstruct residuals",
                 "low_role": "position-specific incremental reconstruction",

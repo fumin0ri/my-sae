@@ -26,16 +26,6 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
 def save_figure(fig: plt.Figure, output: Path, name: str) -> None:
     fig.savefig(output / f"{name}.png", dpi=190, bbox_inches="tight")
     fig.savefig(output / f"{name}.pdf", bbox_inches="tight")
@@ -300,81 +290,33 @@ def invariance_plot(report: dict[str, Any], figures: Path) -> None:
     save_figure(fig, figures, "view-invariance")
 
 
-def probe_plot(report: dict[str, Any], figures: Path) -> None:
-    probes = report["mmlu_probe_accuracy"]
-    preferred = [
-        "high_mean",
-        "endpoint_high",
-        "low_mean",
-        "endpoint_low",
-        "endpoint_full",
-    ]
-    labels = {
-        "high_mean": "Window high mean",
-        "endpoint_high": "Endpoint high",
-        "low_mean": "Window low mean",
-        "endpoint_low": "Endpoint low",
-        "endpoint_full": "Endpoint full",
-    }
-    colors = [HIGH, "#047857", LOW, "#65a30d", TOTAL]
-    fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.0))
-    for axis, (probe_axis, results) in zip(axes, probes.items()):
-        names = [name for name in preferred if name in results]
-        values = [results[name]["balanced_accuracy"] for name in names]
-        chance = np.mean([results[name]["chance_accuracy"] for name in names])
-        axis.bar(np.arange(len(names)), values, color=colors[: len(names)])
-        axis.axhline(chance, color="#334155", linestyle="--", label="Chance")
-        axis.set_xticks(
-            np.arange(len(names)),
-            [labels[name] for name in names],
-            rotation=35,
-            ha="right",
-        )
-        axis.set_title(f"{probe_axis.capitalize()} probe")
-        axis.set_ylabel("Locked-test balanced accuracy")
-        axis.grid(axis="y", alpha=0.2)
-        axis.legend(frameon=False)
-    fig.tight_layout()
-    save_figure(fig, figures, "mmlu-probes")
-
-
-def causal_plot(run_dir: Path, figures: Path) -> dict[str, Any] | None:
-    conditions = {
-        "Patch": (run_dir / "analysis" / "intervention-patch.jsonl", "delta_contrast_minus_target_logprob"),
-        "Ablate": (run_dir / "analysis" / "intervention-ablate.jsonl", "delta_answer_logprob"),
-        "Random ablate": (run_dir / "analysis" / "intervention-random.jsonl", "delta_answer_logprob"),
-    }
-    summary: dict[str, Any] = {}
-    for label, (path, metric) in conditions.items():
-        values = np.asarray(
-            [float(row[metric]) for row in load_jsonl(path) if metric in row],
-            dtype=float,
-        )
-        if not len(values):
-            continue
-        summary[label] = {
-            "metric": metric,
-            "n": len(values),
-            "mean": float(values.mean()),
-            "standard_error": float(values.std(ddof=1) / np.sqrt(len(values))) if len(values) > 1 else 0.0,
-        }
-    if not summary:
+def saebench_plot(run_dir: Path, figures: Path) -> dict[str, Any] | None:
+    path = run_dir / "saebench" / "saebench_summary.json"
+    if not path.exists():
         return None
-    labels = list(summary)
-    fig, ax = plt.subplots(figsize=(8.4, 4.7))
-    ax.bar(
-        labels,
-        [summary[label]["mean"] for label in labels],
-        yerr=[1.96 * summary[label]["standard_error"] for label in labels],
-        capsize=5,
-        color=[HIGH, "#dc2626", NULL][: len(labels)],
-    )
-    ax.axhline(0, color="#334155", linewidth=1)
-    ax.set_title("Causal effect of Rectified high features")
-    ax.set_ylabel("Log-probability change (95% normal CI)")
-    ax.grid(axis="y", alpha=0.2)
+    summary = load_json(path)
+    core = summary.get("evals", {}).get("core", [])
+    if not core:
+        return summary
+    labels = [str(row.get("sae_set", "SAE")).removeprefix("rectified-lpjepa-") for row in core]
+    colors = [TOTAL if label == "full" else HIGH if label == "high" else LOW for label in labels]
+    metric_paths = [
+        ("reconstruction_quality", "explained_variance", "Explained variance"),
+        ("model_behavior_preservation", "kl_div_score", "KL score"),
+        ("model_performance_preservation", "ce_loss_score", "CE loss score"),
+        ("sparsity", "l0", "L0"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
+    for axis, (category, metric, title) in zip(axes.flat, metric_paths):
+        values = [
+            float(row.get("metrics", {}).get(category, {}).get(metric, np.nan))
+            for row in core
+        ]
+        axis.bar(labels, values, color=colors)
+        axis.set_title(f"SAEBench Core: {title}")
+        axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    save_figure(fig, figures, "causal-interventions")
+    save_figure(fig, figures, "saebench-core")
     return summary
 
 
@@ -385,21 +327,19 @@ def fmt(value: Any) -> str:
 def write_html(
     output: Path,
     report: dict[str, Any],
-    causal_summary: dict[str, Any] | None,
+    saebench_summary: dict[str, Any] | None,
 ) -> None:
     quality = report["standard_sae_quality"]
     recovered = report.get("loss_recovered")
     invariant = report["view_invariance"]
     rdm = report["rdm_validation"]
-    base_mmlu = report["base_model_mmlu_accuracy"].get("accuracy")
     figures = [
         ("Training", "figures/training.png"),
         ("Conventional SAE quality", "figures/standard-sae-quality.png"),
         ("Shared-view validity and null control", "figures/view-invariance.png"),
-        ("MMLU semantic/context/syntax probes", "figures/mmlu-probes.png"),
     ]
-    if causal_summary is not None:
-        figures.append(("Causal interventions", "figures/causal-interventions.png"))
+    if saebench_summary is not None and saebench_summary.get("evals", {}).get("core"):
+        figures.append(("SAEBench Core", "figures/saebench-core.png"))
     figure_html = "\n".join(
         f'<section><h2>{html.escape(title)}</h2><img src="{path}" alt="{html.escape(title)}"></section>'
         for title, path in figures
@@ -418,7 +358,7 @@ main{{max-width:1120px;margin:auto;padding:36px 20px 70px}}.subtitle{{color:var(
 section{{margin-top:34px}}section img{{width:100%;background:white;border:1px solid var(--line);border-radius:10px}}
 </style></head><body><main>
 <h1>Predictor-free Rectified LpJEPA-SAE</h1>
-<p class="subtitle">Dense ReLU high candidates learn view invariance and RDMReg. ReLU+Top-K high codes are the only codes used for reconstruction, evaluation, and intervention.</p>
+<p class="subtitle">Dense ReLU high candidates learn view invariance and RDMReg. ReLU+Top-K codes are evaluated with held-out Pile controls and the official SAEBench Core protocol.</p>
 <div class="metrics">
 <div class="metric"><span>Full SAE FVE</span><strong>{fmt(quality['fraction_variance_explained'])}</strong></div>
 <div class="metric"><span>Sparse high L0 / target</span><strong>{fmt(quality['high_l0'])} / {fmt(report['checkpoint']['config']['high_k'])}</strong></div>
@@ -427,9 +367,8 @@ section{{margin-top:34px}}section img{{width:100%;background:white;border:1px so
 <div class="metric"><span>Loss recovered</span><strong>{recovered_value}</strong></div>
 <div class="metric"><span>Held-out RDMReg</span><strong>{fmt(rdm['rdm_loss'])}</strong></div>
 <div class="metric"><span>Axis-aligned RDMReg</span><strong>{fmt(rdm['axis_aligned_rdm_loss'])}</strong></div>
-<div class="metric"><span>Base-model MMLU</span><strong>{fmt(base_mmlu)}</strong></div>
 </div>{figure_html}
-<section><h2>Machine-readable artifacts</h2><p><code>analysis/rectified_lpjepa_report.json</code>, <code>distance_metrics.csv</code>, and <code>mmlu_probe_accuracy.csv</code>.</p></section>
+<section><h2>Machine-readable artifacts</h2><p><code>analysis/rectified_lpjepa_report.json</code>, <code>analysis/distance_metrics.csv</code>, and <code>saebench/saebench_summary.json</code>.</p></section>
 </main></body></html>"""
     (output / "index.html").write_text(document, encoding="utf-8", newline="\n")
 
@@ -453,9 +392,8 @@ def main() -> None:
     training_plot(run_dir, figures)
     sae_quality_plot(report, figures)
     invariance_plot(report, figures)
-    probe_plot(report, figures)
-    causal_summary = causal_plot(run_dir, figures)
-    write_html(output, report, causal_summary)
+    saebench_summary = saebench_plot(run_dir, figures)
+    write_html(output, report, saebench_summary)
     write_json(
         output / "visualization_summary.json",
         {
@@ -465,7 +403,7 @@ def main() -> None:
             "loss_recovered": report.get("loss_recovered"),
             "view_invariance": report["view_invariance"],
             "rdm_validation": report["rdm_validation"],
-            "causal_interventions": causal_summary,
+            "saebench": saebench_summary,
             "figures": sorted(path.name for path in figures.glob("*.png")),
         },
     )

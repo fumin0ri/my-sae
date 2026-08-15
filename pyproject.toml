@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.20.0"
+version = "0.21.0"
 description = "Train dense Rectified LpJEPA candidates with Top-K high/low SAE reconstruction codes"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,14 +21,13 @@ dependencies = [
 
 [project.optional-dependencies]
 sae = ["sae-lens>=6.0", "transformer-lens>=2.0"]
+saebench = ["sae-bench==0.6.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
 sr-extract = "shared_residual.extract:main"
 sr-extract-grid = "shared_residual.extract_grid:main"
 sr-extract-pile = "shared_residual.pile_extract:main"
-sr-make-mmlu = "shared_residual.mmlu_data:main"
-sr-score-mmlu = "shared_residual.mmlu_score:main"
 sr-fit = "shared_residual.subspace:main"
 sr-research = "shared_residual.research:main"
 sr-sae = "shared_residual.sae_analysis:main"
@@ -37,7 +36,7 @@ sr-train-group-sae = "shared_residual.group_sae:main"
 sr-visualize = "shared_residual.visualize_results:main"
 sr-train-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_sae:main"
 sr-evaluate-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_eval:main"
-sr-intervene-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_intervene:main"
+sr-evaluate-saebench = "shared_residual.saebench_eval:main"
 sr-visualize-rectified-lpjepa-sae = "shared_residual.rectified_lpjepa_visualize:main"
 
 [tool.setuptools.packages.find]

@@ -18,23 +18,15 @@ from .activation_store import (
     validation_batches,
     validation_view_pair_batches,
 )
-from .evaluation import collapse_diagnostics, fit_probe, pca_embedding
 from .io import torch_load, write_json
 from .modeling import edit_residual, get_layer, input_device, load_hf_model
-from .training import autocast_context, configure_accelerator, grouped_three_way_split
+from .training import autocast_context, configure_accelerator
 from .rectified_lpjepa_sae import (
     ARCHITECTURE_ID,
     RectifiedLpJEPAConfig,
     RectifiedLpJEPASAE,
     evaluate_losses as evaluate_training_objective,
 )
-
-
-PROBE_LABELS = {
-    "semantics": "semantic_answer",
-    "context": "context_category",
-    "syntax": "syntax_template",
-}
 
 
 def load_model(
@@ -423,120 +415,15 @@ def evaluate_loss_recovered(
     }
 
 
-def _representation_batch(
-    model: RectifiedLpJEPASAE, batch: torch.Tensor
-) -> dict[str, torch.Tensor]:
-    batch_size, width, _ = batch.shape
-    flat = batch.reshape(-1, model.cfg.d_in)
-    code = model.encode(flat).reshape(batch_size, width, model.cfg.d_sae)
-    high, low = model.split_code(code)
-    return {
-        "high_mean": high.mean(dim=1),
-        "endpoint_high": high[:, -1],
-        "low_mean": low.mean(dim=1),
-        "endpoint_low": low[:, -1],
-        "endpoint_full": code[:, -1],
-    }
-
-
-@torch.no_grad()
-def encode_mmlu_representations(
-    model: RectifiedLpJEPASAE,
-    x: torch.Tensor,
-    development_indices: list[int],
-    probe_max_dim: int,
-    batch_size: int,
-    device: torch.device,
-    amp_dtype: str,
-) -> tuple[dict[str, torch.Tensor], dict[str, list[int]]]:
-    """Two-pass encoding stores only high-variance probe dimensions on CPU."""
-    development_mask = torch.zeros(len(x), dtype=torch.bool)
-    development_mask[development_indices] = True
-    sums: dict[str, torch.Tensor] = {}
-    squares: dict[str, torch.Tensor] = {}
-    count = 0
-    for start in tqdm(range(0, len(x), batch_size), desc="MMLU dimension pass"):
-        end = min(start + batch_size, len(x))
-        mask = development_mask[start:end]
-        if not mask.any():
-            continue
-        batch = x[start:end].to(device, dtype=model.pre_bias.dtype)
-        with autocast_context(device, amp_dtype):
-            values = _representation_batch(model, batch)
-        local_indices = mask.nonzero(as_tuple=False).flatten().to(device)
-        for name, value in values.items():
-            selected = value.index_select(0, local_indices).float()
-            sums[name] = sums.get(name, torch.zeros(value.shape[-1], device=device)) + selected.sum(dim=0)
-            squares[name] = squares.get(name, torch.zeros(value.shape[-1], device=device)) + selected.square().sum(dim=0)
-        count += int(mask.sum())
-    if count < 2:
-        raise ValueError("at least two development rows are required for probes")
-    selected_dimensions: dict[str, torch.Tensor] = {}
-    for name in sums:
-        variance = squares[name] / count - (sums[name] / count).square()
-        width = min(probe_max_dim, len(variance))
-        selected_dimensions[name] = torch.topk(variance, width).indices.sort().values
-    representations = {
-        name: torch.empty((len(x), len(indices)), dtype=torch.float16)
-        for name, indices in selected_dimensions.items()
-    }
-    for start in tqdm(range(0, len(x), batch_size), desc="MMLU representation pass"):
-        end = min(start + batch_size, len(x))
-        batch = x[start:end].to(device, dtype=model.pre_bias.dtype)
-        with autocast_context(device, amp_dtype):
-            values = _representation_batch(model, batch)
-        for name, value in values.items():
-            representations[name][start:end].copy_(
-                value.index_select(-1, selected_dimensions[name]).float().cpu()
-            )
-    return representations, {
-        name: indices.cpu().tolist() for name, indices in selected_dimensions.items()
-    }
-
-
-def evaluate_probes(
-    representations: dict[str, torch.Tensor],
-    metadata: list[dict[str, Any]],
-    development_indices: list[int],
-    test_indices: list[int],
-    group_key: str,
-    seed: int,
-) -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    for axis_index, (axis, label_key) in enumerate(PROBE_LABELS.items()):
-        axis_results: dict[str, Any] = {}
-        for representation_index, (name, values) in enumerate(representations.items()):
-            result, _ = fit_probe(
-                values,
-                metadata,
-                development_indices,
-                test_indices,
-                label_key,
-                group_key,
-                seed + 1000 * axis_index + representation_index,
-            )
-            result["probe_dimension"] = values.shape[1]
-            axis_results[name] = result
-        results[axis] = axis_results
-    return results
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate SAE quality, Rectified distribution matching, and view invariance"
     )
     parser.add_argument("--activation-manifest", required=True)
-    parser.add_argument("--activations", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--mmlu-model-results", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--group-key", default="question_id")
-    parser.add_argument("--probe-max-dim", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--maximum-validation-batches", type=int, default=0)
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
-    parser.add_argument("--test-fraction", type=float, default=0.2)
-    parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default="bfloat16")
@@ -560,8 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.batch_size < 2 or args.probe_max_dim < 1:
-        raise ValueError("batch size must be at least two and probe dimension positive")
+    if args.batch_size < 2:
+        raise ValueError("batch size must be at least two")
     device = torch.device(
         args.device
         if not args.device.startswith("cuda") or torch.cuda.is_available()
@@ -601,61 +488,7 @@ def main() -> None:
     )
     model.eval()
 
-    bundle = torch_load(args.activations)
-    x = bundle["activations"]
-    metadata = bundle["metadata"]
-    if len(x) != len(metadata):
-        raise ValueError("MMLU activation rows and metadata differ")
-    if x.ndim != 3 or x.shape[1:] != (model.cfg.max_span_length, model.cfg.d_in):
-        raise ValueError("MMLU activation span must match checkpoint span and residual width")
-    extraction = bundle.get("config", {})
     source_config = checkpoint.get("source_config", {})
-    for key, expected in {
-        "model": source_config.get("model"),
-        "layer": source_config.get("layer"),
-        "hook_point": source_config.get("hook_point"),
-    }.items():
-        actual = extraction.get(key)
-        if expected is not None and actual is not None and expected != actual:
-            raise ValueError(f"MMLU activation {key}={actual!r} != checkpoint {expected!r}")
-    train_indices, validation_indices, test_indices = grouped_three_way_split(
-        metadata,
-        args.validation_fraction,
-        args.test_fraction,
-        args.group_key,
-        args.split_seed,
-    )
-    development_indices = sorted(train_indices + validation_indices)
-    representations, selected_dimensions = encode_mmlu_representations(
-        model,
-        x,
-        development_indices,
-        args.probe_max_dim,
-        args.batch_size,
-        device,
-        amp_dtype,
-    )
-    probes = evaluate_probes(
-        representations,
-        metadata,
-        development_indices,
-        test_indices,
-        args.group_key,
-        args.seed,
-    )
-    diagnostics = {
-        name: collapse_diagnostics(values) for name, values in representations.items()
-    }
-    mmlu_model_results = json.loads(Path(args.mmlu_model_results).read_text(encoding="utf-8"))
-    activation_ids = {str(row[args.group_key]) for row in metadata}
-    scored_ids = {str(value) for value in mmlu_model_results.get("question_ids", [])}
-    mmlu_alignment = {
-        "activation_rows": len(metadata),
-        "base_model_scored_rows": int(mmlu_model_results.get("n", 0)),
-        "question_id_overlap": len(activation_ids & scored_ids),
-        "activation_only": len(activation_ids - scored_ids),
-        "base_score_only": len(scored_ids - activation_ids),
-    }
 
     loss_recovered = None
     if not args.skip_loss_recovered:
@@ -694,24 +527,13 @@ def main() -> None:
             "sae_evaluation_code": "ReLU plus Top-K sparse high code",
             "null": "sparse high code from a different validation sequence in the batch",
             "causal_decomposition_test": "swap same-span sparse high code while retaining position-specific low code",
-            "mmlu_split": "question-grouped development/locked test",
+            "external_standard_evaluation": "SAEBench Core is run separately on OpenWebText",
             "predictor": None,
         },
         "standard_sae_quality": sae_quality,
         "loss_recovered": loss_recovered,
         "view_invariance": view_invariance,
         "rdm_validation": objective_validation,
-        "mmlu_probe_accuracy": probes,
-        "base_model_mmlu_accuracy": mmlu_model_results,
-        "mmlu_alignment": mmlu_alignment,
-        "representation_diagnostics": diagnostics,
-        "selected_probe_dimensions": selected_dimensions,
-        "split": {
-            "development_n": len(development_indices),
-            "locked_test_n": len(test_indices),
-            "split_seed": args.split_seed,
-            "group_key": args.group_key,
-        },
         "checkpoint": {
             "path": str(Path(args.checkpoint)),
             "architecture_id": checkpoint["architecture_id"],
@@ -728,38 +550,6 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(curve)
-    with (output_dir / "mmlu_probe_accuracy.csv").open("w", encoding="utf-8", newline="") as handle:
-        fieldnames = [
-            "axis", "representation", "accuracy", "balanced_accuracy", "chance_accuracy",
-            "ci95_low", "ci95_high", "n_development", "n_locked_test",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for axis, axis_results in probes.items():
-            for representation, result in axis_results.items():
-                writer.writerow({
-                    "axis": axis,
-                    "representation": representation,
-                    "accuracy": result["accuracy"],
-                    "balanced_accuracy": result["balanced_accuracy"],
-                    "chance_accuracy": result["chance_accuracy"],
-                    "ci95_low": result["group_bootstrap"]["ci95_low"],
-                    "ci95_high": result["group_bootstrap"]["ci95_high"],
-                    "n_development": result["n_development"],
-                    "n_locked_test": result["n_locked_test"],
-                })
-    test_tensor = torch.as_tensor(test_indices, dtype=torch.long)
-    torch.save(
-        {
-            "high_mean": pca_embedding(representations["high_mean"].index_select(0, test_tensor)),
-            "endpoint_high": pca_embedding(representations["endpoint_high"].index_select(0, test_tensor)),
-            "endpoint_low": pca_embedding(representations["endpoint_low"].index_select(0, test_tensor)),
-            "semantic_labels": [str(metadata[index][PROBE_LABELS["semantics"]]) for index in test_indices],
-            "context_labels": [str(metadata[index][PROBE_LABELS["context"]]) for index in test_indices],
-            "syntax_labels": [str(metadata[index][PROBE_LABELS["syntax"]]) for index in test_indices],
-        },
-        output_dir / "evaluation_embeddings.pt",
-    )
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
 

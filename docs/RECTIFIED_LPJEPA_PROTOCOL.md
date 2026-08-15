@@ -131,15 +131,17 @@ training budget, and evaluation data.
 
 ## Secondary evaluations
 
-- Conventional SAE FVU, FVE, cosine, L0, and loss recovered.
+- SAEBench Core on OpenWebText: explained variance, L0, KL/CE preservation,
+  shrinkage, feature density, and loss recovered.
+- Optional SAEBench Sparse Probing for feature usefulness.
 - Dense versus sparse high margin, energy retention, cosine, and Top-K saturation.
 - High-only and low-only reconstruction.
-- Effective rank and collapse diagnostics on memory-bounded selected dimensions.
-- MMLU semantics, context, and syntax locked probes.
-- High-feature patching, ablation, and norm-matched random ablation.
 
-MMLU is secondary: the core claim concerns shared representation within held-out
-Pile spans, not task accuracy.
+SAEBench results must be compared across matched sparsity sweeps because its
+metrics are strongly L0-dependent. The primary comparison uses full sparse codes;
+high-only and low-only adapters are optional decomposition diagnostics. AutoInterp
+is excluded because it requires an external API, and Unlearning is excluded
+because its official protocol targets an instruction-tuned Gemma model.
 
 ## Compute
 
@@ -147,4 +149,5 @@ Primary hardware is one RTX 4090 with 23.5 GiB VRAM, CUDA 12.1, and PyTorch
 2.5.1. The primary run uses 1024 random projections in chunks of 128 and 512
 axis-aligned coordinates sampled without replacement per step. A
 projection-count convergence check uses `{256, 512, 1024, 2048}` on held-out
-checkpoints; it does not tune on the locked MMLU test.
+checkpoints. SAEBench uses context size 128 and LLM batch size 1 for Pythia-6.9B
+on the same 24 GiB GPU.
