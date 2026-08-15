@@ -169,7 +169,7 @@ def test_llm_activation_collector_offloads_each_batch_to_cpu() -> None:
         def run_with_hooks(self, tokens, stop_at_layer, fwd_hooks):
             assert stop_at_layer == 3
             residual = tokens.float().unsqueeze(-1).repeat(1, 1, 3)
-            fwd_hooks[0][1](residual, None)
+            fwd_hooks[0][1](residual, hook=None)
 
     tokens = torch.arange(20).reshape(5, 4)
     activations = _cpu_offloaded_llm_activations(

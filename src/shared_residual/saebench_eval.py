@@ -131,8 +131,9 @@ def _cpu_offloaded_llm_activations(
         token_batch = tokens[start : start + batch_size]
         captured: torch.Tensor | None = None
 
-        def activation_hook(residual: torch.Tensor, _hook: Any) -> None:
+        def activation_hook(residual: torch.Tensor, hook: Any) -> None:
             nonlocal captured
+            del hook
             captured = residual.detach()
 
         model.run_with_hooks(
