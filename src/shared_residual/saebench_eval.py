@@ -39,15 +39,15 @@ def _parse_csv(value: str) -> list[str]:
     return values
 
 
-def _load_official_core_outputs(
-    output_dir: Path, selected_saes: list[tuple[str, Any]]
+def _load_official_outputs(
+    evaluation_dir: Path, selected_saes: list[tuple[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Load both newly computed and SAEBench-cached Core result files."""
+    """Load both newly computed and SAEBench-cached result files."""
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
     for sae_release, _ in selected_saes:
         filename = f"{sae_release}_custom_sae_eval_results.json".replace("/", "_")
-        path = output_dir / "core" / filename
+        path = evaluation_dir / filename
         if not path.exists():
             missing.append(str(path))
             continue
@@ -63,16 +63,22 @@ def _load_official_core_outputs(
         )
     if missing:
         raise RuntimeError(
-            "SAEBench Core did not produce results for every requested SAE: "
+            "SAEBench did not produce results for every requested SAE: "
             + ", ".join(missing)
             + ". Inspect the preceding SAEBench error log."
         )
     return rows
 
 
+def _load_official_core_outputs(
+    output_dir: Path, selected_saes: list[tuple[str, Any]]
+) -> list[dict[str, Any]]:
+    return _load_official_outputs(output_dir / "core", selected_saes)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained Rectified LpJEPA-SAE with SAEBench 0.6"
+        description="Evaluate a trained Rectified LpJEPA-SAE with SAEBench 0.5"
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -128,9 +134,10 @@ def main() -> None:
         raise RuntimeError(
             "SAEBench is not installed. Run: pip install -e '.[saebench]'"
         ) from error
-    if saebench_version.split(".")[:2] != ["0", "6"]:
+    if saebench_version != "0.5.0":
         raise RuntimeError(
-            f"This adapter targets sae-bench 0.6.x, found {saebench_version}"
+            "The CUDA 12.1 adapter requires sae-bench 0.5.0, found "
+            f"{saebench_version}. Run: bash scripts/install_cuda121.sh"
         )
 
     dtype = getattr(torch, args.dtype)
@@ -194,7 +201,8 @@ def main() -> None:
         from sae_bench.evals.sparse_probing.eval_config import (
             SparseProbingEvalConfig,
         )
-        from sae_bench.evals.sparse_probing.main import run_eval
+        import sae_bench.evals.sparse_probing.main as sparse_probing_main
+        from transformer_lens import HookedTransformer
 
         probe_config = SparseProbingEvalConfig(
             model_name=selected_saes[0][1].cfg.model_name,
@@ -207,19 +215,42 @@ def main() -> None:
             llm_dtype=args.dtype,
             lower_vram_usage=True,
         )
-        probe_results = run_eval(
-            probe_config,
-            selected_saes,
-            args.device,
-            str(output_dir / "sparse_probing"),
-            force_rerun=args.force_rerun,
-            clean_up_activations=not args.save_activations,
-            save_activations=args.save_activations,
-            artifacts_path=str(output_dir / "artifacts"),
+        # SAEBench 0.5 Sparse Probing does not forward custom model kwargs.
+        # Inject the pinned revision and safetensors requirement into its one
+        # model-loading call, then restore the upstream module immediately.
+        model_kwargs = dict(
+            selected_saes[0][1].cfg.model_from_pretrained_kwargs
         )
-        if not probe_results:
-            raise RuntimeError("SAEBench Sparse Probing produced no results")
-        summary["evals"]["sparse_probing"] = _jsonable(probe_results)
+        upstream_loader_class = sparse_probing_main.HookedTransformer
+
+        class PinnedHookedTransformer:
+            @staticmethod
+            def from_pretrained_no_processing(
+                model_name: str, *loader_args: Any, **loader_kwargs: Any
+            ) -> Any:
+                pinned_kwargs = dict(loader_kwargs)
+                pinned_kwargs.update(model_kwargs)
+                return HookedTransformer.from_pretrained_no_processing(
+                    model_name, *loader_args, **pinned_kwargs
+                )
+
+        sparse_probing_main.HookedTransformer = PinnedHookedTransformer
+        try:
+            sparse_probing_main.run_eval(
+                probe_config,
+                selected_saes,
+                args.device,
+                str(output_dir / "sparse_probing"),
+                force_rerun=args.force_rerun,
+                clean_up_activations=not args.save_activations,
+                save_activations=args.save_activations,
+                artifacts_path=str(output_dir / "artifacts"),
+            )
+        finally:
+            sparse_probing_main.HookedTransformer = upstream_loader_class
+        summary["evals"]["sparse_probing"] = _load_official_outputs(
+            output_dir / "sparse_probing", selected_saes
+        )
 
     write_json(output_dir / "saebench_summary.json", _jsonable(summary))
     print(f"wrote {output_dir / 'saebench_summary.json'}")

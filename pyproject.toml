@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-residual"
-version = "0.21.0"
+version = "0.21.1"
 description = "Train dense Rectified LpJEPA candidates with Top-K high/low SAE reconstruction codes"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,15 +13,20 @@ dependencies = [
   "matplotlib>=3.8",
   "numpy>=1.26",
   "scikit-learn>=1.4",
-  "torch>=2.5,<3",
+  "torch==2.5.1",
   "tqdm>=4.66",
-  "transformers>=4.44",
+  "transformers>=4.44,<5",
   "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
-sae = ["sae-lens>=6.0", "transformer-lens>=2.0"]
-saebench = ["sae-bench==0.6.0"]
+sae = ["sae-lens==6.5.0", "transformer-lens==2.15.4"]
+saebench = [
+  "sae-bench==0.5.0",
+  "sae-lens==6.5.0",
+  "transformer-lens==2.15.4",
+  "torchvision==0.20.1",
+]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

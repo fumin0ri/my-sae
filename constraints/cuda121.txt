@@ -1,0 +1,9 @@
+# Keep the research environment on the last PyTorch CUDA 12.1 release.
+# SAEBench 0.6 requires TransformerLens >=2.16.1, whose Python 3.11 wheel
+# requires torch >=2.6 and therefore cannot preserve this CUDA 12.1 stack.
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+sae-bench==0.5.0
+sae-lens==6.5.0
+transformer-lens==2.15.4

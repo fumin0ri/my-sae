@@ -21,7 +21,7 @@ Component = Literal["full", "high", "low"]
 
 @dataclass
 class SAEBenchAdapterConfig:
-    """Duck-typed subset of SAE Lens config required by SAEBench 0.6."""
+    """Duck-typed subset of SAE Lens config required by SAEBench 0.5."""
 
     model_name: str
     d_in: int

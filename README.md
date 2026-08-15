@@ -28,10 +28,23 @@ git clone https://github.com/fumin0ri/my-sae.git
 cd my-sae
 conda create -n sae python=3.11 -y
 conda activate sae
-pip install --index-url https://download.pytorch.org/whl/cu121 \
-  torch==2.5.1 torchvision torchaudio
-pip install -e ".[saebench]"
+bash scripts/install_cuda121.sh
 HF_TOKEN=... bash scripts/rectified_lpjepa_quickstart.sh
+```
+
+`install_cuda121.sh`はPyTorch 2.5.1+cu121に加え、CUDA 12.1と両立する
+SAEBench 0.5.0、SAE Lens 6.5.0、TransformerLens 2.15.4を固定します。
+SAEBench 0.6.0は依存先のTransformerLensがPyTorch 2.6以上を要求するため、
+このCUDA 12.1環境では使用しません。
+
+SAEBench追加後に`CUDA initialization: driver ... too old`が出る既存環境も、
+次のコマンドで修復できます。
+
+```bash
+conda activate sae
+cd my-sae
+git pull
+bash scripts/install_cuda121.sh
 ```
 
 主な既定値はPythia 6.9B、layer 16、maximum span 32、SAE width 32768、

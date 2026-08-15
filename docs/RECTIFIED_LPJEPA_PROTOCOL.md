@@ -150,4 +150,6 @@ Primary hardware is one RTX 4090 with 23.5 GiB VRAM, CUDA 12.1, and PyTorch
 axis-aligned coordinates sampled without replacement per step. A
 projection-count convergence check uses `{256, 512, 1024, 2048}` on held-out
 checkpoints. SAEBench uses context size 128 and LLM batch size 1 for Pythia-6.9B
-on the same 24 GiB GPU.
+on the same 24 GiB GPU. The reproducible evaluation environment pins SAEBench
+0.5.0, SAE Lens 6.5.0, and TransformerLens 2.15.4: SAEBench 0.6.0's dependency
+chain requires PyTorch 2.6 or newer and cannot preserve the CUDA 12.1 stack.

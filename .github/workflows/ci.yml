@@ -17,6 +17,6 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,saebench]" -c constraints/cuda121.txt
       - name: Test
         run: pytest -q

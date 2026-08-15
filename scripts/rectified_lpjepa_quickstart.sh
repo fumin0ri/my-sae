@@ -101,7 +101,30 @@ fi
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export USE_SAFETENSORS
-python -c 'import os, torch; from shared_residual.modeling import require_safe_torch_load; require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1"); assert torch.cuda.is_available(), "CUDA GPU is required"; assert torch.cuda.is_bf16_supported(), "BF16-capable GPU is required"; p=torch.cuda.get_device_properties(0); print(f"GPU: {p.name}, VRAM={p.total_memory/2**30:.1f} GiB, torch={torch.__version__}, CUDA={torch.version.cuda}")'
+python - <<'PY'
+import os
+import torch
+
+from shared_residual.modeling import require_safe_torch_load
+
+require_safe_torch_load(os.environ["USE_SAFETENSORS"] == "1")
+print(f"PyTorch: {torch.__version__}, built CUDA={torch.version.cuda}")
+if torch.__version__ != "2.5.1+cu121" or torch.version.cuda != "12.1":
+    raise RuntimeError(
+        "This pipeline requires torch 2.5.1+cu121. A dependency probably "
+        "replaced it. Repair the environment with: "
+        "bash scripts/install_cuda121.sh"
+    )
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA is unavailable even with the expected PyTorch build. Check "
+        "nvidia-smi and the driver, then rerun scripts/install_cuda121.sh."
+    )
+if not torch.cuda.is_bf16_supported():
+    raise RuntimeError("a BF16-capable CUDA GPU is required")
+p = torch.cuda.get_device_properties(0)
+print(f"GPU: {p.name}, VRAM={p.total_memory / 2**30:.1f} GiB")
+PY
 echo "Config: span=$MIN_SPAN_LENGTH..$WINDOW_SIZE, D=$D_SAE, high_k=$HIGH_K, low_k=$LOW_K, high=$HIGH_FRACTION, RGG=p$RGG_P active=$TARGET_ACTIVE_FRACTION, inv=$INVARIANCE_WEIGHT, rdm=$RDM_WEIGHT/$RDM_PROJECTIONS projections, axis=$AXIS_RDM_WEIGHT/$AXIS_RDM_FEATURES features, pairs/sequence=$PAIRS_PER_SEQUENCE, per-batch cap=$MAX_PAIRS_PER_SEQUENCE_PER_BATCH, pair buffer=$PAIR_SHUFFLE_BUFFER_PAIRS, SAEBench=$SAEBENCH_EVALS/$SAEBENCH_COMPONENTS"
 
 MODEL_LOAD_ARGS=(--model "$MODEL")
