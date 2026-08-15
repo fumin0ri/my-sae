@@ -14,6 +14,8 @@ from shared_residual.saebench_adapter import (
     transformer_lens_model_name,
 )
 from shared_residual.saebench_eval import (
+    _cpu_offloaded_llm_activations,
+    _cpu_offloaded_sae_meaned_activations,
     _density_only_misc_metrics,
     _isolated_eval_command,
     _load_official_core_outputs,
@@ -160,3 +162,42 @@ def test_isolated_eval_command_replaces_only_eval_selection(argv) -> None:
     assert "model.pt" in command
     assert not any("core,sparse_probing" in value for value in command)
     assert any("sparse_probing" in value for value in command)
+
+
+def test_llm_activation_collector_offloads_each_batch_to_cpu() -> None:
+    class FakeModel:
+        def run_with_hooks(self, tokens, stop_at_layer, fwd_hooks):
+            assert stop_at_layer == 3
+            residual = tokens.float().unsqueeze(-1).repeat(1, 1, 3)
+            fwd_hooks[0][1](residual, None)
+
+    tokens = torch.arange(20).reshape(5, 4)
+    activations = _cpu_offloaded_llm_activations(
+        tokens,
+        FakeModel(),
+        batch_size=2,
+        layer=2,
+        hook_name="blocks.2.hook_resid_post",
+        show_progress=False,
+    )
+    assert activations.device.type == "cpu"
+    assert activations.shape == (5, 4, 3)
+    assert torch.equal(activations[..., 0], tokens.float())
+
+
+def test_sae_meaned_activations_microbatch_and_return_cpu() -> None:
+    class FakeSAE:
+        def encode(self, residuals):
+            return residuals.clamp_min(0)
+
+    residuals = torch.tensor(
+        [
+            [[0.0, 0.0], [2.0, 4.0], [4.0, 8.0]],
+            [[1.0, 3.0], [3.0, 5.0], [0.0, 0.0]],
+        ]
+    )
+    encoded = _cpu_offloaded_sae_meaned_activations(
+        {"class-a": residuals}, FakeSAE(), sae_batch_size=1
+    )["class-a"]
+    assert encoded.device.type == "cpu"
+    assert torch.allclose(encoded, torch.tensor([[3.0, 6.0], [2.0, 4.0]]))

@@ -136,7 +136,9 @@ quickstartは以下を一括で評価・可視化します。
 複数のSAEBench評価は評価ごとに独立したPython processで実行します。これにより、
 Pythia-6.9BのCore評価後にGPU上へモデル参照が残っても、次のSparse Probing
 開始前にprocess終了によって確実にVRAMを解放します。保存済みの公式結果は
-再利用されます。
+再利用されます。Sparse Probingのresidual activationは各LLM batchの直後に
+CPUへ退避し、SAE encode時だけmicrobatchをGPUへ戻します。4000/1000サンプルを
+減らさず、24 GiB VRAMで評価できます。
 
 SAEBench公式の推奨どおり、`HIGH_K=64,128,256`など複数のL0で学習した
 checkpointを同一設定で比較してください。辞書幅32768で二乗計算量になる

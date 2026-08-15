@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, cast
 
 import torch
+from tqdm import tqdm
 
 from .io import write_json
 from .saebench_adapter import Component, load_saebench_adapter
@@ -108,6 +109,73 @@ def _density_only_misc_metrics(
         "normalized_freq_over_1_percent": normalized_mass(0.01),
         "normalized_freq_over_10_percent": normalized_mass(0.1),
     }
+
+
+@torch.no_grad()
+def _cpu_offloaded_llm_activations(
+    tokens: torch.Tensor,
+    model: Any,
+    batch_size: int,
+    layer: int,
+    hook_name: str,
+    mask_bos_pad_eos_tokens: bool = False,
+    show_progress: bool = True,
+) -> torch.Tensor:
+    """Collect residual batches on GPU and immediately store them on CPU."""
+    batches: list[torch.Tensor] = []
+    for start in tqdm(
+        range(0, len(tokens), batch_size),
+        desc="Collecting activations (CPU offload)",
+        disable=not show_progress,
+    ):
+        token_batch = tokens[start : start + batch_size]
+        captured: torch.Tensor | None = None
+
+        def activation_hook(residual: torch.Tensor, _hook: Any) -> None:
+            nonlocal captured
+            captured = residual.detach()
+
+        model.run_with_hooks(
+            token_batch,
+            stop_at_layer=layer + 1,
+            fwd_hooks=[(hook_name, activation_hook)],
+        )
+        if captured is None:
+            raise RuntimeError(f"hook {hook_name!r} did not capture activations")
+        if mask_bos_pad_eos_tokens:
+            from sae_bench.sae_bench_utils.activation_collection import (
+                get_bos_pad_eos_mask,
+            )
+
+            mask = get_bos_pad_eos_mask(token_batch, model.tokenizer)
+            captured = captured * mask[:, :, None]
+        batches.append(captured.to(device="cpu", non_blocking=False))
+        del captured
+    return torch.cat(batches, dim=0)
+
+
+@torch.no_grad()
+def _cpu_offloaded_sae_meaned_activations(
+    all_llm_activations: dict[str, torch.Tensor],
+    sae: Any,
+    sae_batch_size: int,
+) -> dict[str, torch.Tensor]:
+    """Encode CPU residuals in GPU microbatches and return mean codes on CPU."""
+    outputs: dict[str, torch.Tensor] = {}
+    for class_name, class_activations in all_llm_activations.items():
+        class_batches: list[torch.Tensor] = []
+        for start in range(0, len(class_activations), sae_batch_size):
+            residuals = class_activations[start : start + sae_batch_size]
+            nonzero_tokens = residuals.sum(dim=-1).ne(0)
+            nonzero_counts = nonzero_tokens.sum(dim=-1).clamp_min(1)
+            codes = sae.encode(residuals)
+            mask = nonzero_tokens.to(device=codes.device, dtype=codes.dtype)
+            mean_codes = (codes * mask[:, :, None]).sum(dim=1) / nonzero_counts.to(
+                device=codes.device, dtype=codes.dtype
+            )[:, None]
+            class_batches.append(mean_codes.to(device="cpu"))
+        outputs[class_name] = torch.cat(class_batches, dim=0)
+    return outputs
 
 
 def _load_official_outputs(
@@ -303,6 +371,7 @@ def main() -> None:
             SparseProbingEvalConfig,
         )
         import sae_bench.evals.sparse_probing.main as sparse_probing_main
+        from sae_bench.sae_bench_utils import activation_collection
         from transformer_lens import HookedTransformer
 
         probe_config = SparseProbingEvalConfig(
@@ -323,6 +392,11 @@ def main() -> None:
             selected_saes[0][1].cfg.model_from_pretrained_kwargs
         )
         upstream_loader_class = sparse_probing_main.HookedTransformer
+        upstream_llm_collector = activation_collection.get_llm_activations
+        upstream_sae_encoder = activation_collection.get_sae_meaned_activations
+        upstream_model_meaner = (
+            activation_collection.create_meaned_model_activations
+        )
 
         class PinnedHookedTransformer:
             @staticmethod
@@ -335,7 +409,25 @@ def main() -> None:
                     model_name, *loader_args, **pinned_kwargs
                 )
 
+        def device_meaned_model_activations(
+            activations: dict[str, torch.Tensor],
+        ) -> dict[str, torch.Tensor]:
+            meaned = upstream_model_meaner(activations)
+            return {
+                name: value.to(device=args.device)
+                for name, value in meaned.items()
+            }
+
         sparse_probing_main.HookedTransformer = PinnedHookedTransformer
+        activation_collection.get_llm_activations = (
+            _cpu_offloaded_llm_activations
+        )
+        activation_collection.get_sae_meaned_activations = (
+            _cpu_offloaded_sae_meaned_activations
+        )
+        activation_collection.create_meaned_model_activations = (
+            device_meaned_model_activations
+        )
         try:
             sparse_probing_main.run_eval(
                 probe_config,
@@ -349,6 +441,11 @@ def main() -> None:
             )
         finally:
             sparse_probing_main.HookedTransformer = upstream_loader_class
+            activation_collection.get_llm_activations = upstream_llm_collector
+            activation_collection.get_sae_meaned_activations = upstream_sae_encoder
+            activation_collection.create_meaned_model_activations = (
+                upstream_model_meaner
+            )
         summary["evals"]["sparse_probing"] = _load_official_outputs(
             output_dir / "sparse_probing", selected_saes
         )

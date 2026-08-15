@@ -103,7 +103,9 @@ class RectifiedLpJEPASAEBenchAdapter(nn.Module):
         self.dtype = self.W_dec.dtype
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        preactivations = x.to(self.dtype) @ self.W_enc + self.b_enc
+        preactivations = (
+            x.to(device=self.device, dtype=self.dtype) @ self.W_enc + self.b_enc
+        )
         if self.cfg.component == "high":
             return topk_relu(preactivations, self.high_k)
         if self.cfg.component == "low":
@@ -113,7 +115,10 @@ class RectifiedLpJEPASAEBenchAdapter(nn.Module):
         return torch.cat((high, low), dim=-1)
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
-        return feature_acts.to(self.dtype) @ self.W_dec + self.b_dec
+        return (
+            feature_acts.to(device=self.device, dtype=self.dtype) @ self.W_dec
+            + self.b_dec
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
